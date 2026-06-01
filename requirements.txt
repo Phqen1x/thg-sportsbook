@@ -1,0 +1,6 @@
+discord.py==2.7.1
+sqlalchemy[asyncio]==2.0.41
+aiosqlite==0.21.0
+aiohttp==3.12.4
+pillow==11.2.1
+python-dotenv==1.1.0

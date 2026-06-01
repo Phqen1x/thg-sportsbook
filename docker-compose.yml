@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./assets:/app/assets
+    environment:
+      - PYTHONUNBUFFERED=1

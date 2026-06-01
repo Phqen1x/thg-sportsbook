@@ -1,0 +1,60 @@
+import asyncio
+import logging
+import sys
+
+import discord
+from discord.ext import commands
+
+from bot import config
+from bot.database.engine import init_db
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("capitol")
+
+
+class SportsBookBot(commands.Bot):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self) -> None:
+        log.info("Initializing database...")
+        await init_db()
+
+        log.info("Loading cogs...")
+        await self.load_extension("bot.cogs.admin")
+        await self.load_extension("bot.cogs.betting")
+        await self.load_extension("bot.cogs.display")
+
+        if config.DEV_GUILD_ID:
+            guild = discord.Object(id=config.DEV_GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            log.info(f"Slash commands synced to dev guild {config.DEV_GUILD_ID}")
+        else:
+            await self.tree.sync()
+            log.info("Slash commands synced globally")
+
+    async def on_ready(self) -> None:
+        assert self.user is not None
+        log.info(f"Logged in as {self.user} (ID: {self.user.id})")
+        log.info("Capitol Sportsbook is open for business.")
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="the Games | /odds",
+            )
+        )
+
+
+def main() -> None:
+    bot = SportsBookBot()
+    bot.run(config.BOT_TOKEN, log_handler=None)
+
+
+if __name__ == "__main__":
+    main()
