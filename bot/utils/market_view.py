@@ -69,6 +69,7 @@ class MarketPageView(discord.ui.View):
         phase_map: dict[int, str] | None = None,
         is_admin: bool = False,
         title: str | None = None,
+        extra_type_labels: dict[str, str] | None = None,
     ) -> None:
         super().__init__(timeout=300)
         self.sorted_markets = sorted_markets
@@ -76,6 +77,7 @@ class MarketPageView(discord.ui.View):
         self.phase_map = phase_map or {}
         self.is_admin = is_admin
         self.title = title or ("📊 MARKETS — ADMIN" if is_admin else "📊 OPEN BETTING MARKETS")
+        self._type_labels = {**_TYPE_LABELS, **(extra_type_labels or {})}
         self.page = 0
         self.total_pages = max(1, (len(sorted_markets) + PAGE_SIZE - 1) // PAGE_SIZE)
         self.message: discord.Message | None = None
@@ -120,7 +122,7 @@ class MarketPageView(discord.ui.View):
         # ── Row 1: category jump select ───────────────────────────────────────
         cat_options = [
             discord.SelectOption(
-                label=_TYPE_LABELS.get(t, t)[:100],
+                label=self._type_labels.get(t, t)[:100],
                 value=t,
                 description=f"Starts on page {pg + 1}",
             )
@@ -157,7 +159,7 @@ class MarketPageView(discord.ui.View):
             # Section header when market type changes within this page
             if m.type != current_type:
                 current_type = m.type
-                section = _TYPE_LABELS.get(m.type, m.type).upper()
+                section = self._type_labels.get(m.type, m.type).upper()
                 embed.add_field(name=f"── {section} ──", value="​", inline=False)
 
             prob = implied_probability(m.odds)

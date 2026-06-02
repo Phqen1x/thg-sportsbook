@@ -45,6 +45,8 @@ class Tribute(Base):
     killed_by_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tributes.id"), nullable=True)
     placement: Mapped[int | None] = mapped_column(Integer, nullable=True)
     alliance_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("alliances.id"), nullable=True)
+    discord_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    member_joined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     alliance: Mapped["Alliance | None"] = relationship("Alliance", back_populates="members")
@@ -147,8 +149,64 @@ class PendingParlayLeg(Base):
     market: Mapped["Market"] = relationship("Market")
 
 
+class MarketTemplate(Base):
+    __tablename__ = "market_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    description: Mapped[str] = mapped_column(String(500), nullable=False)
+    difficulty: Mapped[str] = mapped_column(String(20), nullable=False)
+    default_odds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    label_template: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    type_key: Mapped[str | None] = mapped_column(String(30), nullable=True, unique=True)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class GameSetting(Base):
     __tablename__ = "game_settings"
 
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[str] = mapped_column(String(500), nullable=False)
+
+
+class DistrictRecord(Base):
+    """One tribute's performance in one completed game, used for district historical odds."""
+    __tablename__ = "district_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    district: Mapped[int] = mapped_column(Integer, nullable=False)
+    game_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    tribute_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    placement: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kills: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    won: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class Modifier(Base):
+    __tablename__ = "modifiers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(100), nullable=False)
+    weight: Mapped[float] = mapped_column(Float, nullable=False)
+
+    assignments: Mapped[list["ModifierAssignment"]] = relationship(
+        "ModifierAssignment", back_populates="modifier", cascade="all, delete-orphan"
+    )
+
+
+class ModifierAssignment(Base):
+    __tablename__ = "modifier_assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    modifier_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("modifiers.id", ondelete="CASCADE"), nullable=False
+    )
+    tribute_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("tributes.id", ondelete="CASCADE"), nullable=True
+    )
+    district: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    modifier: Mapped["Modifier"] = relationship("Modifier", back_populates="assignments")

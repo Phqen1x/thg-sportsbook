@@ -9,7 +9,7 @@ from discord.ext import commands
 from sqlalchemy import select, func
 
 from bot.database.engine import get_session, get_setting
-from bot.database.models import Market, Tribute, User
+from bot.database.models import Market, MarketTemplate, Tribute, User
 from bot.imaging.hot_odds import TributeCardData, FeaturedMarket, render_hot_odds
 from bot.imaging.base import render_async, fetch_image_bytes, buf_to_discord_file
 from bot.utils.formatters import fmt_chips, fmt_odds, fmt_pct, market_type_label, safe_defer
@@ -182,12 +182,15 @@ class DisplayCog(commands.Cog):
             trib_result = await session.execute(select(Tribute))
             tribute_map = {t.id: t for t in trib_result.scalars().all()}
 
+            t_result = await session.execute(select(MarketTemplate))
+            custom_type_labels = {f"CUSTOM_{t.id}": t.name for t in t_result.scalars().all()}
+
         if not all_markets:
             await interaction.followup.send("No open markets at the moment.", ephemeral=True)
             return
 
         sorted_mkts = sort_markets(all_markets, tribute_map)
-        view = MarketPageView(sorted_mkts, tribute_map, is_admin=False)
+        view = MarketPageView(sorted_mkts, tribute_map, is_admin=False, extra_type_labels=custom_type_labels)
         msg = await interaction.followup.send(
             embed=view.build_embed(), view=view, ephemeral=True
         )

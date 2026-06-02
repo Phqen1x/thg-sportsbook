@@ -22,6 +22,12 @@ DEFAULT_FALLBACK_ODDS = 200
 _DISTRICT_ALPHA = 0.10
 _ALLIANCE_ALPHA = 0.20
 
+# How much of an alliance member's modifier bleeds into their allies' odds
+MODIFIER_ALLIANCE_ALPHA = 0.20
+
+# How much district historical performance influences current tribute odds
+HIST_ALPHA = 0.15
+
 # Market types where group influence applies (single-tribute performance markets)
 _GROUP_INFLUENCED_TYPES = {
     "TRIBUTE_WINS", "TRIBUTE_PLACEMENT", "TRIBUTE_TOP_N",
