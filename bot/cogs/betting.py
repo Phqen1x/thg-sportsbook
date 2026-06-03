@@ -22,6 +22,106 @@ log = logging.getLogger("capitol.betting")
 
 MAX_PARLAY_LEGS = 10
 
+_MAKES_MILESTONES = {"MAKES_FINAL_8", "MAKES_FINAL_5", "MAKES_FINALE"}
+_ALL_MILESTONES = {
+    "MAKES_FINAL_8", "MISSES_FINAL_8",
+    "MAKES_FINAL_5", "MISSES_FINAL_5",
+    "MAKES_FINALE",  "MISSES_FINALE",
+}
+_MILESTONE_GROUP = {
+    "MAKES_FINAL_8": "FINAL_8", "MISSES_FINAL_8": "FINAL_8",
+    "MAKES_FINAL_5": "FINAL_5", "MISSES_FINAL_5": "FINAL_5",
+    "MAKES_FINALE":  "FINALE",  "MISSES_FINALE":  "FINALE",
+}
+
+
+# Every market type that constrains where a tribute finishes. A victor bet is
+# just an exact-placement bet on 1st, so it counts as a placement market too.
+_PLACEMENT_TYPES = {"TRIBUTE_WINS", "TRIBUTE_PLACEMENT", "TRIBUTE_TOP_N", "PLACEMENT_OU"}
+
+
+def _ordinal(n: int) -> str:
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _exact_placement(m: Market) -> int | None:
+    """The single finishing position a market pins down, or None if it covers a
+    range (top-N / over-under) rather than one exact spot."""
+    if m.type == "TRIBUTE_WINS":
+        return 1
+    if m.type == "TRIBUTE_PLACEMENT":
+        return m.placement_num
+    return None
+
+
+def _placement_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Return an error string if adding new_mkt would violate placement parlay rules.
+
+    A tribute can only finish in one position, so two placement bets on the SAME
+    tribute conflict — the lone exception being an opposite over/under pair (e.g.
+    over 3rd AND under 12th, which together describe a finishing window). Across
+    DIFFERENT tributes placement bets are fine, except two bets that pin the same
+    exact position (two victors, or two tributes both finishing exactly Nth),
+    since only one tribute can occupy a given spot.
+    """
+    if new_mkt.type not in _PLACEMENT_TYPES:
+        return None
+    for m in existing_markets:
+        if m.type not in _PLACEMENT_TYPES:
+            continue
+        same_tribute = (
+            m.tribute_a_id is not None and m.tribute_a_id == new_mkt.tribute_a_id
+        )
+        if same_tribute:
+            # Opposite-side placement over/unders together describe a window and
+            # are the only allowed pairing on a single tribute.
+            if (
+                m.type == "PLACEMENT_OU"
+                and new_mkt.type == "PLACEMENT_OU"
+                and m.ou_side and new_mkt.ou_side
+                and m.ou_side != new_mkt.ou_side
+            ):
+                continue
+            return (
+                "You can't parlay two placement bets on the same tribute — a "
+                "tribute only finishes in one position, so victor, exact "
+                "placement, top-N, and placement over/under bets all conflict "
+                "with each other. (The only exception is an opposite over/under "
+                "pair, e.g. over 3rd **and** under 12th.)"
+            )
+        ea, eb = _exact_placement(m), _exact_placement(new_mkt)
+        if ea is not None and ea == eb:
+            if ea == 1:
+                return "You can't parlay two victor bets — only one tribute can win the Games."
+            return (
+                f"You can't parlay two bets on a tribute finishing exactly "
+                f"{_ordinal(ea)} — only one tribute can take that position."
+            )
+    return None
+
+
+def _milestone_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Return an error string if adding new_mkt would violate milestone parlay rules."""
+    if new_mkt.type not in _ALL_MILESTONES:
+        return None
+    same = [
+        m for m in existing_markets
+        if m.tribute_a_id == new_mkt.tribute_a_id and m.type in _ALL_MILESTONES
+    ]
+    new_group = _MILESTONE_GROUP[new_mkt.type]
+    for m in same:
+        if _MILESTONE_GROUP[m.type] == new_group:
+            return (
+                f"Cannot combine two milestone markets for the same phase on one tribute "
+                f"(both target {new_group.replace('_', ' ').title()})."
+            )
+    if new_mkt.type in _MAKES_MILESTONES:
+        for m in same:
+            if m.type in _MAKES_MILESTONES:
+                return "Cannot include two 'makes milestone' bets for the same tribute in one parlay."
+    return None
+
 
 async def _get_or_create_user(session, member: discord.Member) -> User:
     u = await session.get(User, member.id)
@@ -187,14 +287,30 @@ class BettingCog(commands.Cog):
                 await interaction.followup.send("That market is already on your slip.", ephemeral=True)
                 return
 
-            existing = await session.execute(
+            existing_legs_result = await session.execute(
                 select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
             )
-            if len(existing.scalars().all()) >= MAX_PARLAY_LEGS:
+            existing_legs = existing_legs_result.scalars().all()
+            if len(existing_legs) >= MAX_PARLAY_LEGS:
                 await interaction.followup.send(
                     f"Maximum {MAX_PARLAY_LEGS} legs per parlay.", ephemeral=True
                 )
                 return
+
+            # Milestone + placement validation against the legs already on the slip
+            if mkt.type in _ALL_MILESTONES or mkt.type in _PLACEMENT_TYPES:
+                existing_mkts: list[Market] = []
+                for leg in existing_legs:
+                    leg_mkt = await session.get(Market, leg.market_id)
+                    if leg_mkt:
+                        existing_mkts.append(leg_mkt)
+                conflict = (
+                    _milestone_conflict(existing_mkts, mkt)
+                    or _placement_conflict(existing_mkts, mkt)
+                )
+                if conflict:
+                    await interaction.followup.send(conflict, ephemeral=True)
+                    return
 
             session.add(PendingParlayLeg(user_id=user.discord_id, market_id=mkt.id))
             mkt_label = mkt.label
@@ -291,6 +407,16 @@ class BettingCog(commands.Cog):
                     )
                     return
                 markets.append(mkt)
+
+            # Final milestone + placement validation pass before committing
+            for i, mkt in enumerate(markets):
+                conflict = (
+                    _milestone_conflict(markets[:i], mkt)
+                    or _placement_conflict(markets[:i], mkt)
+                )
+                if conflict:
+                    await interaction.followup.send(conflict, ephemeral=True)
+                    return
 
             all_odds = [m.odds for m in markets]
             total_payout = parlay_payout(wager, all_odds)

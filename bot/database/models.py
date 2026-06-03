@@ -36,10 +36,14 @@ class Tribute(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     district: Mapped[int] = mapped_column(Integer, nullable=False)
-    gender: Mapped[str] = mapped_column(String(1), nullable=False)
-    training_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    gender: Mapped[str] = mapped_column(String(2), nullable=False)
+    training_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     face_claim: Mapped[str | None] = mapped_column(String(500), nullable=True)
     kills: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Accumulated kill-quality boost: each kill multiplies this by a factor that
+    # reflects how strong the victim was (see kill_quality_multiplier). Folded
+    # into the tribute's win/kill odds during recalculation.
+    kill_boost: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     status: Mapped[str] = mapped_column(String(10), default="ALIVE", nullable=False)
     death_cause: Mapped[str | None] = mapped_column(String(200), nullable=True)
     killed_by_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tributes.id"), nullable=True)
@@ -47,7 +51,14 @@ class Tribute(Base):
     alliance_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("alliances.id"), nullable=True)
     discord_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     member_joined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sade_participant: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    sade_champion: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    non_binary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    @property
+    def display_gender(self) -> str:
+        return "NB" if self.non_binary else self.gender
 
     alliance: Mapped["Alliance | None"] = relationship("Alliance", back_populates="members")
     markets_as_a: Mapped[list["Market"]] = relationship(
@@ -66,7 +77,7 @@ class Market(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     type: Mapped[str] = mapped_column(String(30), nullable=False)
     label: Mapped[str] = mapped_column(String(200), nullable=False)
-    tribute_a_id: Mapped[int] = mapped_column(Integer, ForeignKey("tributes.id"), nullable=False)
+    tribute_a_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tributes.id"), nullable=True)
     tribute_b_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tributes.id"), nullable=True)
     cause: Mapped[str | None] = mapped_column(String(100), nullable=True)
     placement_num: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -83,7 +94,7 @@ class Market(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     phase: Mapped["BettingPhase | None"] = relationship("BettingPhase", back_populates="markets")
-    tribute_a: Mapped["Tribute"] = relationship("Tribute", foreign_keys=[tribute_a_id], back_populates="markets_as_a")
+    tribute_a: Mapped["Tribute | None"] = relationship("Tribute", foreign_keys=[tribute_a_id], back_populates="markets_as_a")
     tribute_b: Mapped["Tribute | None"] = relationship("Tribute", foreign_keys=[tribute_b_id], back_populates="markets_as_b")
     bets: Mapped[list["Bet"]] = relationship("Bet", back_populates="market")
 
@@ -172,17 +183,37 @@ class GameSetting(Base):
 
 
 class DistrictRecord(Base):
-    """One tribute's performance in one completed game, used for district historical odds."""
+    """Aggregate historical performance for one district across all past games."""
     __tablename__ = "district_records"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    district: Mapped[int] = mapped_column(Integer, nullable=False)
-    game_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    tribute_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    placement: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    kills: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    won: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    district: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Wins / victor breakdown
+    wins: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    victor_male_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    victor_female_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Runner-up breakdown
+    runner_up_finishes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    runner_up_male: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    runner_up_female: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Placements
+    avg_placement: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    avg_placement_last5: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    top8_finishes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    top5_finishes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Kills — total_kills is auto-computed as the sum of gender-specific columns
+    total_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    male_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    female_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bloodbath_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kill_record: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Arena-type win breakdown (natural wins = wins - manmade_arena_wins at display time)
+    manmade_arena_wins: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Training scores (current-game betting reference)
+    avg_training_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    avg_training_score_male: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    avg_training_score_female: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # District reputation (1 = highest/best odds, 5 = lowest, 3 = neutral)
+    reputation: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class Modifier(Base):

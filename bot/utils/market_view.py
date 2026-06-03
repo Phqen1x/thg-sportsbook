@@ -14,40 +14,60 @@ PAGE_SIZE = 12
 
 # Canonical display order for market types
 _TYPE_ORDER: dict[str, int] = {
-    "TRIBUTE_WINS":       0,
-    "TRIBUTE_PLACEMENT":  1,
-    "TRIBUTE_TOP_N":      2,
-    "TRIBUTE_KILLS":      3,
-    "KILLS_OU":           4,
-    "PLACEMENT_OU":       5,
-    "KILL_EVENT":         6,
-    "FIRST_BLOOD":        7,
-    "BLOODBATH_SURVIVOR": 8,
-    "DEATH_CAUSE":        9,
-    "SPONSOR_EVENT":      10,
+    "TRIBUTE_WINS":            0,
+    "TRIBUTE_PLACEMENT":       1,
+    "TRIBUTE_TOP_N":           2,
+    "TRIBUTE_KILLS":           3,
+    "KILLS_OU":                4,
+    "PLACEMENT_OU":            5,
+    "MAKES_FINAL_8":           6,
+    "MISSES_FINAL_8":          7,
+    "MAKES_FINAL_5":           8,
+    "MISSES_FINAL_5":          9,
+    "MAKES_FINALE":            10,
+    "MISSES_FINALE":           11,
+    "KILL_EVENT":              12,
+    "FIRST_BLOOD":             13,
+    "BLOODBATH_SURVIVOR":      14,
+    "DEATH_CAUSE":             15,
+    "ARENA_TYPE":              16,
+    "EXACT_TRAINING_SCORE":    17,
+    "COMBINED_DISTRICT_SCORE": 18,
+    "TRAINING_SCORE_OU":       19,
+    "SPONSOR_EVENT":           20,
 }
 
 _TYPE_LABELS: dict[str, str] = {
-    "TRIBUTE_WINS":       "Victor Markets",
-    "TRIBUTE_PLACEMENT":  "Placement Markets",
-    "TRIBUTE_TOP_N":      "Top-N Finish",
-    "TRIBUTE_KILLS":      "Top Killer",
-    "KILLS_OU":           "Kills Over/Under",
-    "PLACEMENT_OU":       "Placement Over/Under",
-    "KILL_EVENT":         "Kill Events",
-    "FIRST_BLOOD":        "First Blood",
-    "BLOODBATH_SURVIVOR": "Bloodbath Survivor",
-    "DEATH_CAUSE":        "Death Cause",
-    "SPONSOR_EVENT":      "Sponsor Events",
+    "TRIBUTE_WINS":            "Victor Markets",
+    "TRIBUTE_PLACEMENT":       "Placement Markets",
+    "TRIBUTE_TOP_N":           "Top-N Finish",
+    "TRIBUTE_KILLS":           "Top Killer",
+    "KILLS_OU":                "Kills Over/Under",
+    "PLACEMENT_OU":            "Placement Over/Under",
+    "MAKES_FINAL_8":           "Makes Final 8",
+    "MISSES_FINAL_8":          "Eliminated Before Final 8",
+    "MAKES_FINAL_5":           "Makes Final 5",
+    "MISSES_FINAL_5":          "Eliminated Before Final 5",
+    "MAKES_FINALE":            "Makes the Finale",
+    "MISSES_FINALE":           "Eliminated Before Finale",
+    "KILL_EVENT":              "Kill Events",
+    "FIRST_BLOOD":             "First Blood",
+    "BLOODBATH_SURVIVOR":      "Bloodbath Survivor",
+    "DEATH_CAUSE":             "Death Cause",
+    "ARENA_TYPE":              "Arena Type",
+    "EXACT_TRAINING_SCORE":    "Exact Training Score",
+    "COMBINED_DISTRICT_SCORE": "Combined District Score",
+    "TRAINING_SCORE_OU":       "Training Score Over/Under",
+    "SPONSOR_EVENT":           "Sponsor Events",
 }
 
 
 def sort_markets(markets: list["Market"], tribute_map: dict[int, "Tribute"]) -> list["Market"]:
     """Sort markets by type → district → gender (M first) → id."""
     def _key(m: "Market"):
-        trib = tribute_map.get(m.tribute_a_id)
+        trib = tribute_map.get(m.tribute_a_id) if m.tribute_a_id is not None else None
         district = trib.district if trib else 99
-        gender_order = 0 if (trib and trib.gender == "M") else 1
+        gender_order = {"M": 0, "F": 1, "NB": 2}.get(trib.gender, 3) if trib else 3
         return (_TYPE_ORDER.get(m.type, 99), district, gender_order, m.id)
     return sorted(markets, key=_key)
 
