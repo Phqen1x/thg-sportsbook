@@ -521,8 +521,8 @@ def build_quickref():
     rows = [
         [th("Setting"), th("Current Value"), th("Where to Change"), th("What It Does")],
         [td("District peer influence"),   tdc("10%"), td("bot/odds/defaults.py → _DISTRICT_ALPHA"),  td("How much alive districtmates shift your odds")],
-        [td("Alliance peer influence"),   tdc("20%"), td("bot/odds/defaults.py → _ALLIANCE_ALPHA"),  td("How much alive allies shift your odds")],
-        [td("Alliance modifier bleed"),   tdc("20%"), td("bot/odds/defaults.py → MODIFIER_ALLIANCE_ALPHA"), td("How much allies' modifiers bleed into yours")],
+        [td("Alliance peer influence"),   tdc("20%"), td("bot/odds/defaults.py → _ALLIANCE_ALPHA"),  td("How much allies' training strength (vs. field avg) shifts your odds; weak allies penalise")],
+        [td("Alliance factor bleed"),     tdc("20%"), td("bot/odds/defaults.py → ALLIANCE_FACTOR_ALPHA"), td("How much allies' history/bloodbath/modifiers (vs. field avg) shift your odds; weak allies penalise")],
         [td("District history impact"),   tdc("15%"), td("bot/odds/defaults.py → HIST_ALPHA"),       td("Max effect of district historical stats")],
     ]
     col_w = [1.7 * inch, 1.1 * inch, 2.2 * inch, 1.5 * inch]

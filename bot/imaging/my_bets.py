@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from PIL import Image, ImageDraw
 
 from bot.imaging.base import (
-    COLORS, cinzel, cinzel_regular, rajdhani, rajdhani_bold,
+    COLORS, Theme, get_active_theme,
+    cinzel, cinzel_regular, rajdhani, rajdhani_bold,
     draw_rounded_rect, draw_text_centered, draw_text_right, odds_color, status_color,
 )
 from bot.utils.formatters import fmt_chips, fmt_odds, fmt_pct
@@ -52,58 +53,56 @@ def _col_x(col: int) -> int:
     return x
 
 
-def _draw_header(draw: ImageDraw.ImageDraw, username: str, chips: int) -> None:
-    draw.rectangle((0, 0, WIDTH, HEADER_H), fill=COLORS["header_dark"])
-    draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=COLORS["card_border"])
+def _draw_header(draw: ImageDraw.ImageDraw, username: str, chips: int, *, colors: dict) -> None:
+    c = colors
+    draw.rectangle((0, 0, WIDTH, HEADER_H), fill=c["header_dark"])
+    draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=c["card_border"])
 
     title_font = cinzel(20)
     sub_font = rajdhani(13)
-    draw.text((PAD, 14), "MY BETS", font=title_font, fill=COLORS["header_gold"])
-    draw.text((PAD, 44), f"@{username}", font=sub_font, fill=COLORS["text_dim"])
+    draw.text((PAD, 14), "MY BETS", font=title_font, fill=c["header_gold"])
+    draw.text((PAD, 44), f"@{username}", font=sub_font, fill=c["text_dim"])
 
     bal_val = cinzel(18)
     bal_lbl = rajdhani(12)
-    draw_text_right(draw, "BALANCE", bal_lbl, COLORS["text_dim"], WIDTH - PAD, 16)
-    draw_text_right(draw, fmt_chips(chips), bal_val, COLORS["header_gold"], WIDTH - PAD, 36)
+    draw_text_right(draw, "BALANCE", bal_lbl, c["text_dim"], WIDTH - PAD, 16)
+    draw_text_right(draw, fmt_chips(chips), bal_val, c["header_gold"], WIDTH - PAD, 36)
 
 
-def _draw_table_header(draw: ImageDraw.ImageDraw, y: int) -> None:
-    draw.rectangle((0, y, WIDTH, y + ROW_H - 4), fill=COLORS["bg_mid"])
-    draw.rectangle((0, y + ROW_H - 4, WIDTH, y + ROW_H), fill=COLORS["divider"])
+def _draw_table_header(draw: ImageDraw.ImageDraw, y: int, *, colors: dict) -> None:
+    c = colors
+    draw.rectangle((0, y, WIDTH, y + ROW_H - 4), fill=c["bg_mid"])
+    draw.rectangle((0, y + ROW_H - 4, WIDTH, y + ROW_H), fill=c["divider"])
 
     headers = ["MARKET", "WAGER", "ODDS", "PAYOUT", "STATUS"]
     col_font = rajdhani_bold(13)
     for i, h in enumerate(headers):
         x = _col_x(i) + 6
-        draw.text((x, y + 12), h, font=col_font, fill=COLORS["text_dim"])
+        draw.text((x, y + 12), h, font=col_font, fill=c["text_dim"])
 
 
-def _draw_bet_row(draw: ImageDraw.ImageDraw, y: int, bet: BetRowData, alt: bool) -> None:
-    row_fill = COLORS["row_alt"] if alt else COLORS["card_bg"]
+def _draw_bet_row(draw: ImageDraw.ImageDraw, y: int, bet: BetRowData, alt: bool, *, colors: dict) -> None:
+    c = colors
+    row_fill = c["row_alt"] if alt else c["card_bg"]
     draw.rectangle((0, y, WIDTH, y + ROW_H - 1), fill=row_fill)
-    draw.rectangle((0, y + ROW_H - 1, WIDTH, y + ROW_H), fill=COLORS["divider"])
+    draw.rectangle((0, y + ROW_H - 1, WIDTH, y + ROW_H), fill=c["divider"])
 
     label_font = rajdhani(15)
     val_font = rajdhani_bold(15)
     odds_font = rajdhani_bold(15)
     status_font = rajdhani_bold(14)
 
-    # Market label
     label = bet.market_label if len(bet.market_label) <= 38 else bet.market_label[:36] + "…"
-    draw.text((_col_x(0) + 6, y + (ROW_H - 18) // 2), label, font=label_font, fill=COLORS["text_white"])
+    draw.text((_col_x(0) + 6, y + (ROW_H - 18) // 2), label, font=label_font, fill=c["text_white"])
 
-    # Wager
-    draw.text((_col_x(1) + 6, y + (ROW_H - 18) // 2), fmt_chips(bet.wager).replace(" chips", ""), font=val_font, fill=COLORS["text_white"])
+    draw.text((_col_x(1) + 6, y + (ROW_H - 18) // 2), fmt_chips(bet.wager).replace(" chips", ""), font=val_font, fill=c["text_white"])
 
-    # Odds
-    oc = odds_color(bet.odds)
+    oc = odds_color(bet.odds, c)
     draw.text((_col_x(2) + 6, y + (ROW_H - 18) // 2), fmt_odds(bet.odds), font=odds_font, fill=oc)
 
-    # Payout
-    draw.text((_col_x(3) + 6, y + (ROW_H - 18) // 2), fmt_chips(bet.payout).replace(" chips", ""), font=val_font, fill=COLORS["text_white"])
+    draw.text((_col_x(3) + 6, y + (ROW_H - 18) // 2), fmt_chips(bet.payout).replace(" chips", ""), font=val_font, fill=c["text_white"])
 
-    # Status pill
-    sc = status_color(bet.status)
+    sc = status_color(bet.status, c)
     px = _col_x(4) + 4
     pill_w = COL_WIDTHS[4] - 10
     draw_rounded_rect(draw, (px, y + 8, px + pill_w, y + ROW_H - 8), 8,
@@ -111,73 +110,73 @@ def _draw_bet_row(draw: ImageDraw.ImageDraw, y: int, bet: BetRowData, alt: bool)
     draw_text_centered(draw, bet.status, status_font, (255, 255, 255, 255), px + pill_w // 2, y + 13)
 
 
-def _draw_parlay_block(draw: ImageDraw.ImageDraw, y: int, p: ParlayData) -> int:
-    sc = status_color(p.status)
+def _draw_parlay_block(draw: ImageDraw.ImageDraw, y: int, p: ParlayData, *, colors: dict) -> int:
+    c = colors
+    sc = status_color(p.status, c)
 
-    # Parlay header bar
     draw_rounded_rect(draw, (PAD, y, WIDTH - PAD, y + PARLAY_HEADER_H), 8,
-                      fill=COLORS["header_dark"],
-                      outline=COLORS["card_border"],
+                      fill=c["header_dark"],
+                      outline=c["card_border"],
                       outline_width=2)
 
     hf = rajdhani_bold(15)
     sf = rajdhani_bold(13)
-    draw.text((PAD + 10, y + 10), f"PARLAY #{p.parlay_id}", font=hf, fill=COLORS["header_gold"])
+    draw.text((PAD + 10, y + 10), f"PARLAY #{p.parlay_id}", font=hf, fill=c["header_gold"])
     legs_label = f"{len(p.legs)}-LEG PARLAY"
-    draw_text_centered(draw, legs_label, sf, COLORS["text_dim"], WIDTH // 2, y + 12)
+    draw_text_centered(draw, legs_label, sf, c["text_dim"], WIDTH // 2, y + 12)
     draw_rounded_rect(draw, (WIDTH - PAD - 100, y + 8, WIDTH - PAD - 4, y + PARLAY_HEADER_H - 8), 6,
                       fill=(*sc[:3], 160), outline=sc, outline_width=1)
     draw_text_centered(draw, p.status, sf, (255, 255, 255, 255), WIDTH - PAD - 52, y + 12)
     y += PARLAY_HEADER_H + 2
 
-    # Leg rows
     leg_font = rajdhani(14)
     odds_font = rajdhani_bold(14)
     for i, leg in enumerate(p.legs):
-        row_fill = COLORS["row_alt"] if i % 2 == 0 else COLORS["card_bg"]
+        row_fill = c["row_alt"] if i % 2 == 0 else c["card_bg"]
         draw.rectangle((PAD, y, WIDTH - PAD, y + LEG_ROW_H - 1), fill=row_fill)
-        draw.text((PAD + 24, y + (LEG_ROW_H - 16) // 2), f"  └  {leg.market_label}", font=leg_font, fill=COLORS["text_dim"])
-        oc = odds_color(leg.odds)
+        draw.text((PAD + 24, y + (LEG_ROW_H - 16) // 2), f"  └  {leg.market_label}", font=leg_font, fill=c["text_dim"])
+        oc = odds_color(leg.odds, c)
         draw_text_right(draw, fmt_odds(leg.odds), odds_font, oc, WIDTH - PAD - 10, y + (LEG_ROW_H - 18) // 2)
         y += LEG_ROW_H
 
-    # Parlay summary footer
-    draw.rectangle((PAD, y, WIDTH - PAD, y + PARLAY_FOOTER_H), fill=COLORS["bg_mid"])
-    draw.rectangle((PAD, y, WIDTH - PAD, y + 2), fill=COLORS["card_border"])
-    draw.rectangle((PAD, y + PARLAY_FOOTER_H - 2, WIDTH - PAD, y + PARLAY_FOOTER_H), fill=COLORS["divider"])
+    draw.rectangle((PAD, y, WIDTH - PAD, y + PARLAY_FOOTER_H), fill=c["bg_mid"])
+    draw.rectangle((PAD, y, WIDTH - PAD, y + 2), fill=c["card_border"])
+    draw.rectangle((PAD, y + PARLAY_FOOTER_H - 2, WIDTH - PAD, y + PARLAY_FOOTER_H), fill=c["divider"])
 
     pf = rajdhani_bold(14)
-    draw.text((PAD + 10, y + 10), f"WAGER  {fmt_chips(p.total_wager)}", font=pf, fill=COLORS["text_white"])
+    draw.text((PAD + 10, y + 10), f"WAGER  {fmt_chips(p.total_wager)}", font=pf, fill=c["text_white"])
     combo_str = f"COMBINED  {fmt_odds(p.combined_odds)}"
-    oc = odds_color(p.combined_odds)
+    oc = odds_color(p.combined_odds, c)
     draw_text_centered(draw, combo_str, pf, oc, WIDTH // 2, y + 10)
-    draw_text_right(draw, f"PAYOUT  {fmt_chips(p.total_payout)}", pf, COLORS["header_gold"], WIDTH - PAD - 10, y + 10)
+    draw_text_right(draw, f"PAYOUT  {fmt_chips(p.total_payout)}", pf, c["header_gold"], WIDTH - PAD - 10, y + 10)
 
     y += PARLAY_FOOTER_H + PAD
     return y
 
 
-def _draw_section_label(draw: ImageDraw.ImageDraw, y: int, text: str) -> None:
-    draw.rectangle((0, y, WIDTH, y + SECTION_LABEL_H), fill=COLORS["bg_mid"])
-    draw.rectangle((0, y + SECTION_LABEL_H - 2, WIDTH, y + SECTION_LABEL_H), fill=COLORS["divider"])
+def _draw_section_label(draw: ImageDraw.ImageDraw, y: int, text: str, *, colors: dict) -> None:
+    c = colors
+    draw.rectangle((0, y, WIDTH, y + SECTION_LABEL_H), fill=c["bg_mid"])
+    draw.rectangle((0, y + SECTION_LABEL_H - 2, WIDTH, y + SECTION_LABEL_H), fill=c["divider"])
     font = cinzel_regular(12)
-    draw.text((PAD, y + 8), text, font=font, fill=COLORS["text_gold"])
+    draw.text((PAD, y + 8), text, font=font, fill=c["text_gold"])
 
 
-def _draw_footer(draw: ImageDraw.ImageDraw, y: int, total_wagered: int, total_potential: int, chips: int) -> None:
-    draw.rectangle((0, y, WIDTH, y + FOOTER_H), fill=COLORS["header_dark"])
-    draw.rectangle((0, y, WIDTH, y + 3), fill=COLORS["card_border"])
+def _draw_footer(draw: ImageDraw.ImageDraw, y: int, total_wagered: int, total_potential: int, chips: int, *, colors: dict) -> None:
+    c = colors
+    draw.rectangle((0, y, WIDTH, y + FOOTER_H), fill=c["header_dark"])
+    draw.rectangle((0, y, WIDTH, y + 3), fill=c["card_border"])
 
     f = rajdhani_bold(14)
     lf = rajdhani(13)
-    draw.text((PAD, y + 8), "TOTAL WAGERED", font=lf, fill=COLORS["text_dim"])
-    draw.text((PAD, y + 28), fmt_chips(total_wagered), font=f, fill=COLORS["text_white"])
+    draw.text((PAD, y + 8), "TOTAL WAGERED", font=lf, fill=c["text_dim"])
+    draw.text((PAD, y + 28), fmt_chips(total_wagered), font=f, fill=c["text_white"])
 
-    draw_text_centered(draw, "TOTAL POTENTIAL", lf, COLORS["text_dim"], WIDTH // 2, y + 8)
-    draw_text_centered(draw, fmt_chips(total_potential), f, COLORS["header_gold"], WIDTH // 2, y + 28)
+    draw_text_centered(draw, "TOTAL POTENTIAL", lf, c["text_dim"], WIDTH // 2, y + 8)
+    draw_text_centered(draw, fmt_chips(total_potential), f, c["header_gold"], WIDTH // 2, y + 28)
 
-    draw_text_right(draw, "CURRENT BALANCE", lf, COLORS["text_dim"], WIDTH - PAD, y + 8)
-    draw_text_right(draw, fmt_chips(chips), f, COLORS["header_gold"], WIDTH - PAD, y + 28)
+    draw_text_right(draw, "CURRENT BALANCE", lf, c["text_dim"], WIDTH - PAD, y + 8)
+    draw_text_right(draw, fmt_chips(chips), f, c["header_gold"], WIDTH - PAD, y + 28)
 
 
 def render_my_bets(
@@ -187,7 +186,9 @@ def render_my_bets(
     parlays: list[ParlayData],
     filter_status: str = "ALL",
 ) -> io.BytesIO:
-    # Calculate dynamic height
+    theme = get_active_theme()
+    c = theme.colors
+
     h = HEADER_H
     if straight_bets:
         h += SECTION_LABEL_H + ROW_H + len(straight_bets) * ROW_H
@@ -204,36 +205,39 @@ def render_my_bets(
         if p.status == "PENDING":
             total_potential += p.total_payout
 
-    img = Image.new("RGBA", (WIDTH, h), COLORS["bg"])
+    img = Image.new("RGBA", (WIDTH, h), c["bg"])
+    theme.draw_bg(img, WIDTH, h)
     draw = ImageDraw.Draw(img)
 
     for gx in range(0, WIDTH, 40):
         draw.line((gx, 0, gx, h), fill=(255, 255, 255, 3))
 
-    _draw_header(draw, username, chips)
+    _draw_header(draw, username, chips, colors=c)
     cur_y = HEADER_H
 
     if straight_bets:
-        _draw_section_label(draw, cur_y, "STRAIGHT BETS")
+        _draw_section_label(draw, cur_y, "STRAIGHT BETS", colors=c)
         cur_y += SECTION_LABEL_H
-        _draw_table_header(draw, cur_y)
+        _draw_table_header(draw, cur_y, colors=c)
         cur_y += ROW_H
         for i, bet in enumerate(straight_bets):
-            _draw_bet_row(draw, cur_y, bet, i % 2 == 0)
+            _draw_bet_row(draw, cur_y, bet, i % 2 == 0, colors=c)
             cur_y += ROW_H
 
     if parlays:
-        _draw_section_label(draw, cur_y, "PARLAYS")
+        _draw_section_label(draw, cur_y, "PARLAYS", colors=c)
         cur_y += SECTION_LABEL_H + PAD // 2
         for p in parlays:
-            cur_y = _draw_parlay_block(draw, cur_y, p)
+            cur_y = _draw_parlay_block(draw, cur_y, p, colors=c)
 
     if not straight_bets and not parlays:
         no_bets_font = rajdhani(18)
-        draw_text_centered(draw, "No bets found.", no_bets_font, COLORS["text_dim"], WIDTH // 2, HEADER_H + 60)
+        draw_text_centered(draw, "No bets found.", no_bets_font, c["text_dim"], WIDTH // 2, HEADER_H + 60)
         cur_y = HEADER_H + 120
 
-    _draw_footer(draw, max(cur_y, h - FOOTER_H), total_wagered, total_potential, chips)
+    _draw_footer(draw, max(cur_y, h - FOOTER_H), total_wagered, total_potential, chips, colors=c)
+
+    theme.draw_fg(img, WIDTH, h)
 
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG", optimize=True)

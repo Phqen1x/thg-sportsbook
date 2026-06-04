@@ -1,4 +1,28 @@
 from __future__ import annotations
+import math
+
+# ── Odds rail (soft-knee compression) ────────────────────────────────────────
+# American odds magnitude is capped at ±ODDS_RAIL. Rather than a hard clamp at
+# the rail (which made every sub-1% / super-99% probability collapse onto an
+# identical ±9900), the magnitude is bent smoothly toward the rail above a
+# "knee": everything below ODDS_KNEE passes through untouched (competitive
+# lines are unaffected), and beyond it the curve asymptotes to ODDS_RAIL so the
+# rail is reached only by genuinely extreme inputs. ODDS_TAU sets how quickly
+# the tail approaches the rail (larger = longshots compressed harder).
+ODDS_RAIL = 9900.0
+ODDS_KNEE = 2500.0
+ODDS_TAU = 11000.0
+# Internal probability clamp, far below the rail so the soft knee (not the
+# clamp) governs the tail. Symmetric so both extremes behave identically.
+_PROB_MIN = 0.0002
+
+
+def _soft_rail(magnitude: float) -> float:
+    """Bend an American-odds magnitude toward ODDS_RAIL above ODDS_KNEE."""
+    if magnitude <= ODDS_KNEE:
+        return magnitude
+    span = ODDS_RAIL - ODDS_KNEE
+    return ODDS_KNEE + span * (1.0 - math.exp(-(magnitude - ODDS_KNEE) / ODDS_TAU))
 
 
 def american_to_decimal(odds: int) -> float:
@@ -14,12 +38,14 @@ def decimal_to_american(dec: float) -> int:
 
 
 def prob_to_american(prob: float) -> int:
-    prob = max(0.01, min(0.99, prob))
+    prob = max(_PROB_MIN, min(1.0 - _PROB_MIN, prob))
     if prob >= 0.5:
         raw = -(prob / (1.0 - prob)) * 100.0
     else:
         raw = ((1.0 - prob) / prob) * 100.0
-    rounded = round(raw / 5.0) * 5
+    magnitude = _soft_rail(abs(raw))
+    signed = -magnitude if raw < 0 else magnitude
+    rounded = round(signed / 5.0) * 5
     return int(rounded)
 
 

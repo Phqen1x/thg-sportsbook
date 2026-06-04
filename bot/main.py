@@ -6,7 +6,8 @@ import discord
 from discord.ext import commands
 
 from bot import config
-from bot.database.engine import init_db
+from bot.database.engine import get_setting, init_db
+from bot.imaging.base import get_theme_by_name, set_active_theme
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,6 +25,13 @@ class SportsBookBot(commands.Bot):
     async def setup_hook(self) -> None:
         log.info("Initializing database...")
         await init_db()
+
+        saved_theme = await get_setting("image_theme")
+        if saved_theme:
+            theme = get_theme_by_name(saved_theme)
+            if theme:
+                set_active_theme(theme)
+                log.info(f"Loaded image theme: {theme.name}")
 
         log.info("Loading cogs...")
         await self.load_extension("bot.cogs.admin")

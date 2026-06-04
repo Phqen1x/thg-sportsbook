@@ -8,7 +8,7 @@ from bot.odds.calculator import implied_probability
 from bot.utils.formatters import fmt_odds, fmt_pct
 
 if TYPE_CHECKING:
-    from bot.database.models import Market, Tribute
+    from bot.database.models import Market, MarketTemplate, Tribute
 
 PAGE_SIZE = 12
 
@@ -250,6 +250,120 @@ class MarketPageView(discord.ui.View):
         await self._safe_edit(interaction)
 
     # ── Timeout ───────────────────────────────────────────────────────────────
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+TEMPLATE_PAGE_SIZE = 10
+
+
+class MarketTypePageView(discord.ui.View):
+    """Paginated embed view for market type templates (admin /market-type list)."""
+
+    def __init__(
+        self,
+        templates: list["MarketTemplate"],
+        difficulty_odds: dict[str, int],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.templates = templates
+        self.difficulty_odds = difficulty_odds
+        self.page = 0
+        self.total_pages = max(1, (len(templates) + TEMPLATE_PAGE_SIZE - 1) // TEMPLATE_PAGE_SIZE)
+        self.message: discord.Message | None = None
+
+        self.btn_first = discord.ui.Button(emoji="⏮", style=discord.ButtonStyle.secondary, row=0, disabled=True)
+        self.btn_prev = discord.ui.Button(emoji="◀", style=discord.ButtonStyle.secondary, row=0, disabled=True)
+        self.btn_page_label = discord.ui.Button(
+            label=f"1 / {self.total_pages}", style=discord.ButtonStyle.secondary, row=0, disabled=True
+        )
+        self.btn_next = discord.ui.Button(
+            emoji="▶", style=discord.ButtonStyle.secondary, row=0, disabled=self.total_pages <= 1
+        )
+        self.btn_last = discord.ui.Button(
+            emoji="⏭", style=discord.ButtonStyle.secondary, row=0, disabled=self.total_pages <= 1
+        )
+
+        self.btn_first.callback = self._on_first
+        self.btn_prev.callback = self._on_prev
+        self.btn_next.callback = self._on_next
+        self.btn_last.callback = self._on_last
+
+        for btn in (self.btn_first, self.btn_prev, self.btn_page_label, self.btn_next, self.btn_last):
+            self.add_item(btn)
+
+    def _sync_buttons(self) -> None:
+        at_first = self.page == 0
+        at_last = self.page >= self.total_pages - 1
+        self.btn_first.disabled = at_first
+        self.btn_prev.disabled = at_first
+        self.btn_next.disabled = at_last
+        self.btn_last.disabled = at_last
+        self.btn_page_label.label = f"{self.page + 1} / {self.total_pages}"
+
+    def build_embed(self) -> discord.Embed:
+        start = self.page * TEMPLATE_PAGE_SIZE
+        page_templates = self.templates[start : start + TEMPLATE_PAGE_SIZE]
+
+        embed = discord.Embed(title="Market Types", color=0xC9A227)
+        for t in page_templates:
+            kind = "Built-in" if t.is_builtin else "Custom"
+            status = "ACTIVE" if t.active else "INACTIVE"
+            if t.default_odds is not None:
+                odds_str = fmt_odds(t.default_odds)
+            elif t.is_builtin:
+                odds_str = "Computed"
+            else:
+                odds_str = fmt_odds(self.difficulty_odds[t.difficulty])
+            label_str = f"\nLabel: `{t.label_template}`" if t.label_template else ""
+            embed.add_field(
+                name=f"#{t.id} {t.name} [{kind} · {status}]",
+                value=(
+                    f"{t.description}\n"
+                    f"Difficulty: **{t.difficulty}** | Odds: **{odds_str}**"
+                    f"{label_str}"
+                ),
+                inline=False,
+            )
+
+        total = len(self.templates)
+        embed.set_footer(
+            text=f"Page {self.page + 1} of {self.total_pages}  ·  {total} type{'s' if total != 1 else ''}"
+        )
+        return embed
+
+    async def _safe_edit(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        except discord.NotFound:
+            pass
+
+    async def _on_first(self, interaction: discord.Interaction) -> None:
+        self.page = 0
+        self._sync_buttons()
+        await self._safe_edit(interaction)
+
+    async def _on_prev(self, interaction: discord.Interaction) -> None:
+        self.page = max(0, self.page - 1)
+        self._sync_buttons()
+        await self._safe_edit(interaction)
+
+    async def _on_next(self, interaction: discord.Interaction) -> None:
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self._sync_buttons()
+        await self._safe_edit(interaction)
+
+    async def _on_last(self, interaction: discord.Interaction) -> None:
+        self.page = self.total_pages - 1
+        self._sync_buttons()
+        await self._safe_edit(interaction)
 
     async def on_timeout(self) -> None:
         for item in self.children:

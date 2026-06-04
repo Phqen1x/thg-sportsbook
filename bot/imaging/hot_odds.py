@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING
 from PIL import Image, ImageDraw
 
 from bot.imaging.base import (
-    COLORS, cinzel, cinzel_regular, rajdhani, rajdhani_bold,
+    COLORS, Theme, get_active_theme,
+    cinzel, cinzel_regular, rajdhani, rajdhani_bold,
     draw_rounded_rect, draw_text_centered, draw_text_right,
     image_from_bytes, paste_image, odds_color,
 )
@@ -63,61 +64,62 @@ class TributeDetailData:
     markets: list[FeaturedMarket]
 
 
-def _draw_header(draw: ImageDraw.ImageDraw, img: Image.Image, chips: int) -> None:
+def _tribute_status_color(status: str, colors: dict) -> tuple:
+    return {
+        "ALIVE":  colors["alive"],
+        "DEAD":   colors["dead"],
+        "VICTOR": colors["victor"],
+    }.get(status, colors["text_dim"])
+
+
+def _draw_header(draw: ImageDraw.ImageDraw, img: Image.Image, chips: int, *, colors: dict) -> None:
+    c = colors
     draw_rounded_rect(draw, (0, 0, WIDTH - 1, HEADER_H - 1), 0,
-                      fill=COLORS["header_dark"])
+                      fill=c["header_dark"])
 
-    # Decorative gold border on bottom of header
-    draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=COLORS["card_border"])
+    draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=c["card_border"])
 
-    # Crest — simple geometric Capitol symbol drawn with Pillow
     cx, cy = 52, HEADER_H // 2
-    draw.ellipse((cx - 22, cy - 22, cx + 22, cy + 22), outline=COLORS["header_gold"], width=2)
-    draw.ellipse((cx - 14, cy - 14, cx + 14, cy + 14), outline=COLORS["header_gold"], width=1)
+    draw.ellipse((cx - 22, cy - 22, cx + 22, cy + 22), outline=c["header_gold"], width=2)
+    draw.ellipse((cx - 14, cy - 14, cx + 14, cy + 14), outline=c["header_gold"], width=1)
     for angle_deg in range(0, 360, 45):
         angle = math.radians(angle_deg)
         x1 = cx + int(14 * math.cos(angle))
         y1 = cy + int(14 * math.sin(angle))
         x2 = cx + int(22 * math.cos(angle))
         y2 = cy + int(22 * math.sin(angle))
-        draw.line((x1, y1, x2, y2), fill=COLORS["header_gold"], width=1)
+        draw.line((x1, y1, x2, y2), fill=c["header_gold"], width=1)
 
-    # Title
     title_font = cinzel(22)
-    draw.text((82, 14), "CAPITOL SPORTSBOOK", font=title_font, fill=COLORS["header_gold"])
+    draw.text((82, 14), "CAPITOL SPORTSBOOK", font=title_font, fill=c["header_gold"])
     sub_font = rajdhani(13)
-    draw.text((82, 44), "MAY THE ODDS BE EVER IN YOUR FAVOR", font=sub_font, fill=COLORS["text_dim"])
+    draw.text((82, 44), "MAY THE ODDS BE EVER IN YOUR FAVOR", font=sub_font, fill=c["text_dim"])
 
-    # Chip balance
     bal_label = rajdhani(12)
     bal_val = cinzel(18)
-    draw_text_right(draw, "ACCOUNT BALANCE", bal_label, COLORS["text_dim"], WIDTH - PAD, 16)
-    draw_text_right(draw, fmt_chips(chips), bal_val, COLORS["header_gold"], WIDTH - PAD, 34)
+    draw_text_right(draw, "ACCOUNT BALANCE", bal_label, c["text_dim"], WIDTH - PAD, 16)
+    draw_text_right(draw, fmt_chips(chips), bal_val, c["header_gold"], WIDTH - PAD, 34)
 
 
-def _draw_section_label(draw: ImageDraw.ImageDraw, y: int, text: str) -> None:
-    draw.rectangle((0, y, WIDTH, y + SECTION_H), fill=COLORS["bg_mid"])
-    draw.rectangle((0, y + SECTION_H - 2, WIDTH, y + SECTION_H), fill=COLORS["divider"])
+def _draw_section_label(draw: ImageDraw.ImageDraw, y: int, text: str, *, colors: dict) -> None:
+    c = colors
+    draw.rectangle((0, y, WIDTH, y + SECTION_H), fill=c["bg_mid"])
+    draw.rectangle((0, y + SECTION_H - 2, WIDTH, y + SECTION_H), fill=c["divider"])
     font = cinzel_regular(14)
-    draw_text_centered(draw, text, font, COLORS["header_gold"], WIDTH // 2, y + 12)
-
-
-def _tribute_status_color(status: str) -> tuple:
-    return {
-        "ALIVE":  COLORS["alive"],
-        "DEAD":   COLORS["dead"],
-        "VICTOR": COLORS["victor"],
-    }.get(status, COLORS["text_dim"])
+    draw_text_centered(draw, text, font, c["header_gold"], WIDTH // 2, y + 12)
 
 
 def _draw_tribute_rows(
     draw: ImageDraw.ImageDraw,
     cards: list[TributeCardData],
     y_start: int,
+    *,
+    colors: dict,
 ) -> None:
     if not cards:
         return
 
+    c = colors
     n_cols = 2
     col_w = (WIDTH - PAD * (n_cols + 1)) // n_cols
     badge_font = rajdhani_bold(11)
@@ -132,25 +134,23 @@ def _draw_tribute_rows(
         cy = y_start + row_idx * (TRIBUTE_ROW_H + _TRIBUTE_ROW_GAP)
 
         is_dead = card.status == "DEAD"
-        row_fill = COLORS["row_alt"] if row_idx % 2 == 0 else COLORS["card_bg"]
+        row_fill = c["row_alt"] if row_idx % 2 == 0 else c["card_bg"]
         draw_rounded_rect(draw, (cx, cy, cx + col_w, cy + TRIBUTE_ROW_H), 5,
-                          fill=row_fill, outline=COLORS["divider"], outline_width=1)
+                          fill=row_fill, outline=c["divider"], outline_width=1)
 
         pill_y1 = cy + 5
         pill_y2 = cy + TRIBUTE_ROW_H - 5
 
-        # ── District/gender badge ─────────────────────────────────────────────
         badge_text = f"D{card.district}{card.gender}"
         badge_tw = draw.textbbox((0, 0), badge_text, font=badge_font)[2]
         badge_w = badge_tw + 10
         badge_x = cx + 5
         draw_rounded_rect(draw, (badge_x, pill_y1, badge_x + badge_w, pill_y2), 4,
-                          fill=COLORS["header_dark"], outline=COLORS["card_border"], outline_width=1)
-        draw_text_centered(draw, badge_text, badge_font, COLORS["header_gold"],
+                          fill=c["header_dark"], outline=c["card_border"], outline_width=1)
+        draw_text_centered(draw, badge_text, badge_font, c["header_gold"],
                            badge_x + badge_w // 2, pill_y1 + 3)
 
-        # ── Status pill (right edge) ──────────────────────────────────────────
-        sc = _tribute_status_color(card.status)
+        sc = _tribute_status_color(card.status, c)
         status_text = card.status
         st_tw = draw.textbbox((0, 0), status_text, font=status_font)[2]
         st_w = st_tw + 10
@@ -160,11 +160,10 @@ def _draw_tribute_rows(
         draw_text_centered(draw, status_text, status_font, sc,
                            st_x + st_w // 2, pill_y1 + 3)
 
-        # ── Win odds chip (left of status) ────────────────────────────────────
         right_edge = st_x - 6
         if card.win_odds is not None:
             odds_str = fmt_odds(card.win_odds)
-            oc = odds_color(card.win_odds)
+            oc = odds_color(card.win_odds, c)
             ow = draw.textbbox((0, 0), odds_str, font=odds_font)[2] + 14
             chip_x = right_edge - ow
             draw_rounded_rect(draw, (chip_x, pill_y1, chip_x + ow, pill_y2), 4,
@@ -173,7 +172,6 @@ def _draw_tribute_rows(
                                chip_x + ow // 2, pill_y1 + 3)
             right_edge = chip_x - 6
 
-        # ── Name ──────────────────────────────────────────────────────────────
         name_x = badge_x + badge_w + 8
         max_name_w = right_edge - name_x - 4
         name = card.name
@@ -182,7 +180,7 @@ def _draw_tribute_rows(
         if name != card.name:
             name = name.rstrip() + "…"
 
-        name_color = COLORS["text_dim"] if is_dead else COLORS["text_white"]
+        name_color = c["text_dim"] if is_dead else c["text_white"]
         text_y = cy + (TRIBUTE_ROW_H - 15) // 2
         draw.text((name_x, text_y), name, font=name_font, fill=name_color)
 
@@ -190,15 +188,16 @@ def _draw_tribute_rows(
 def _draw_placeholder_face(
     draw: ImageDraw.ImageDraw,
     x: int, y: int, size: int, gender: str,
+    *,
+    colors: dict,
 ) -> None:
-    draw.ellipse((x, y, x + size, y + size), fill=COLORS["bg_mid"], outline=COLORS["divider"], width=1)
+    c = colors
+    draw.ellipse((x, y, x + size, y + size), fill=c["bg_mid"], outline=c["divider"], width=1)
     font = cinzel(20)
     symbol = {"M": "M", "F": "F", "NB": "NB"}.get(gender, "?")
-    draw_text_centered(draw, symbol, font, COLORS["text_dim"], x + size // 2, y + size // 2 - 14)
+    draw_text_centered(draw, symbol, font, c["text_dim"], x + size // 2, y + size // 2 - 14)
 
 
-# Matches "D5NB Foxface " (the tribute prefix) up to the start of the market description.
-# The lookahead anchors on the first action/descriptor keyword so multi-word names work too.
 _TRIBUTE_NAME_RE = re.compile(
     r'^(D\d+(?:M|F|NB))\s+.+?\s+'
     r'(?=(?:Wins|Finishes|Top|Gets|Kills|Dies|Survives|Makes|Eliminated|Training|Placement|First|Bloodbath|Finale)\b)'
@@ -231,7 +230,6 @@ def _smart_shorten_label(label: str, draw, font, max_width: int) -> str:
     if fits(label):
         return label
 
-    # Step 1: strip tribute name, keep district code (e.g. "D5NB Foxface …" → "D5NB …")
     m = _TRIBUTE_NAME_RE.match(label)
     if m:
         shortened = label[: m.end(1)] + " " + label[m.end():]
@@ -239,7 +237,6 @@ def _smart_shorten_label(label: str, draw, font, max_width: int) -> str:
             return shortened
         label = shortened
 
-    # Step 2: abbreviate common verbose phrases
     for old, new in _ABBREVIATIONS:
         if old in label:
             test = label.replace(old, new)
@@ -247,7 +244,6 @@ def _smart_shorten_label(label: str, draw, font, max_width: int) -> str:
                 return test
             label = test
 
-    # Step 3: hard truncate with ellipsis
     for end in range(len(label) - 1, 0, -1):
         test = label[:end].rstrip() + "…"
         if fits(test):
@@ -259,10 +255,13 @@ def _draw_featured_markets(
     draw: ImageDraw.ImageDraw,
     markets: list[FeaturedMarket],
     y_start: int,
+    *,
+    colors: dict,
 ) -> int:
     if not markets:
         return y_start
 
+    c = colors
     label_font = rajdhani(14)
     odds_font = rajdhani_bold(15)
     col_w = (WIDTH - PAD * 3) // 2
@@ -275,23 +274,21 @@ def _draw_featured_markets(
         my = y_start + row * (col_h + 4)
 
         draw_rounded_rect(draw, (mx, my, mx + col_w, my + col_h), 8,
-                          fill=COLORS["card_bg"],
-                          outline=COLORS["divider"],
+                          fill=c["card_bg"],
+                          outline=c["divider"],
                           outline_width=1)
 
-        # Odds chip — compute width first so we know how much room the label has
         odds_str = fmt_odds(mkt.odds)
-        oc = odds_color(mkt.odds)
+        oc = odds_color(mkt.odds, c)
         odds_bbox = draw.textbbox((0, 0), odds_str, font=odds_font)
         ow = odds_bbox[2] - odds_bbox[0] + 20
         chip_x = mx + col_w - ow - 8
         chip_y1 = my + 7
         chip_y2 = my + col_h - 7
 
-        # Label gets the space to the left of the chip; shorten only if needed
         max_label_w = chip_x - (mx + 10) - 8
         label = _smart_shorten_label(mkt.label, draw, label_font, max_label_w)
-        draw.text((mx + 10, my + (col_h - 18) // 2), label, font=label_font, fill=COLORS["text_white"])
+        draw.text((mx + 10, my + (col_h - 18) // 2), label, font=label_font, fill=c["text_white"])
 
         draw_rounded_rect(draw, (chip_x, chip_y1, chip_x + ow, chip_y2), 6,
                           fill=(*oc[:3], 200), outline=oc, outline_width=1)
@@ -302,18 +299,19 @@ def _draw_featured_markets(
     return y_start + rows * (col_h + 4)
 
 
-def _draw_footer(draw: ImageDraw.ImageDraw, img_h: int) -> None:
-    draw.rectangle((0, img_h - FOOTER_H, WIDTH, img_h), fill=COLORS["header_dark"])
-    draw.rectangle((0, img_h - FOOTER_H, WIDTH, img_h - FOOTER_H + 2), fill=COLORS["card_border"])
+def _draw_footer(draw: ImageDraw.ImageDraw, img_h: int, *, colors: dict) -> None:
+    c = colors
+    draw.rectangle((0, img_h - FOOTER_H, WIDTH, img_h), fill=c["header_dark"])
+    draw.rectangle((0, img_h - FOOTER_H, WIDTH, img_h - FOOTER_H + 2), fill=c["card_border"])
     font = rajdhani(13)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
-    draw.text((PAD, img_h - FOOTER_H + 11), "CAPITOL ANNOUNCEMENT", font=font, fill=COLORS["text_gold"])
-    draw_text_right(draw, ts, font, COLORS["text_dim"], WIDTH - PAD, img_h - FOOTER_H + 11)
+    draw.text((PAD, img_h - FOOTER_H + 11), "CAPITOL ANNOUNCEMENT", font=font, fill=c["text_gold"])
+    draw_text_right(draw, ts, font, c["text_dim"], WIDTH - PAD, img_h - FOOTER_H + 11)
     msg_font = rajdhani(12)
     draw_text_centered(
         draw,
         "TODAY WE HONOR TOMORROW'S VICTORS. PLACE YOUR BETS WISELY.",
-        msg_font, COLORS["text_dim"], WIDTH // 2, img_h - FOOTER_H + 11,
+        msg_font, c["text_dim"], WIDTH // 2, img_h - FOOTER_H + 11,
     )
 
 
@@ -322,7 +320,10 @@ def render_hot_odds(
     featured: list[FeaturedMarket],
     user_chips: int,
 ) -> io.BytesIO:
-    ordered = sorted(cards, key=lambda c: (c.district, c.gender))
+    theme = get_active_theme()
+    c = theme.colors
+
+    ordered = sorted(cards, key=lambda card: (card.district, card.gender))
     n = len(ordered)
     n_left = math.ceil(n / 2)
     left_col = ordered[:n_left]
@@ -350,29 +351,27 @@ def render_hot_odds(
         + PAD
     )
 
-    img = Image.new("RGBA", (WIDTH, img_h), COLORS["bg"])
+    img = Image.new("RGBA", (WIDTH, img_h), c["bg"])
+    theme.draw_bg(img, WIDTH, img_h)
     draw = ImageDraw.Draw(img)
 
-    for gx in range(0, WIDTH, 40):
-        draw.line((gx, 0, gx, img_h), fill=(255, 255, 255, 4))
-    for gy in range(0, img_h, 40):
-        draw.line((0, gy, WIDTH, gy), fill=(255, 255, 255, 4))
-
-    _draw_header(draw, img, user_chips)
+    _draw_header(draw, img, user_chips, colors=c)
 
     cur_y = HEADER_H
-    _draw_section_label(draw, cur_y, "HUNGER GAMES  ·  TRIBUTE ODDS")
+    _draw_section_label(draw, cur_y, "HUNGER GAMES  ·  TRIBUTE ODDS", colors=c)
     cur_y += SECTION_H + PAD
 
-    _draw_tribute_rows(draw, sorted_cards, cur_y)
+    _draw_tribute_rows(draw, sorted_cards, cur_y, colors=c)
     cur_y += tribute_section_h
 
     if featured_8:
-        _draw_section_label(draw, cur_y, "FEATURED MARKETS")
+        _draw_section_label(draw, cur_y, "FEATURED MARKETS", colors=c)
         cur_y += SECTION_H + 8
-        _draw_featured_markets(draw, featured_8, cur_y)
+        _draw_featured_markets(draw, featured_8, cur_y, colors=c)
 
-    _draw_footer(draw, img_h)
+    _draw_footer(draw, img_h, colors=c)
+
+    theme.draw_fg(img, WIDTH, img_h)
 
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG", optimize=True)
@@ -384,6 +383,9 @@ def render_tribute_detail(
     detail: TributeDetailData,
     user_chips: int,
 ) -> io.BytesIO:
+    theme = get_active_theme()
+    c = theme.colors
+
     FACE_SIZE = 180
     stats_row_h = FACE_SIZE + PAD * 2
 
@@ -400,97 +402,92 @@ def render_tribute_detail(
         + PAD
     )
 
-    img = Image.new("RGBA", (WIDTH, img_h), COLORS["bg"])
+    img = Image.new("RGBA", (WIDTH, img_h), c["bg"])
+    theme.draw_bg(img, WIDTH, img_h)
     draw = ImageDraw.Draw(img)
 
-    for gx in range(0, WIDTH, 40):
-        draw.line((gx, 0, gx, img_h), fill=(255, 255, 255, 4))
-    for gy in range(0, img_h, 40):
-        draw.line((0, gy, WIDTH, gy), fill=(255, 255, 255, 4))
-
-    _draw_header(draw, img, user_chips)
+    _draw_header(draw, img, user_chips, colors=c)
 
     cur_y = HEADER_H
     section_label = f"D{detail.district}{detail.gender}  ·  {detail.name.upper()}"
-    _draw_section_label(draw, cur_y, section_label)
+    _draw_section_label(draw, cur_y, section_label, colors=c)
     cur_y += SECTION_H + PAD
 
-    # ── Face image ────────────────────────────────────────────────────────────
     face_x, face_y = PAD, cur_y
     if detail.face_bytes:
         face_img = image_from_bytes(detail.face_bytes)
         if face_img:
             paste_image(img, face_img, (face_x, face_y), (FACE_SIZE, FACE_SIZE), circular=True)
         else:
-            _draw_placeholder_face(draw, face_x, face_y, FACE_SIZE, detail.gender)
+            _draw_placeholder_face(draw, face_x, face_y, FACE_SIZE, detail.gender, colors=c)
     else:
-        _draw_placeholder_face(draw, face_x, face_y, FACE_SIZE, detail.gender)
+        _draw_placeholder_face(draw, face_x, face_y, FACE_SIZE, detail.gender, colors=c)
 
     badge_font = rajdhani_bold(13)
     badge_text = f"D{detail.district}{detail.gender}"
     badge_tw = draw.textbbox((0, 0), badge_text, font=badge_font)[2]
     badge_w = badge_tw + 12
     draw_rounded_rect(draw, (face_x, face_y, face_x + badge_w, face_y + 22), 4,
-                      fill=COLORS["header_dark"], outline=COLORS["card_border"], outline_width=1)
-    draw_text_centered(draw, badge_text, badge_font, COLORS["header_gold"],
+                      fill=c["header_dark"], outline=c["card_border"], outline_width=1)
+    draw_text_centered(draw, badge_text, badge_font, c["header_gold"],
                        face_x + badge_w // 2, face_y + 4)
 
-    # ── Stats panel ───────────────────────────────────────────────────────────
     stats_x = face_x + FACE_SIZE + PAD * 2
     sy = face_y + 4
 
     name_font = cinzel(26)
-    draw.text((stats_x, sy), detail.name.upper(), font=name_font, fill=COLORS["text_white"])
+    draw.text((stats_x, sy), detail.name.upper(), font=name_font, fill=c["text_white"])
     sy += 38
 
     meta_font = rajdhani(16)
     gender_label = {"M": "MALE", "F": "FEMALE", "NB": "NON-BINARY"}.get(detail.gender, detail.gender)
     score_str = str(detail.training_score) if detail.training_score is not None else "?"
     draw.text((stats_x, sy), f"{gender_label}  ·  TRAINING SCORE {score_str}",
-              font=meta_font, fill=COLORS["text_dim"])
+              font=meta_font, fill=c["text_dim"])
     sy += 26
 
-    sc = _tribute_status_color(detail.status)
+    sc = _tribute_status_color(detail.status, c)
     label_w = draw.textbbox((0, 0), "STATUS  ", font=meta_font)[2]
-    draw.text((stats_x, sy), "STATUS  ", font=meta_font, fill=COLORS["text_dim"])
+    draw.text((stats_x, sy), "STATUS  ", font=meta_font, fill=c["text_dim"])
     draw.text((stats_x + label_w, sy), detail.status, font=meta_font, fill=sc)
     sy += 26
 
-    draw.text((stats_x, sy), f"KILLS  {detail.kills}", font=meta_font, fill=COLORS["text_dim"])
+    draw.text((stats_x, sy), f"KILLS  {detail.kills}", font=meta_font, fill=c["text_dim"])
     sy += 26
 
     if detail.placement is not None:
-        draw.text((stats_x, sy), f"PLACEMENT  {detail.placement}", font=meta_font, fill=COLORS["text_dim"])
+        draw.text((stats_x, sy), f"PLACEMENT  {detail.placement}", font=meta_font, fill=c["text_dim"])
         sy += 26
 
     if detail.death_cause:
         draw.text((stats_x, sy), f"CAUSE OF DEATH  {detail.death_cause}",
-                  font=meta_font, fill=COLORS["text_dim"])
+                  font=meta_font, fill=c["text_dim"])
 
-    # ── Win odds (right column) ────────────────────────────────────────────────
     if detail.win_odds is not None:
         lbl_font = rajdhani(13)
         odds_font_lg = cinzel(38)
         prob_font = rajdhani(14)
 
-        draw_text_right(draw, "TO WIN THE GAMES", lbl_font, COLORS["text_dim"], WIDTH - PAD, face_y + 6)
+        draw_text_right(draw, "TO WIN THE GAMES", lbl_font, c["text_dim"], WIDTH - PAD, face_y + 6)
 
         odds_str = fmt_odds(detail.win_odds)
-        oc = odds_color(detail.win_odds)
+        oc = odds_color(detail.win_odds, c)
         draw_text_right(draw, odds_str, odds_font_lg, oc, WIDTH - PAD, face_y + 24)
 
         prob = implied_probability(detail.win_odds)
         draw_text_right(draw, f"{fmt_pct(prob)} IMPLIED PROBABILITY",
-                        prob_font, COLORS["text_dim"], WIDTH - PAD, face_y + 74)
+                        prob_font, c["text_dim"], WIDTH - PAD, face_y + 74)
 
     cur_y += stats_row_h
 
     if featured_markets:
-        _draw_section_label(draw, cur_y, "TRIBUTE MARKETS")
+        _draw_section_label(draw, cur_y, "TRIBUTE MARKETS", colors=c)
         cur_y += SECTION_H + 8
-        _draw_featured_markets(draw, featured_markets, cur_y)
+        _draw_featured_markets(draw, featured_markets, cur_y, colors=c)
 
-    _draw_footer(draw, img_h)
+    _draw_footer(draw, img_h, colors=c)
+
+    theme.draw_fg(img, WIDTH, img_h)
 
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG", optimize=True)

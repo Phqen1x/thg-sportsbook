@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import math
+import random
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -20,9 +23,9 @@ COLORS = {
     "card_border":  (139, 105,  20,  255),
     "header_gold":  (201, 162,  39,  255),
     "header_dark":  (15,  13,   8,  255),
-    "text_white":   (232, 232, 232, 255),
-    "text_dim":     (136, 136, 136, 255),
-    "text_gold":    (184, 148,  40, 255),
+    "text_white":   (242, 242, 242, 255),
+    "text_dim":     (176, 176, 176, 255),
+    "text_gold":    (214, 176,  60, 255),
     "odds_pos":     ( 76, 175,  80, 255),
     "odds_neg":     (207, 102, 121, 255),
     "alive":        ( 76, 175,  80, 255),
@@ -35,6 +38,30 @@ COLORS = {
     "voided":       (136, 136, 136, 255),
     "divider":      ( 50,  45,  30, 255),
     "row_alt":      ( 24,  22,  15, 255),
+}
+
+FOREST_COLORS = {
+    "bg":           (  4,  13,   4, 255),
+    "bg_mid":       (  8,  20,   8, 255),
+    "card_bg":      ( 10,  24,  10, 255),
+    "card_border":  ( 48,  88,  24, 255),
+    "header_gold":  (155, 210,  62, 255),
+    "header_dark":  (  3,  10,   3, 255),
+    "text_white":   (210, 232, 198, 255),
+    "text_dim":     (125, 152, 106, 255),
+    "text_gold":    (145, 200,  55, 255),
+    "odds_pos":     ( 68, 188,  68, 255),
+    "odds_neg":     (195,  65,  85, 255),
+    "alive":        ( 68, 188,  68, 255),
+    "dead":         ( 62,  62,  62, 255),
+    "victor":       (195, 222,  44, 255),
+    "pending":      (188, 168,  48, 255),
+    "won":          ( 68, 188,  68, 255),
+    "lost":         (188,  58,  58, 255),
+    "cashed_out":   ( 68, 148, 198, 255),
+    "voided":       (118, 118, 118, 255),
+    "divider":      ( 24,  52,  14, 255),
+    "row_alt":      ( 12,  26,  10, 255),
 }
 
 _font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
@@ -193,9 +220,136 @@ def buf_to_discord_file(buf: io.BytesIO, filename: str):
     return discord.File(buf, filename=filename)
 
 
-def odds_color(odds: int) -> tuple:
-    return COLORS["odds_pos"] if odds >= 0 else COLORS["odds_neg"]
+def odds_color(odds: int, colors: dict | None = None) -> tuple:
+    c = colors or COLORS
+    return c["odds_pos"] if odds >= 0 else c["odds_neg"]
 
 
-def status_color(status: str) -> tuple:
-    return COLORS.get(status.lower(), COLORS["text_dim"])
+def status_color(status: str, colors: dict | None = None) -> tuple:
+    c = colors or COLORS
+    return c.get(status.lower(), c["text_dim"])
+
+
+# ── Theme system ─────────────────────────────────────────────────────────────
+
+def _noop_hook(img: Image.Image, w: int, h: int) -> None:
+    pass
+
+
+def _draw_vine_side(
+    draw: ImageDraw.ImageDraw, w: int, h: int, side: str, rng: random.Random
+) -> None:
+    """Draw one organic vine along the given edge of the image."""
+    x_base = 0 if side == "left" else w
+    sign = 1 if side == "left" else -1
+
+    vine_col = (30, 72, 12, 200)
+    leaf_cols = [(22, 62, 9, 185), (42, 98, 18, 165), (18, 48, 7, 195)]
+    tendril_col = (35, 82, 15, 155)
+    berry_col = (95, 20, 28, 190)
+
+    freq1, freq2 = 0.022, 0.047
+    amp1, amp2 = 12, 5
+    off1 = rng.uniform(0, 6.28)
+    off2 = rng.uniform(0, 6.28)
+
+    stem: list[tuple[int, int]] = []
+    y = 0
+    while y <= h:
+        x_off = amp1 * math.sin(y * freq1 + off1) + amp2 * math.sin(y * freq2 + off2) + 10
+        stem.append((int(x_base + sign * x_off), y))
+        y += 2
+
+    for i in range(len(stem) - 1):
+        draw.line([stem[i], stem[i + 1]], fill=vine_col, width=2 if (i // 15) % 2 == 0 else 1)
+
+    interval = max(1, len(stem) // 20)
+    for i in range(0, len(stem), interval):
+        px, py = stem[i]
+
+        # Leaf
+        lw, lh = rng.randint(12, 26), rng.randint(5, 12)
+        lx = px + sign * rng.randint(8, 30)
+        ly = py + rng.randint(-10, 10)
+        draw.ellipse((lx - lw // 2, ly - lh // 2, lx + lw // 2, ly + lh // 2),
+                     fill=rng.choice(leaf_cols))
+
+        if rng.random() < 0.55:
+            slw, slh = rng.randint(6, 16), rng.randint(4, 8)
+            slx = px + sign * rng.randint(4, 22)
+            sly = py + rng.randint(-18, 18)
+            draw.ellipse((slx - slw // 2, sly - slh // 2, slx + slw // 2, sly + slh // 2),
+                         fill=rng.choice(leaf_cols))
+
+        # Curling tendril via quadratic bezier approximation
+        tx_end = px + sign * rng.randint(16, 38)
+        ty_end = py + rng.randint(-22, 22)
+        mx_ctrl = (px + tx_end) // 2 + sign * rng.randint(3, 12)
+        my_ctrl = (py + ty_end) // 2 + rng.randint(-10, 10)
+        t_pts: list[tuple[int, int]] = []
+        for s in range(6):
+            t = s / 5
+            bx = int((1 - t) ** 2 * px + 2 * (1 - t) * t * mx_ctrl + t ** 2 * tx_end)
+            by = int((1 - t) ** 2 * py + 2 * (1 - t) * t * my_ctrl + t ** 2 * ty_end)
+            t_pts.append((bx, by))
+        draw.line(t_pts, fill=tendril_col, width=1)
+
+        if rng.random() < 0.28:
+            for _ in range(rng.randint(2, 4)):
+                bx = tx_end + rng.randint(-5, 5)
+                by_b = ty_end + rng.randint(-5, 5)
+                br = rng.randint(2, 4)
+                draw.ellipse((bx - br, by_b - br, bx + br, by_b + br), fill=berry_col)
+
+
+def _forest_bg(img: Image.Image, w: int, h: int) -> None:
+    draw = ImageDraw.Draw(img)
+    _draw_vine_side(draw, w, h, "left", random.Random(7331))
+    _draw_vine_side(draw, w, h, "right", random.Random(8442))
+
+
+def _forest_fg(img: Image.Image, w: int, h: int) -> None:
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    rng = random.Random(1337)
+    for _ in range(20):
+        fx = rng.randint(20, w - 20)
+        fy = rng.randint(0, h)
+        fr = rng.randint(1, 2)
+        alpha = rng.randint(55, 130)
+        gr = fr + 3
+        draw.ellipse((fx - gr, fy - gr, fx + gr, fy + gr), fill=(170, 220, 60, alpha // 3))
+        draw.ellipse((fx - fr, fy - fr, fx + fr, fy + fr), fill=(210, 240, 100, alpha))
+    img.alpha_composite(overlay)
+
+
+@dataclass
+class Theme:
+    name: str
+    colors: dict
+    draw_bg: Callable[[Image.Image, int, int], None] = field(default=_noop_hook)
+    draw_fg: Callable[[Image.Image, int, int], None] = field(default=_noop_hook)
+
+
+THEME_DARK = Theme("dark", COLORS)
+THEME_FOREST = Theme("forest", FOREST_COLORS, _forest_bg, _forest_fg)
+
+_THEMES: dict[str, Theme] = {"dark": THEME_DARK, "forest": THEME_FOREST}
+_active_theme: Theme = THEME_DARK
+
+
+def set_active_theme(theme: Theme) -> None:
+    global _active_theme
+    _active_theme = theme
+
+
+def get_active_theme() -> Theme:
+    return _active_theme
+
+
+def get_theme_by_name(name: str) -> Theme | None:
+    return _THEMES.get(name.lower())
+
+
+def list_theme_names() -> list[str]:
+    return list(_THEMES.keys())

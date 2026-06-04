@@ -205,6 +205,7 @@ class DistrictRecord(Base):
     male_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
     female_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bloodbath_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bloodbath_deaths: Mapped[int | None] = mapped_column(Integer, nullable=True)
     kill_record: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Arena-type win breakdown (natural wins = wins - manmade_arena_wins at display time)
     manmade_arena_wins: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -241,3 +242,16 @@ class ModifierAssignment(Base):
     district: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     modifier: Mapped["Modifier"] = relationship("Modifier", back_populates="assignments")
+
+
+class BettingRestriction(Base):
+    """Per-user betting restrictions. type is 'ALL', 'DISTRICT', or 'TRIBUTE'."""
+    __tablename__ = "betting_restrictions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    restriction_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    district: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tribute_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("tributes.id", ondelete="CASCADE"), nullable=True
+    )

@@ -9,7 +9,7 @@ from discord.ext import commands
 from sqlalchemy import select
 
 from bot.database.engine import get_session, get_setting
-from bot.database.models import Bet, Market, Parlay, PendingParlayLeg, User
+from bot.database.models import Bet, BettingRestriction, Market, Parlay, PendingParlayLeg, Tribute, User
 from bot.imaging.bet_slip import ParlayLegData, render_parlay_slip
 from bot.imaging.my_bets import BetRowData, ParlayData, render_my_bets
 from bot.imaging.base import render_async, buf_to_discord_file
@@ -34,10 +34,32 @@ _MILESTONE_GROUP = {
     "MAKES_FINALE":  "FINALE",  "MISSES_FINALE":  "FINALE",
 }
 
+_DISTRICT_MILESTONE_GROUP = {
+    "DISTRICT_BOTH_FINAL_8": "DISTRICT_FINAL_8", "DISTRICT_ONE_FINAL_8": "DISTRICT_FINAL_8",
+    "DISTRICT_BOTH_FINAL_5": "DISTRICT_FINAL_5", "DISTRICT_ONE_FINAL_5": "DISTRICT_FINAL_5",
+    "DISTRICT_BOTH_FINALE":  "DISTRICT_FINALE",  "DISTRICT_ONE_FINALE":  "DISTRICT_FINALE",
+}
+
+_ALLIANCE_MILESTONE_GROUP = {
+    "ALLIANCE_ALL_FINAL_8": "ALLIANCE_FINAL_8", "ALLIANCE_ONE_FINAL_8": "ALLIANCE_FINAL_8",
+    "ALLIANCE_ALL_FINAL_5": "ALLIANCE_FINAL_5", "ALLIANCE_ONE_FINAL_5": "ALLIANCE_FINAL_5",
+    "ALLIANCE_ALL_FINALE":  "ALLIANCE_FINALE",  "ALLIANCE_ONE_FINALE":  "ALLIANCE_FINALE",
+}
+
 
 # Every market type that constrains where a tribute finishes. A victor bet is
 # just an exact-placement bet on 1st, so it counts as a placement market too.
 _PLACEMENT_TYPES = {"TRIBUTE_WINS", "TRIBUTE_PLACEMENT", "TRIBUTE_TOP_N", "PLACEMENT_OU"}
+
+
+def _parse_id(raw: str) -> int | None:
+    """Parse an ID coming from an autocomplete field. Returns None if the user
+    typed free text instead of selecting a real choice (Discord then sends the
+    raw text as the value, which is not a valid integer ID)."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _ordinal(n: int) -> str:
@@ -123,6 +145,49 @@ def _milestone_conflict(existing_markets: list[Market], new_mkt: Market) -> str 
     return None
 
 
+def _district_milestone_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Prevent parlaying BOTH and ONE district milestone markets for the same district+phase.
+
+    If both survive, ONE is guaranteed to win, making the parlay degenerate.
+    """
+    if new_mkt.type not in _DISTRICT_MILESTONE_GROUP:
+        return None
+    new_group = _DISTRICT_MILESTONE_GROUP[new_mkt.type]
+    new_district = new_mkt.placement_num
+    for m in existing_markets:
+        if m.type not in _DISTRICT_MILESTONE_GROUP:
+            continue
+        if _DISTRICT_MILESTONE_GROUP[m.type] != new_group:
+            continue
+        if m.placement_num != new_district:
+            continue
+        return (
+            "Cannot combine 'both make it' and 'at least one makes it' district markets "
+            "for the same district and phase — one outcome is guaranteed by the other."
+        )
+    return None
+
+
+def _alliance_milestone_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Prevent parlaying ALL and ONE alliance milestone markets for the same alliance+phase."""
+    if new_mkt.type not in _ALLIANCE_MILESTONE_GROUP:
+        return None
+    new_group = _ALLIANCE_MILESTONE_GROUP[new_mkt.type]
+    new_alliance = new_mkt.placement_num
+    for m in existing_markets:
+        if m.type not in _ALLIANCE_MILESTONE_GROUP:
+            continue
+        if _ALLIANCE_MILESTONE_GROUP[m.type] != new_group:
+            continue
+        if m.placement_num != new_alliance:
+            continue
+        return (
+            "Cannot combine 'all make it' and 'at least one makes it' alliance markets "
+            "for the same alliance and phase — one outcome is guaranteed by the other."
+        )
+    return None
+
+
 async def _get_or_create_user(session, member: discord.Member) -> User:
     u = await session.get(User, member.id)
     if u is None:
@@ -187,6 +252,68 @@ async def user_parlay_autocomplete(
     return choices[:25]
 
 
+async def cashout_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    uid = interaction.user.id
+    cashout_type = getattr(interaction.namespace, "cashout_type", "BET")
+
+    if cashout_type == "PARLAY":
+        async with get_session() as session:
+            result = await session.execute(
+                select(Parlay).where(Parlay.user_id == uid, Parlay.status == "PENDING")
+            )
+            parlays = result.scalars().all()
+        choices = []
+        for p in parlays:
+            label = f"Parlay #{p.id} — {fmt_chips(p.total_wager)} wager"
+            if current.lower() in label.lower():
+                choices.append(app_commands.Choice(name=label[:100], value=str(p.id)))
+        return choices[:25]
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Bet, Market)
+            .join(Market, Bet.market_id == Market.id)
+            .where(Bet.user_id == uid, Bet.status == "PENDING", Bet.parlay_id == None)
+        )
+        rows = result.all()
+    choices = []
+    for bet, mkt in rows:
+        if current.lower() in mkt.label.lower():
+            choices.append(app_commands.Choice(name=mkt.label[:100], value=str(bet.id)))
+    return choices[:25]
+
+
+async def _get_restriction_msg(session, user_id: int, mkt: Market) -> str | None:
+    """Return an error string if the user is restricted from betting on this market."""
+    result = await session.execute(
+        select(BettingRestriction).where(BettingRestriction.discord_user_id == user_id)
+    )
+    restrictions = result.scalars().all()
+    if not restrictions:
+        return None
+
+    for r in restrictions:
+        if r.restriction_type == "ALL":
+            return "You are not permitted to place bets in this server."
+
+    blocked_districts = {r.district for r in restrictions if r.restriction_type == "DISTRICT"}
+    blocked_tribute_ids = {r.tribute_id for r in restrictions if r.restriction_type == "TRIBUTE"}
+
+    if blocked_tribute_ids and (mkt.tribute_a_id in blocked_tribute_ids or mkt.tribute_b_id in blocked_tribute_ids):
+        return "You are not permitted to bet on markets involving that tribute."
+
+    if blocked_districts:
+        for tid in (mkt.tribute_a_id, mkt.tribute_b_id):
+            if tid is not None:
+                tribute = await session.get(Tribute, tid)
+                if tribute and tribute.district in blocked_districts:
+                    return f"You are not permitted to bet on markets involving District {tribute.district} tributes."
+
+    return None
+
+
 class BettingCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -194,8 +321,13 @@ class BettingCog(commands.Cog):
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
-        log.error(f"Betting command error: {error}", exc_info=error)
-        msg = "An error occurred. Please try again."
+        original = getattr(error, "original", error)
+        if isinstance(original, ValueError):
+            log.warning(f"Betting command input error: {original}")
+            msg = "Invalid selection. Please pick an option from the autocomplete list."
+        else:
+            log.error(f"Betting command error: {error}", exc_info=error)
+            msg = "An error occurred. Please try again."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
@@ -218,10 +350,23 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
 
+        mid = _parse_id(market_id)
+        if mid is None:
+            await interaction.followup.send(
+                "Invalid market chosen. Please pick a market from the autocomplete list.",
+                ephemeral=True,
+            )
+            return
+
         async with get_session() as session:
-            mkt = await session.get(Market, int(market_id))
+            mkt = await session.get(Market, mid)
             if not mkt or mkt.status != "OPEN":
                 await interaction.followup.send("That market is not open for betting.", ephemeral=True)
+                return
+
+            restriction = await _get_restriction_msg(session, interaction.user.id, mkt)
+            if restriction:
+                await interaction.followup.send(restriction, ephemeral=True)
                 return
 
             user = await _get_or_create_user(session, interaction.user)
@@ -269,10 +414,23 @@ class BettingCog(commands.Cog):
     async def parlay_add(self, interaction: discord.Interaction, market_id: str) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
+        mid = _parse_id(market_id)
+        if mid is None:
+            await interaction.followup.send(
+                "Invalid market chosen. Please pick a market from the autocomplete list.",
+                ephemeral=True,
+            )
+            return
+
         async with get_session() as session:
-            mkt = await session.get(Market, int(market_id))
+            mkt = await session.get(Market, mid)
             if not mkt or mkt.status != "OPEN":
                 await interaction.followup.send("That market is not open.", ephemeral=True)
+                return
+
+            restriction = await _get_restriction_msg(session, interaction.user.id, mkt)
+            if restriction:
+                await interaction.followup.send(restriction, ephemeral=True)
                 return
 
             user = await _get_or_create_user(session, interaction.user)
@@ -298,7 +456,9 @@ class BettingCog(commands.Cog):
                 return
 
             # Milestone + placement validation against the legs already on the slip
-            if mkt.type in _ALL_MILESTONES or mkt.type in _PLACEMENT_TYPES:
+            if (mkt.type in _ALL_MILESTONES or mkt.type in _PLACEMENT_TYPES
+                    or mkt.type in _DISTRICT_MILESTONE_GROUP
+                    or mkt.type in _ALLIANCE_MILESTONE_GROUP):
                 existing_mkts: list[Market] = []
                 for leg in existing_legs:
                     leg_mkt = await session.get(Market, leg.market_id)
@@ -307,6 +467,8 @@ class BettingCog(commands.Cog):
                 conflict = (
                     _milestone_conflict(existing_mkts, mkt)
                     or _placement_conflict(existing_mkts, mkt)
+                    or _district_milestone_conflict(existing_mkts, mkt)
+                    or _alliance_milestone_conflict(existing_mkts, mkt)
                 )
                 if conflict:
                     await interaction.followup.send(conflict, ephemeral=True)
@@ -413,6 +575,8 @@ class BettingCog(commands.Cog):
                 conflict = (
                     _milestone_conflict(markets[:i], mkt)
                     or _placement_conflict(markets[:i], mkt)
+                    or _district_milestone_conflict(markets[:i], mkt)
+                    or _alliance_milestone_conflict(markets[:i], mkt)
                 )
                 if conflict:
                     await interaction.followup.send(conflict, ephemeral=True)
@@ -510,19 +674,28 @@ class BettingCog(commands.Cog):
     @app_commands.command(name="cashout", description="Cash out a pending bet or parlay early")
     @app_commands.describe(
         cashout_type="Cash out a single bet or an entire parlay",
-        cashout_id="ID of the bet or parlay to cash out",
+        cashout_id="Market or parlay to cash out",
     )
     @app_commands.choices(cashout_type=[
         app_commands.Choice(name="Single Bet",   value="BET"),
         app_commands.Choice(name="Parlay",        value="PARLAY"),
     ])
+    @app_commands.autocomplete(cashout_id=cashout_autocomplete)
     async def cashout(
         self,
         interaction: discord.Interaction,
         cashout_type: app_commands.Choice[str],
-        cashout_id: int,
+        cashout_id: str,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
+            return
+
+        cid = _parse_id(cashout_id)
+        if cid is None:
+            await interaction.followup.send(
+                "Invalid selection. Please pick from the autocomplete list.",
+                ephemeral=True,
+            )
             return
 
         global_allowed_raw = await get_setting("cashout_allowed")
@@ -534,7 +707,7 @@ class BettingCog(commands.Cog):
             user = await _get_or_create_user(session, interaction.user)
 
             if cashout_type.value == "BET":
-                b = await session.get(Bet, cashout_id)
+                b = await session.get(Bet, cid)
                 if not b or b.user_id != user.discord_id:
                     await interaction.followup.send("Bet not found.", ephemeral=True)
                     return
@@ -559,7 +732,7 @@ class BettingCog(commands.Cog):
                 label = mkt.label if mkt else "Unknown"
 
             else:  # PARLAY
-                p = await session.get(Parlay, cashout_id)
+                p = await session.get(Parlay, cid)
                 if not p or p.user_id != user.discord_id:
                     await interaction.followup.send("Parlay not found.", ephemeral=True)
                     return
@@ -583,7 +756,7 @@ class BettingCog(commands.Cog):
                     leg.status = "CASHED_OUT"
                     leg.cashout_amount = amount
 
-                label = f"Parlay #{cashout_id}"
+                label = f"Parlay #{cid}"
 
         embed = discord.Embed(title="Cashed Out!", color=0x5B9BD5)
         embed.add_field(name="Market/Parlay", value=label, inline=False)

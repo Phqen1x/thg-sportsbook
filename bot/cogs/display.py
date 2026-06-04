@@ -22,6 +22,21 @@ from bot.odds.calculator import implied_probability
 log = logging.getLogger("capitol.display")
 
 
+def _add_field_chunks(embed: discord.Embed, name: str, lines: list[str], inline: bool = False) -> None:
+    """Add lines as one or more embed fields, splitting at the 1024-char limit."""
+    chunk, first = [], True
+    for line in lines:
+        candidate = "\n".join(chunk + [line])
+        if len(candidate) > 1024:
+            embed.add_field(name=name if first else "​", value="\n".join(chunk), inline=inline)
+            first = False
+            chunk = [line]
+        else:
+            chunk.append(line)
+    if chunk:
+        embed.add_field(name=name if first else "​", value="\n".join(chunk), inline=inline)
+
+
 def _balance(m: Market) -> int:
     """How competitive a line is: |american odds|, where even money (±100) is
     smallest and lopsided rails (±9900) are largest. Lower = more interesting."""
@@ -112,8 +127,13 @@ class DisplayCog(commands.Cog):
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
-        log.error(f"Display command error: {error}", exc_info=error)
-        msg = "An error occurred. Please try again."
+        original = getattr(error, "original", error)
+        if isinstance(original, ValueError):
+            log.warning(f"Display command input error: {original}")
+            msg = "Invalid selection. Please pick an option from the autocomplete list."
+        else:
+            log.error(f"Display command error: {error}", exc_info=error)
+            msg = "An error occurred. Please try again."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
@@ -133,7 +153,14 @@ class DisplayCog(commands.Cog):
 
         # ── Single-tribute detail view ────────────────────────────────────────
         if tribute is not None:
-            tribute_id = int(tribute)
+            try:
+                tribute_id = int(tribute)
+            except (TypeError, ValueError):
+                await interaction.followup.send(
+                    "Invalid tribute chosen. Please pick a tribute from the autocomplete list.",
+                    ephemeral=True,
+                )
+                return
             async with get_session() as session:
                 user = await _get_or_create_user(session, interaction.user)
                 user_chips = user.chips
@@ -282,7 +309,7 @@ class DisplayCog(commands.Cog):
                 alive_lines.append(
                     f"**D{t.district}{t.display_gender} {t.name}** {gender_icon} — Score: `{t.training_score if t.training_score is not None else '?'}` | Kills: `{t.kills}`"
                 )
-            embed.add_field(name="🟢 ALIVE", value="\n".join(alive_lines), inline=False)
+            _add_field_chunks(embed, "🟢 ALIVE", alive_lines)
 
         if victor:
             for t in victor:
@@ -298,7 +325,7 @@ class DisplayCog(commands.Cog):
                 placement = f"#{t.placement}" if t.placement else "?"
                 cause = t.death_cause or "Unknown"
                 dead_lines.append(f"D{t.district}{t.display_gender} {t.name} — {placement} | {cause}")
-            embed.add_field(name="💀 FALLEN", value="\n".join(dead_lines[:20]), inline=False)
+            _add_field_chunks(embed, "💀 FALLEN", dead_lines)
 
         embed.set_footer(text=f"Total tributes: {len(tributes)} | Alive: {len(alive)}")
         await interaction.followup.send(embed=embed, ephemeral=True)

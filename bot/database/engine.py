@@ -145,6 +145,7 @@ async def _migrate_schema() -> None:
             ("nonbinary_kills",                "INTEGER"),
             ("avg_placement_last5",            "INTEGER"),
             ("bloodbath_kills",                "INTEGER"),
+            ("bloodbath_deaths",               "INTEGER"),
             ("avg_training_score",             "INTEGER"),
             ("avg_training_score_male",        "INTEGER"),
             ("avg_training_score_female",      "INTEGER"),
@@ -239,6 +240,26 @@ _BUILTIN_MARKET_TYPES = [
     ("EXACT_TRAINING_SCORE",    "Exact Training Score",                 "HARD",      "Guess a tribute's exact training score (1–12). Resolves when Pre-Games ends."),
     ("COMBINED_DISTRICT_SCORE", "Combined District Training Score",     "VERY_HARD", "Guess the combined training scores of both district tributes. Resolves when Pre-Games ends."),
     ("TRAINING_SCORE_OU",       "Training Score Over/Under",            "EASY",      "Bet over or under on a tribute's training score. Resolves when Pre-Games ends."),
+    # ── District-level markets ─────────────────────────────────────────────────
+    ("DISTRICT_VICTOR",         "District Victor",                      "HARD",      "Bet on which district the victor will come from. Resolves at game end."),
+    ("DISTRICT_KILLS_OU",       "District Total Kills Over/Under",      "MODERATE",  "Bet over or under on a district's combined kill total. Resolves at game end."),
+    ("DISTRICT_BOTH_BLOODBATH", "District Both Survive Bloodbath",      "MODERATE",  "Both district tributes survive the opening bloodbath. Resolves when Bloodbath ends."),
+    ("DISTRICT_BOTH_FINAL_8",   "District Both Make Final 8",           "HARD",      "Both district tributes are alive when the Final 8 phase begins."),
+    ("DISTRICT_ONE_FINAL_8",    "District At Least One Makes Final 8",  "MODERATE",  "At least one district tribute is alive when the Final 8 phase begins."),
+    ("DISTRICT_BOTH_FINAL_5",   "District Both Make Final 5",           "VERY_HARD", "Both district tributes are alive when the Final 5 phase begins."),
+    ("DISTRICT_ONE_FINAL_5",    "District At Least One Makes Final 5",  "MODERATE",  "At least one district tribute is alive when the Final 5 phase begins."),
+    ("DISTRICT_BOTH_FINALE",    "District Both Make the Finale",        "VERY_HARD", "Both district tributes are alive when the Finale phase begins."),
+    ("DISTRICT_ONE_FINALE",     "District At Least One Makes Finale",   "HARD",      "At least one district tribute is alive when the Finale phase begins."),
+    # ── Alliance-level markets ─────────────────────────────────────────────────
+    ("ALLIANCE_VICTOR",         "Alliance Victor",                      "HARD",      "A member of the alliance wins the Games. Resolves at game end."),
+    ("ALLIANCE_KILLS_OU",       "Alliance Total Kills Over/Under",      "MODERATE",  "Bet over or under on the alliance's combined kill total. Resolves at game end."),
+    ("ALLIANCE_ALL_BLOODBATH",  "Alliance All Survive Bloodbath",       "MODERATE",  "All alliance members survive the opening bloodbath. Resolves when Bloodbath ends."),
+    ("ALLIANCE_ALL_FINAL_8",    "Alliance All Make Final 8",            "HARD",      "All alliance members are alive when the Final 8 phase begins."),
+    ("ALLIANCE_ONE_FINAL_8",    "Alliance At Least One Makes Final 8",  "MODERATE",  "At least one alliance member is alive when the Final 8 phase begins."),
+    ("ALLIANCE_ALL_FINAL_5",    "Alliance All Make Final 5",            "VERY_HARD", "All alliance members are alive when the Final 5 phase begins."),
+    ("ALLIANCE_ONE_FINAL_5",    "Alliance At Least One Makes Final 5",  "MODERATE",  "At least one alliance member is alive when the Final 5 phase begins."),
+    ("ALLIANCE_ALL_FINALE",     "Alliance All Make the Finale",         "VERY_HARD", "All alliance members are alive when the Finale phase begins."),
+    ("ALLIANCE_ONE_FINALE",     "Alliance At Least One Makes Finale",   "HARD",      "At least one alliance member is alive when the Finale phase begins."),
 ]
 
 
