@@ -1640,6 +1640,31 @@ class BettingCog(commands.Cog):
         f = buf_to_discord_file(buf, "my_bets.png")
         await interaction.followup.send(file=f, ephemeral=True)
 
+    # ── /featured ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="featured",
+        description="Browse Gamemaker-curated parlays available to tail at live odds",
+    )
+    async def featured(self, interaction: discord.Interaction) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            featured_list, member_list = await _gather_tailable(session)
+
+        if not featured_list:
+            await interaction.followup.send(
+                "No featured parlays are available right now. Check back after the next phase opens.",
+                ephemeral=True,
+            )
+            return
+
+        buf = await render_async(render_tail_board, featured_list, member_list)
+        f = buf_to_discord_file(buf, "featured.png")
+        view = TailView(featured_list, member_list)
+        msg = await interaction.followup.send(file=f, view=view, ephemeral=True)
+        view.message = msg
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(BettingCog(bot))

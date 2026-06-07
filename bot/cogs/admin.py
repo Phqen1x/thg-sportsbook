@@ -2883,12 +2883,19 @@ class HistoryPageView(discord.ui.View):
 # ── AdminCog ──────────────────────────────────────────────────────────────────
 
 
+_ADMIN_PERMS = discord.Permissions(administrator=True)
+
+
 class AdminCog(commands.Cog):
     admin = app_commands.Group(
-        name="admin", description="Capitol Sportsbook admin commands"
+        name="admin",
+        description="Capitol Sportsbook admin commands",
+        default_member_permissions=_ADMIN_PERMS,
     )
     tribute = app_commands.Group(
-        name="tribute", description="Manage tributes"
+        name="tribute",
+        description="Manage tributes",
+        default_member_permissions=_ADMIN_PERMS,
     )
     market = app_commands.Group(
         name="market", description="Manage markets", parent=admin
@@ -2917,15 +2924,26 @@ class AdminCog(commands.Cog):
         name="history", description="District historical records", parent=admin
     )
     restrict = app_commands.Group(
-        name="restrict", description="Manage user betting restrictions"
+        name="restrict",
+        description="Manage user betting restrictions",
+        default_member_permissions=_ADMIN_PERMS,
     )
     # Top-level (not under /admin) to stay within Discord's 8000-char limit on
     # the admin command tree — same pattern as the tribute/restrict groups.
-    game = app_commands.Group(name="game", description="Game control")
-    phase = app_commands.Group(name="phase", description="Manage betting phases")
-    modifier = app_commands.Group(name="modifier", description="Manage odds modifiers")
-    featured = app_commands.Group(
-        name="featured", description="Manage featured pre-built tailable parlays"
+    game = app_commands.Group(
+        name="game",
+        description="Game control",
+        default_member_permissions=_ADMIN_PERMS,
+    )
+    phase = app_commands.Group(
+        name="phase",
+        description="Manage betting phases",
+        default_member_permissions=_ADMIN_PERMS,
+    )
+    modifier = app_commands.Group(
+        name="modifier",
+        description="Manage odds modifiers",
+        default_member_permissions=_ADMIN_PERMS,
     )
 
     def __init__(self, bot: commands.Bot) -> None:
