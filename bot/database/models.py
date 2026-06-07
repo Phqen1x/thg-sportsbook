@@ -37,13 +37,15 @@ class Tribute(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     district: Mapped[int] = mapped_column(Integer, nullable=False)
     gender: Mapped[str] = mapped_column(String(2), nullable=False)
+    # Tribute age (12–18). Older tributes start at longer odds — see age_factor.
+    age: Mapped[int | None] = mapped_column(Integer, nullable=True)
     training_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     face_claim: Mapped[str | None] = mapped_column(String(500), nullable=True)
     kills: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # Accumulated kill-quality boost: each kill multiplies this by a factor that
-    # reflects how strong the victim was (see kill_quality_multiplier). Folded
-    # into the tribute's win/kill odds during recalculation.
-    kill_boost: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    # Additive kill-boost sum: each kill contributes max(0, quality-1) * dr_factor,
+    # where dr_factor shrinks past half the national kill record. Converted to a
+    # multiplier at odds time: max(0.5, 1 + sum * KILL_BOOST_SCALE). Neutral = 0.0.
+    kill_boost: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     status: Mapped[str] = mapped_column(String(10), default="ALIVE", nullable=False)
     death_cause: Mapped[str | None] = mapped_column(String(200), nullable=True)
     killed_by_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tributes.id"), nullable=True)
@@ -54,6 +56,12 @@ class Tribute(Base):
     sade_participant: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sade_champion: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     non_binary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # NULL = none; "DEBILITATED" | "MODERATELY_DEBILITATED" | "SEVERELY_DEBILITATED"
+    debilitation_level: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Prior experience. times_played = number of Games entered before this one (0 = rookie).
+    # highest_placement = best finish across all prior games (2–24; lower is better).
+    times_played: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    highest_placement: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     @property
@@ -123,6 +131,9 @@ class Parlay(Base):
     total_payout: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(10), default="PENDING", nullable=False)
     cashout_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # When True the parlay is listed on the public tailing board so other members
+    # can copy it. Members can opt out at submit time; tailed copies default off.
+    is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     user: Mapped["User"] = relationship("User", back_populates="parlays")
@@ -157,6 +168,47 @@ class PendingParlayLeg(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     user: Mapped["User"] = relationship("User", back_populates="pending_legs")
+    market: Mapped["Market"] = relationship("Market")
+
+
+class ParlayTemplate(Base):
+    """A pre-built parlay that members can tail (copy onto their own slip).
+
+    Legs reference live markets, so odds are always read fresh from the market
+    at view/tail time — the template never stores frozen odds. ``source`` is
+    "ADMIN" for hand-built admin parlays or "AUTO" for the three per-phase
+    auto-generated parlays. AUTO templates are regenerated each phase and removed
+    once any of their legs resolve.
+    """
+    __tablename__ = "parlay_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    source: Mapped[str] = mapped_column(String(10), default="ADMIN", nullable=False)
+    # For AUTO parlays: "SAFE" | "BALANCED" | "LONGSHOT". NULL for admin parlays.
+    difficulty: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    phase_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("betting_phases.id"), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    legs: Mapped[list["ParlayTemplateLeg"]] = relationship(
+        "ParlayTemplateLeg", back_populates="template",
+        cascade="all, delete-orphan", order_by="ParlayTemplateLeg.sort_order",
+    )
+
+
+class ParlayTemplateLeg(Base):
+    __tablename__ = "parlay_template_legs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    template_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("parlay_templates.id", ondelete="CASCADE"), nullable=False
+    )
+    market_id: Mapped[int] = mapped_column(Integer, ForeignKey("markets.id"), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    template: Mapped["ParlayTemplate"] = relationship("ParlayTemplate", back_populates="legs")
     market: Mapped["Market"] = relationship("Market")
 
 
@@ -215,6 +267,8 @@ class DistrictRecord(Base):
     avg_training_score_female: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # District reputation (1 = highest/best odds, 5 = lowest, 3 = neutral)
     reputation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # District funding level ("rich", "well_funded", "under_funded", "poor", or None)
+    funding_level: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
 
 class Modifier(Base):
@@ -240,6 +294,9 @@ class ModifierAssignment(Base):
         Integer, ForeignKey("tributes.id", ondelete="CASCADE"), nullable=True
     )
     district: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    alliance_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("alliances.id", ondelete="CASCADE"), nullable=True
+    )
 
     modifier: Mapped["Modifier"] = relationship("Modifier", back_populates="assignments")
 

@@ -11,8 +11,8 @@ from bot.imaging.base import (
     cinzel, cinzel_regular, rajdhani, rajdhani_bold,
     draw_rounded_rect, draw_text_centered, draw_text_right, odds_color, status_color,
 )
-from bot.utils.formatters import fmt_chips, fmt_odds, fmt_pct
-from bot.odds.calculator import implied_probability
+from bot.utils.formatters import fmt_chips, fmt_odds, fmt_pct, fmt_odds_with_mult
+from bot.odds.calculator import implied_probability, parlay_payout, combined_american
 
 WIDTH = 960
 PAD = 20
@@ -236,6 +236,201 @@ def render_my_bets(
         cur_y = HEADER_H + 120
 
     _draw_footer(draw, max(cur_y, h - FOOTER_H), total_wagered, total_potential, chips, colors=c)
+
+    theme.draw_fg(img, WIDTH, h)
+
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+def render_tail_board(
+    featured: list[dict],
+    member: list[dict],
+) -> io.BytesIO:
+    """Render a preview board of all available parlays to tail."""
+    theme = get_active_theme()
+    c = theme.colors
+
+    # Convert tail dictionaries to ParlayData for rendering
+    parlay_data: list[ParlayData] = []
+    
+    # Combined list for indexing
+    all_entries = featured + member
+    
+    for i, e in enumerate(all_entries):
+        legs = [
+            BetRowData(0, lbl, 0, odds, 0, "OPEN")
+            for lbl, odds in zip(e["labels"], e["odds_list"])
+        ]
+        p_data = ParlayData(
+            parlay_id=i + 1,
+            total_wager=100,
+            total_payout=parlay_payout(100, e["odds_list"]),
+            combined_odds=combined_american(e["odds_list"]),
+            status=e["tag"],
+            legs=legs
+        )
+        parlay_data.append(p_data)
+
+    h = HEADER_H + SECTION_LABEL_H + PAD
+    for p in parlay_data:
+        h += PARLAY_HEADER_H + 2 + len(p.legs) * LEG_ROW_H + PARLAY_FOOTER_H + PAD
+    h += FOOTER_H + PAD
+
+    img = Image.new("RGBA", (WIDTH, h), c["bg"])
+    theme.draw_bg(img, WIDTH, h)
+    draw = ImageDraw.Draw(img)
+
+    for gx in range(0, WIDTH, 40):
+        draw.line((gx, 0, gx, h), fill=(255, 255, 255, 3))
+
+    # Simplified header for tail board
+    draw.rectangle((0, 0, WIDTH, HEADER_H), fill=c["header_dark"])
+    draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=c["card_border"])
+    title_font = cinzel(20)
+    sub_font = rajdhani(13)
+    draw_text_centered(draw, "TAILABLE PARLAYS", title_font, c["header_gold"], WIDTH // 2, 20)
+    draw_text_centered(draw, "COPY FEATURED SLIPS AT LIVE ODDS", sub_font, c["text_dim"], WIDTH // 2, 48)
+
+    cur_y = HEADER_H
+    _draw_section_label(draw, cur_y, "FEATURED & MEMBER SLIPS", colors=c)
+    cur_y += SECTION_LABEL_H + PAD
+
+    for p in parlay_data:
+        sc = status_color("WON", c) if p.status in ("SAFE", "BALANCED", "LONGSHOT") else c["text_gold"]
+        
+        draw_rounded_rect(draw, (PAD, cur_y, WIDTH - PAD, cur_y + PARLAY_HEADER_H), 8,
+                          fill=c["header_dark"],
+                          outline=c["card_border"],
+                          outline_width=2)
+
+        hf = rajdhani_bold(15)
+        sf = rajdhani_bold(13)
+        display_name = all_entries[p.parlay_id-1]["name"]
+        draw.text((PAD + 10, cur_y + 10), display_name.upper(), font=hf, fill=c["header_gold"])
+        
+        tag_label = p.status
+        draw_text_centered(draw, tag_label, sf, c["text_dim"], WIDTH // 2, cur_y + 12)
+        
+        y_leg = cur_y + PARLAY_HEADER_H + 2
+        leg_font = rajdhani(14)
+        odds_font = rajdhani_bold(14)
+        for i, leg in enumerate(p.legs):
+            row_fill = c["row_alt"] if i % 2 == 0 else c["card_bg"]
+            draw.rectangle((PAD, y_leg, WIDTH - PAD, y_leg + LEG_ROW_H - 1), fill=row_fill)
+            draw.text((PAD + 24, y_leg + (LEG_ROW_H - 16) // 2), f"  └  {leg.market_label}", font=leg_font, fill=c["text_dim"])
+            oc = odds_color(leg.odds, c)
+            draw_text_right(draw, fmt_odds(leg.odds), odds_font, oc, WIDTH - PAD - 10, y_leg + (LEG_ROW_H - 18) // 2)
+            y_leg += LEG_ROW_H
+
+        draw.rectangle((PAD, y_leg, WIDTH - PAD, y_leg + PARLAY_FOOTER_H), fill=c["bg_mid"])
+        draw.rectangle((PAD, y_leg, WIDTH - PAD, y_leg + 2), fill=c["card_border"])
+        draw.rectangle((PAD, y_leg + PARLAY_FOOTER_H - 2, WIDTH - PAD, y_leg + PARLAY_FOOTER_H), fill=c["divider"])
+
+        pf = rajdhani_bold(14)
+        draw.text((PAD + 10, y_leg + 10), f"100 CHIPS", font=pf, fill=c["text_white"])
+        combo_str = f"ODDS: {fmt_odds_with_mult(p.combined_odds)}"
+        oc = odds_color(p.combined_odds, c)
+        draw_text_centered(draw, combo_str, pf, oc, WIDTH // 2, y_leg + 10)
+        draw_text_right(draw, f"PAYS {fmt_chips(p.total_payout)}", pf, c["header_gold"], WIDTH - PAD - 10, y_leg + 10)
+
+        cur_y = y_leg + PARLAY_FOOTER_H + PAD
+
+    # Footer
+    draw.rectangle((0, h - FOOTER_H, WIDTH, h), fill=c["header_dark"])
+    draw.rectangle((0, h - FOOTER_H, WIDTH, h - FOOTER_H + 3), fill=c["card_border"])
+    draw_text_centered(draw, "USE /parlay tail TO BROWSE AND BET", rajdhani_bold(14), c["text_dim"], WIDTH // 2, h - FOOTER_H + 18)
+
+    theme.draw_fg(img, WIDTH, h)
+
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+
+def render_tail_detail(
+    entry: dict,
+) -> io.BytesIO:
+    """Render a high-quality visual slip for a single tailed parlay."""
+    theme = get_active_theme()
+    c = theme.colors
+
+    # Prep data
+    odds_list = entry["odds_list"]
+    labels = entry["labels"]
+    combined = combined_american(odds_list)
+    payout = parlay_payout(100, odds_list)
+    tag = entry["tag"]
+    name = entry["name"]
+    sub = entry["sub"]
+
+    n_legs = len(odds_list)
+    h = HEADER_H + 20 + n_legs * LEG_ROW_H + PARLAY_FOOTER_H + FOOTER_H + 40
+    if sub:
+        h += 30
+
+    img = Image.new("RGBA", (WIDTH, h), c["bg"])
+    theme.draw_bg(img, WIDTH, h)
+    draw = ImageDraw.Draw(img)
+
+    for gx in range(0, WIDTH, 40):
+        draw.line((gx, 0, gx, h), fill=(255, 255, 255, 3))
+
+    # Header
+    draw.rectangle((0, 0, WIDTH, HEADER_H), fill=c["header_dark"])
+    draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=c["card_border"])
+    title_font = cinzel(20)
+    sub_font = rajdhani(13)
+    draw_text_centered(draw, "PARLAY PREVIEW", title_font, c["header_gold"], WIDTH // 2, 20)
+    draw_text_centered(draw, "LIVE ODDS AT THE TIME OF VIEWING", sub_font, c["text_dim"], WIDTH // 2, 48)
+
+    cur_y = HEADER_H + 20
+    
+    # Slip Block
+    draw_rounded_rect(draw, (PAD, cur_y, WIDTH - PAD, cur_y + PARLAY_HEADER_H), 8,
+                      fill=c["header_dark"], outline=c["card_border"], outline_width=2)
+    
+    hf = rajdhani_bold(17)
+    sf = rajdhani_bold(14)
+    draw.text((PAD + 14, cur_y + 10), name.upper(), font=hf, fill=c["header_gold"])
+    draw_text_right(draw, tag, sf, c["text_dim"], WIDTH - PAD - 14, cur_y + 12)
+    
+    cur_y += PARLAY_HEADER_H + 2
+    
+    if sub:
+        draw.rectangle((PAD, cur_y, WIDTH - PAD, cur_y + 28), fill=c["bg_mid"])
+        draw.text((PAD + 24, cur_y + 6), sub, font=rajdhani(14), fill=c["text_white"])
+        cur_y += 30
+
+    leg_font = rajdhani(16)
+    odds_font = rajdhani_bold(16)
+    for i, (lbl, odds) in enumerate(zip(labels, odds_list)):
+        row_fill = c["row_alt"] if i % 2 == 0 else c["card_bg"]
+        draw.rectangle((PAD, cur_y, WIDTH - PAD, cur_y + LEG_ROW_H - 1), fill=row_fill)
+        draw.text((PAD + 24, cur_y + (LEG_ROW_H - 20) // 2), f"  └  {lbl}", font=leg_font, fill=c["text_white"])
+        oc = odds_color(odds, c)
+        draw_text_right(draw, fmt_odds(odds), odds_font, oc, WIDTH - PAD - 10, cur_y + (LEG_ROW_H - 20) // 2)
+        cur_y += LEG_ROW_H
+
+    draw.rectangle((PAD, cur_y, WIDTH - PAD, cur_y + PARLAY_FOOTER_H + 10), fill=c["bg_mid"])
+    draw.rectangle((PAD, cur_y, WIDTH - PAD, cur_y + 2), fill=c["card_border"])
+    
+    pf = rajdhani_bold(16)
+    draw.text((PAD + 14, cur_y + 14), "100 CHIPS", font=pf, fill=c["text_white"])
+    combo_str = f"ODDS: {fmt_odds_with_mult(combined)}"
+    oc = odds_color(combined, c)
+    draw_text_centered(draw, combo_str, pf, oc, WIDTH // 2, cur_y + 14)
+    draw_text_right(draw, f"PAYS {fmt_chips(payout)}", pf, c["header_gold"], WIDTH - PAD - 14, cur_y + 14)
+    
+    cur_y += PARLAY_FOOTER_H + 30
+
+    # Footer
+    draw.rectangle((0, h - FOOTER_H, WIDTH, h), fill=c["header_dark"])
+    draw.rectangle((0, h - FOOTER_H, WIDTH, h - FOOTER_H + 3), fill=c["card_border"])
+    draw_text_centered(draw, "USE TAIL & BET TO WAGER NOW", rajdhani_bold(14), c["text_dim"], WIDTH // 2, h - FOOTER_H + 18)
 
     theme.draw_fg(img, WIDTH, h)
 

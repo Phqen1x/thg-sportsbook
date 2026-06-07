@@ -176,6 +176,155 @@ HIST_KILL_ALPHA = 0.25
 REPUTATION_STEP = 0.05
 
 
+_FUNDING_MULTIPLIERS: dict[str, float] = {
+    "rich":         1.5,
+    "well_funded":  1.25,
+    "under_funded": 0.75,
+    "poor":         0.5,
+}
+
+# While the sponsorship window is OPEN (the "Sponsors Open" phase) the funding
+# edge swells — rich and well-funded districts pull even further ahead as the
+# Capitol's money floods in.
+_FUNDING_MULTIPLIERS_SPONSORS_OPEN: dict[str, float] = {
+    "rich":         3.5,
+    "well_funded":  3.0,
+    "under_funded": 0.75,
+    "poor":         0.5,
+}
+
+# After the window CLOSES (the "Sponsors Closing" phase) the funding edge takes a
+# significant hit but never disappears: rich/well-funded districts keep a smaller
+# residual boost, and the penalty on under-funded/poor districts softens too.
+_FUNDING_MULTIPLIERS_SPONSORS_CLOSED: dict[str, float] = {
+    "rich":         1.5,
+    "well_funded":  1.4,
+    "under_funded": 0.85,
+    "poor":         0.7,
+}
+
+_FUNDING_LABELS: dict[str, str] = {
+    "rich":         "Rich",
+    "well_funded":  "Well-Funded",
+    "under_funded": "Under-Funded",
+    "poor":         "Poor",
+}
+
+
+_DEBILITATION_WEIGHTS: dict[str, float] = {
+    "DEBILITATED": 0.75,
+    "MODERATELY_DEBILITATED": 0.55,
+    "SEVERELY_DEBILITATED": 0.35,
+}
+
+_DEBILITATION_LABELS: dict[str, str] = {
+    "DEBILITATED": "Debilitated",
+    "MODERATELY_DEBILITATED": "Moderately Debilitated",
+    "SEVERELY_DEBILITATED": "Severely Debilitated",
+}
+
+
+def debilitation_factor(level: str | None) -> float:
+    """Multiplicative probability debuff for a tribute's debilitation level.
+
+    Each tier halves the step above it — Debilitated is mild, Severely
+    Debilitated is a steep penalty that sharply lengthens win/kill odds.
+    """
+    if level is None:
+        return 1.0
+    return _DEBILITATION_WEIGHTS.get(level, 1.0)
+
+
+def debilitation_label(level: str | None) -> str:
+    """Human-readable label for a debilitation level key."""
+    if level is None:
+        return "—"
+    return _DEBILITATION_LABELS.get(level, level)
+
+
+def funding_factor(funding_level: str | None, sponsor_state: str | None = None) -> float:
+    """Multiplicative factor for a district's funding level.
+
+    Rich/Well-Funded districts boost win/kill probability; Under-Funded/Poor
+    suppress it. ``sponsor_state`` tracks the sponsorship window: "open" amplifies
+    the funding edge (Sponsors Open phase), "closed" cuts it down to a residual
+    (Sponsors Closing phase), and None (default, before sponsors open) uses the
+    baseline multipliers.
+    """
+    if funding_level is None:
+        return 1.0
+    if sponsor_state == "open":
+        table = _FUNDING_MULTIPLIERS_SPONSORS_OPEN
+    elif sponsor_state == "closed":
+        table = _FUNDING_MULTIPLIERS_SPONSORS_CLOSED
+    else:
+        table = _FUNDING_MULTIPLIERS
+    return table.get(funding_level, 1.0)
+
+
+def funding_label(funding_level: str | None) -> str:
+    """Human-readable label for a funding level key."""
+    if funding_level is None:
+        return "—"
+    return _FUNDING_LABELS.get(funding_level, funding_level)
+
+
+# Tribute age. Valid range is 12–18, with 15 as the neutral midpoint. Each year
+# of age lengthens a tribute's price off the bat: older tributes get a smaller
+# win/kill probability factor (higher odds), younger tributes a larger one
+# (lower odds). AGE_STEP keeps the swing modest — age 12 → +15%, age 18 → −15%.
+AGE_MIN = 12
+AGE_MAX = 18
+AGE_NEUTRAL = 15
+AGE_STEP = 0.05
+
+
+# Prior-game experience. Each prior game adds a small flat bonus; the best
+# placement ever adds a bonus scaled by how high it was (2 = runner-up = max,
+# 24 = near-last = no placement bonus). Both components are intentionally small
+# so experience is meaningful but never a deciding factor.
+PRIOR_EXP_TIMES_STEP = 0.025   # probability multiplier bonus per prior game
+PRIOR_EXP_TIMES_CAP = 4        # bonus stops growing after this many games
+PRIOR_EXP_PLACEMENT_MAX = 0.10 # max bonus from best placement (achieved at placement 2)
+
+# A reigning SADE Champion carries measurable competitive credibility — small but
+# real boost applied to both win and kill probability.
+SADE_CHAMPION_FACTOR = 1.08
+
+
+def prior_experience_factor(times_played: int, highest_placement: int | None) -> float:
+    """Multiplicative probability bonus for a tribute with prior Games experience.
+
+    ``times_played`` is the number of previous Games entered (0 = rookie, neutral).
+    ``highest_placement`` is their best finish (2–24; lower = better). A tribute who
+    has never played returns 1.0. Maximum factor is ~1.20 for a four-time player who
+    reached 2nd place.
+    """
+    if times_played <= 0:
+        return 1.0
+    play_bonus = min(times_played, PRIOR_EXP_TIMES_CAP) * PRIOR_EXP_TIMES_STEP
+    if highest_placement is not None:
+        placement = max(2, min(24, highest_placement))
+        placement_bonus = ((24 - placement) / 22) * PRIOR_EXP_PLACEMENT_MAX
+    else:
+        placement_bonus = 0.0
+    return 1.0 + play_bonus + placement_bonus
+
+
+def age_factor(age: int | None, neutral: float = AGE_NEUTRAL) -> float:
+    """Multiplicative probability factor for a tribute's age.
+
+    Higher age → higher odds, i.e. a *lower* win/kill probability. ``neutral``
+    is the breakeven age (factor = 1.0); each year above it suppresses and each
+    year below boosts. Defaults to AGE_NEUTRAL (15); pass the global
+    ``victor_avg_age`` GameSetting value to anchor to historical victor ages.
+    """
+    if age is None:
+        return 1.0
+    a = max(AGE_MIN, min(AGE_MAX, age))
+    return 1.0 + (neutral - a) * AGE_STEP
+
+
 def reputation_factor(reputation: int | None) -> float:
     """Multiplicative probability factor for a district's manually-set reputation.
 
@@ -190,11 +339,12 @@ def reputation_factor(reputation: int | None) -> float:
 # Market types where group influence applies (single-tribute performance markets)
 _GROUP_INFLUENCED_TYPES = {
     "TRIBUTE_WINS", "TRIBUTE_PLACEMENT", "TRIBUTE_TOP_N",
-    "TRIBUTE_KILLS", "FIRST_BLOOD", "BLOODBATH_SURVIVOR",
+    "TRIBUTE_KILLS", "FIRST_BLOOD", "BLOODBATH_SURVIVOR", "TRIBUTE_KILLED_BLOODBATH",
     "KILLS_OU", "PLACEMENT_OU",
     "MAKES_FINAL_8", "MISSES_FINAL_8",
     "MAKES_FINAL_5", "MISSES_FINAL_5",
-    "MAKES_FINALE", "MISSES_FINALE",
+    "TRIBUTE_RUNNER_UP",
+    "FIRST_TRIBUTE_TO_DIE",
 }
 
 
@@ -224,6 +374,11 @@ TRIBUTE_KILL_FRACTION = 0.70
 KILL_QUALITY_SENSITIVITY = 0.5   # exponent on the strength ratio (0 = flat, 1 = linear)
 KILL_QUALITY_MIN = 0.50          # floor: killing the weakest possible long-shot
 KILL_QUALITY_MAX = 3.00          # cap: killing the overwhelming favourite
+
+# kill_boost stores an additive sum of per-kill quality contributions. This
+# constant scales that sum to a final multiplier, keeping even heavy hitters
+# from dominating odds: sum=4.0 → ×2.0 rather than exponential compounding.
+KILL_BOOST_SCALE = 0.25
 
 
 def kill_quality_multiplier(victim_win_prob: float, field_avg_prob: float) -> float:
@@ -260,6 +415,21 @@ DISTRICT_PAIR_KILL_SUPPRESSION = 0.10
 OPPOSING_ALLIANCE_KILL_SUPPRESSION = 0.35
 
 
+def kill_boost_dr_factor(kills_before: int, national_kill_record: int | None) -> float:
+    """Diminishing-returns factor for each kill's contribution to kill_boost.
+
+    Full value (1.0) for kills while the tribute's total is below half the
+    national record; decays as 1/(1+excess) once past that point. Tributes
+    who have fought half as many battles as the all-time record face real
+    injury accumulation, so marginal kills stop moving odds as meaningfully.
+    """
+    half = max(1, (national_kill_record or 7) // 2)
+    if kills_before < half:
+        return 1.0
+    excess = kills_before - half + 1
+    return 1.0 / (1.0 + excess)
+
+
 def district_pair_kill_factor(tribute_a: "Tribute", tribute_b: "Tribute") -> float:
     """Probability suppression for a KILL_EVENT between same-district tributes.
 
@@ -286,9 +456,9 @@ def _p_top_k(strength: float, k: int) -> float:
     normalised strength (score / field-total, so the field sums to 1.0).
 
     Monotone in both strength and k and bounded to (0, 1). With k=1 it reduces
-    exactly to the raw win probability, so Win ⊂ Top-N ⊂ Final-8/5/Finale are
+    exactly to the raw win probability, so Win ⊂ Top-N ⊂ Final-8/5 are
     mutually consistent by construction (a tribute can never be more likely to
-    win than to make the finale).
+    win than to make the Final 5).
     """
     strength = max(0.0, min(1.0, strength))
     return 1.0 - (1.0 - strength) ** max(1, k)
@@ -315,7 +485,7 @@ def strength_hurts(market_type: str, ou_side: str | None) -> bool:
     modifier / historical adjustments push such markets in the correct
     (inverted) direction and keep OVER/UNDER and MAKES/MISSES complementary.
     """
-    if market_type in ("MISSES_FINAL_8", "MISSES_FINAL_5", "MISSES_FINALE"):
+    if market_type in ("MISSES_FINAL_8", "MISSES_FINAL_5"):
         return True
     if market_type == "PLACEMENT_OU" and ou_side == "OVER":
         return True   # OVER the placement line = finishes worse
@@ -323,6 +493,9 @@ def strength_hurts(market_type: str, ou_side: str | None) -> bool:
         return True   # UNDER the kill line = fewer kills
     if market_type == "TRAINING_SCORE_OU" and ou_side == "UNDER":
         return True
+    if market_type in ("FIRST_IN_ALLIANCE_DEATH", "FIRST_TRIBUTE_TO_DIE",
+                        "LOWEST_TRAINING_SCORE"):
+        return True   # stronger tribute is LESS likely for these markets
     return False
 
 
@@ -477,6 +650,13 @@ def default_odds(
         p_death = max(0.03, min(0.92, p_death))
         return prob_to_american(1.0 - p_death)
 
+    if market_type == "TRIBUTE_KILLED_BLOODBATH":
+        inv = 1.0 / max(score_a, 1)
+        sum_inv = sum(1.0 / max(s, 1) for s in alive_scores) or 1.0
+        p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
+        p_death = max(0.03, min(0.92, p_death))
+        return prob_to_american(p_death)
+
     if market_type == "FIRST_BLOOD":
         # A single 1-of-field event, weighted toward aggression (strength).
         sum_sq = sum(s * s for s in alive_scores) or 1
@@ -504,11 +684,61 @@ def default_odds(
         prob = p_under if ou_side == "UNDER" else 1.0 - p_under
         return prob_to_american(prob)
 
+    if market_type == "TRIBUTE_RUNNER_UP":
+        # P(exactly 2nd place) = P(top 2) - P(top 1)
+        prob = _p_top_k(strength, 2) - _p_top_k(strength, 1)
+        return prob_to_american(max(0.005, prob))
+
+    if market_type == "FIRST_TRIBUTE_TO_DIE":
+        # P(this tribute dies first) ∝ weakness (inverse strength)
+        inv = 1.0 / max(score_a, 1)
+        sum_inv = sum(1.0 / max(s, 1) for s in alive_scores) or 1.0
+        return prob_to_american(max(0.01, min(0.99, inv / sum_inv)))
+
+    if market_type == "HIGHEST_TRAINING_SCORE":
+        # Before training scores are revealed, use the district's historical average
+        # as the effective score so districts with stronger scoring histories price
+        # as genuine favourites rather than all collapsing to the same flat odds.
+        if tribute_a is not None and tribute_a.training_score is None and hist_avg_score is not None:
+            effective_a: float = hist_avg_score
+        else:
+            effective_a = float(score_a)
+        sum_cubed = sum(s ** 3 for s in alive_scores) or 1
+        prob = (effective_a ** 3) / sum_cubed
+        return prob_to_american(max(0.005, min(0.99, prob)))
+
+    if market_type == "LOWEST_TRAINING_SCORE":
+        if tribute_a is not None and tribute_a.training_score is None and hist_avg_score is not None:
+            effective_a = hist_avg_score
+        else:
+            effective_a = float(score_a)
+        inv = 1.0 / max(effective_a, 1)
+        sum_inv_sq = sum((1.0 / max(s, 1)) ** 2 for s in alive_scores) or 1.0
+        prob = (inv ** 2) / sum_inv_sq
+        return prob_to_american(max(0.005, min(0.99, prob)))
+
+    if market_type == "FIRST_IN_ALLIANCE_DEATH":
+        # P(this tribute is the first to die within their alliance)
+        if tribute_a is not None and tribute_a.alliance_id is not None:
+            alliance_alive = [
+                t for t in all_tributes
+                if t.alliance_id == tribute_a.alliance_id and t.status == "ALIVE"
+            ]
+            if alliance_alive:
+                sum_inv_alliance = sum(1.0 / max(t.training_score or 6, 1) for t in alliance_alive)
+                inv_a = 1.0 / max(score_a, 1)
+                prob = inv_a / max(sum_inv_alliance, 0.0001)
+                return prob_to_american(max(0.01, min(0.99, prob)))
+        # Fallback: field-relative weakness
+        inv = 1.0 / max(score_a, 1)
+        sum_inv = sum(1.0 / max(s, 1) for s in alive_scores) or 1.0
+        return prob_to_american(max(0.01, min(0.99, inv / sum_inv)))
+
     # ── Milestone markets (all derived from the same top-k model) ───────────────
 
     _FINAL_K = {
-        "MAKES_FINAL_8": 8, "MAKES_FINAL_5": 5, "MAKES_FINALE": 3,
-        "MISSES_FINAL_8": 8, "MISSES_FINAL_5": 5, "MISSES_FINALE": 3,
+        "MAKES_FINAL_8": 8, "MAKES_FINAL_5": 5,
+        "MISSES_FINAL_8": 8, "MISSES_FINAL_5": 5,
     }
     if market_type in _FINAL_K:
         makes_prob = _p_top_k(strength, _FINAL_K[market_type])
@@ -549,17 +779,17 @@ def default_odds(
 # ── District-level market odds ─────────────────────────────────────────────────
 
 _DISTRICT_K_BOTH = {
-    "DISTRICT_BOTH_FINAL_8": 8, "DISTRICT_BOTH_FINAL_5": 5, "DISTRICT_BOTH_FINALE": 3,
+    "DISTRICT_BOTH_FINAL_8": 8, "DISTRICT_BOTH_FINAL_5": 5,
 }
 _DISTRICT_K_ONE = {
-    "DISTRICT_ONE_FINAL_8": 8, "DISTRICT_ONE_FINAL_5": 5, "DISTRICT_ONE_FINALE": 3,
+    "DISTRICT_ONE_FINAL_8": 8, "DISTRICT_ONE_FINAL_5": 5,
 }
 
 _ALLIANCE_K_ALL = {
-    "ALLIANCE_ALL_FINAL_8": 8, "ALLIANCE_ALL_FINAL_5": 5, "ALLIANCE_ALL_FINALE": 3,
+    "ALLIANCE_ALL_FINAL_8": 8, "ALLIANCE_ALL_FINAL_5": 5,
 }
 _ALLIANCE_K_ONE = {
-    "ALLIANCE_ONE_FINAL_8": 8, "ALLIANCE_ONE_FINAL_5": 5, "ALLIANCE_ONE_FINALE": 3,
+    "ALLIANCE_ONE_FINAL_8": 8, "ALLIANCE_ONE_FINAL_5": 5,
 }
 
 
@@ -569,24 +799,37 @@ def district_default_odds(
     all_tributes: list["Tribute"],
     ou_line: float | None = None,
     ou_side: str | None = None,
+    win_factors: "dict[int, float] | None" = None,
+    kill_factors: "dict[int, float] | None" = None,
 ) -> int:
-    """Compute default odds for district-level markets (no single tribute_a)."""
+    """Compute default odds for district-level markets (no single tribute_a).
+
+    win_factors / kill_factors are per-tribute combined modifier maps (debilitation,
+    district funding, historical performance, reputation, etc.) keyed by tribute id.
+    A factor of 1.0 is neutral; omit to price on raw training scores only.
+    """
     alive = [t for t in district_tributes if t.status == "ALIVE"]
     if not alive:
         return DEFAULT_FALLBACK_ODDS
+
+    def _wf(t: "Tribute") -> float:
+        return win_factors.get(t.id, 1.0) if win_factors else 1.0
+
+    def _kf(t: "Tribute") -> float:
+        return kill_factors.get(t.id, 1.0) if kill_factors else 1.0
 
     alive_all_scores = _alive_scores(all_tributes)
     total = sum(alive_all_scores) or 1
     n = len([t for t in all_tributes if t.status == "ALIVE"]) or 1
 
     if market_type == "DISTRICT_VICTOR":
-        prob = sum((t.training_score or 6) / total for t in alive)
+        prob = sum((t.training_score or 6) * _wf(t) / total for t in alive)
         return prob_to_american(max(0.01, min(0.99, prob)))
 
     if market_type == "DISTRICT_KILLS_OU":
         sum_sq = sum(s * s for s in alive_all_scores) or 1
         total_kills = TRIBUTE_KILL_FRACTION * max(1, n - 1)
-        lam = sum(total_kills * ((t.training_score or 6) ** 2) / sum_sq for t in alive)
+        lam = sum(total_kills * ((t.training_score or 6) ** 2) / sum_sq * _kf(t) for t in alive)
         line = ou_line if ou_line is not None else 1.5
         m = int(math.floor(line)) + 1
         p_over = _poisson_at_least(m, lam)
@@ -600,22 +843,66 @@ def district_default_odds(
             inv = 1.0 / max(t.training_score or 6, 1)
             p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
             p_death = max(0.03, min(0.92, p_death))
-            p_both *= (1.0 - p_death)
+            p_survive = (1.0 - p_death) * _wf(t)
+            p_both *= max(0.03, min(0.97, p_survive))
         return prob_to_american(max(0.01, min(0.99, p_both)))
+
+    if market_type == "DISTRICT_WIPED_BLOODBATH":
+        sum_inv = sum(1.0 / max(s, 1) for s in alive_all_scores) or 1.0
+        p_all_dead = 1.0
+        for t in alive:
+            inv = 1.0 / max(t.training_score or 6, 1)
+            p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
+            p_death = max(0.03, min(0.92, p_death))
+            p_die = p_death * _wf(t)
+            p_all_dead *= max(0.03, min(0.97, p_die))
+        return prob_to_american(max(0.01, min(0.99, p_all_dead)))
 
     if market_type in _DISTRICT_K_BOTH:
         k = _DISTRICT_K_BOTH[market_type]
         p_both = 1.0
         for t in alive:
-            p_both *= _p_top_k((t.training_score or 6) / total, k)
+            p_both *= max(0.001, min(0.999, _p_top_k((t.training_score or 6) / total, k) * _wf(t)))
         return prob_to_american(max(0.01, min(0.99, p_both)))
 
     if market_type in _DISTRICT_K_ONE:
         k = _DISTRICT_K_ONE[market_type]
         p_none = 1.0
         for t in alive:
-            p_none *= 1.0 - _p_top_k((t.training_score or 6) / total, k)
+            p_none *= 1.0 - max(0.001, min(0.999, _p_top_k((t.training_score or 6) / total, k) * _wf(t)))
         return prob_to_american(max(0.01, min(0.99, 1.0 - p_none)))
+
+    if market_type == "DISTRICT_HIGHEST_SCORE":
+        # P(this district has the highest combined training score) ∝ sum(scores)³
+        # Win factors serve as a proxy for scoring aptitude when no training scores are set.
+        dist_scores: dict[int, float] = {}
+        for t in all_tributes:
+            if t.status == "ALIVE":
+                dist_scores[t.district] = (
+                    dist_scores.get(t.district, 0) + (t.training_score or 6) * _wf(t)
+                )
+        sum_cubed = sum(s ** 3 for s in dist_scores.values()) or 1
+        dist_score = sum((t.training_score or 6) * _wf(t) for t in alive)
+        prob = (dist_score ** 3) / sum_cubed
+        return prob_to_american(max(0.005, min(0.99, prob)))
+
+    if market_type == "FIRST_DISTRICT_WIPE":
+        # P(this district is first wiped) ∝ product of member inverse strengths
+        if not alive:
+            return DEFAULT_FALLBACK_ODDS
+        dist_prods: dict[int, float] = {}
+        for t in all_tributes:
+            if t.status == "ALIVE":
+                d = t.district
+                effective = max((t.training_score or 6) * _wf(t), 0.1)
+                dist_prods[d] = dist_prods.get(d, 1.0) * (1.0 / effective)
+        sum_prods = sum(dist_prods.values()) or 1.0
+        prod_inv = 1.0
+        for t in alive:
+            effective = max((t.training_score or 6) * _wf(t), 0.1)
+            prod_inv *= 1.0 / effective
+        prob = prod_inv / sum_prods
+        return prob_to_american(max(0.01, min(0.99, prob)))
 
     return DEFAULT_FALLBACK_ODDS
 
@@ -626,24 +913,42 @@ def alliance_default_odds(
     all_tributes: list["Tribute"],
     ou_line: float | None = None,
     ou_side: str | None = None,
+    win_factors: "dict[int, float] | None" = None,
+    kill_factors: "dict[int, float] | None" = None,
+    top_n: int | None = None,
 ) -> int:
-    """Compute default odds for alliance-level markets (no single tribute_a)."""
+    """Compute default odds for alliance-level markets (no single tribute_a).
+
+    win_factors / kill_factors are per-tribute combined modifier maps (debilitation,
+    district funding, custom modifiers, history, etc.).  A factor of 1.0 is neutral;
+    a debilitated member at 0.55 drags the alliance down; a well-funded member at
+    2.25 lifts it.  Omit to price on raw training scores only.
+    """
     alive = [t for t in alliance_members if t.status == "ALIVE"]
     if not alive:
         return DEFAULT_FALLBACK_ODDS
+
+    def _wf(t: "Tribute") -> float:
+        return win_factors.get(t.id, 1.0) if win_factors else 1.0
+
+    def _kf(t: "Tribute") -> float:
+        return kill_factors.get(t.id, 1.0) if kill_factors else 1.0
 
     alive_all_scores = _alive_scores(all_tributes)
     total = sum(alive_all_scores) or 1
     n = len([t for t in all_tributes if t.status == "ALIVE"]) or 1
 
     if market_type == "ALLIANCE_VICTOR":
-        prob = sum((t.training_score or 6) / total for t in alive)
+        prob = sum((t.training_score or 6) * _wf(t) / total for t in alive)
         return prob_to_american(max(0.01, min(0.99, prob)))
 
     if market_type == "ALLIANCE_KILLS_OU":
         sum_sq = sum(s * s for s in alive_all_scores) or 1
         total_kills = TRIBUTE_KILL_FRACTION * max(1, n - 1)
-        lam = sum(total_kills * ((t.training_score or 6) ** 2) / sum_sq for t in alive)
+        lam = sum(
+            total_kills * ((t.training_score or 6) ** 2) / sum_sq * _kf(t)
+            for t in alive
+        )
         line = ou_line if ou_line is not None else 1.5
         m = int(math.floor(line)) + 1
         p_over = _poisson_at_least(m, lam)
@@ -657,21 +962,211 @@ def alliance_default_odds(
             inv = 1.0 / max(t.training_score or 6, 1)
             p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
             p_death = max(0.03, min(0.92, p_death))
-            p_all *= (1.0 - p_death)
+            p_survive = (1.0 - p_death) * _wf(t)
+            p_all *= max(0.03, min(0.97, p_survive))
         return prob_to_american(max(0.01, min(0.99, p_all)))
+
+    if market_type == "ALLIANCE_WIPED_BLOODBATH":
+        sum_inv = sum(1.0 / max(s, 1) for s in alive_all_scores) or 1.0
+        p_all_dead = 1.0
+        for t in alive:
+            inv = 1.0 / max(t.training_score or 6, 1)
+            p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
+            p_death = max(0.03, min(0.92, p_death))
+            p_die = p_death * _wf(t)
+            p_all_dead *= max(0.03, min(0.97, p_die))
+        return prob_to_american(max(0.01, min(0.99, p_all_dead)))
 
     if market_type in _ALLIANCE_K_ALL:
         k = _ALLIANCE_K_ALL[market_type]
         p_all = 1.0
         for t in alive:
-            p_all *= _p_top_k((t.training_score or 6) / total, k)
+            p_member = _p_top_k((t.training_score or 6) / total, k)
+            p_all *= max(0.001, min(0.999, p_member * _wf(t)))
         return prob_to_american(max(0.01, min(0.99, p_all)))
 
     if market_type in _ALLIANCE_K_ONE:
         k = _ALLIANCE_K_ONE[market_type]
         p_none = 1.0
         for t in alive:
-            p_none *= 1.0 - _p_top_k((t.training_score or 6) / total, k)
+            p_member = _p_top_k((t.training_score or 6) / total, k)
+            p_none *= 1.0 - max(0.001, min(0.999, p_member * _wf(t)))
         return prob_to_american(max(0.01, min(0.99, 1.0 - p_none)))
+
+    if market_type == "ALLIANCE_RUNNER_UP":
+        # P(any member of this alliance finishes exactly 2nd)
+        p_none = 1.0
+        for t in alive:
+            s = (t.training_score or 6) / total
+            p_2nd = max(0.001, (_p_top_k(s, 2) - _p_top_k(s, 1)) * _wf(t))
+            p_none *= max(0.001, 1.0 - p_2nd)
+        return prob_to_american(max(0.01, min(0.99, 1.0 - p_none)))
+
+    if market_type == "FIRST_ALLIANCE_WIPED":
+        # P(this alliance is the first wiped) ≈ proportional to combined member weakness
+        alive_all_scores_inv = [1.0 / max(s, 1) for s in alive_all_scores]
+        sum_inv_all = sum(alive_all_scores_inv) or 1.0
+        alliance_weakness = sum(1.0 / max(t.training_score or 6, 1) * _wf(t) for t in alive)
+        prob = alliance_weakness / sum_inv_all
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    if market_type == "ALLIANCE_MOST_KILLS":
+        # P(this alliance gets most kills) ≈ proportion of total kill-strength (strength²)
+        sum_sq = sum(s * s for s in alive_all_scores) or 1
+        alliance_ks = sum((t.training_score or 6) ** 2 * _kf(t) for t in alive)
+        prob = alliance_ks / sum_sq
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    if market_type == "EXACT_ALLIANCE_KILLS":
+        # Poisson PMF at guessed kill count (top_n)
+        sum_sq = sum(s * s for s in alive_all_scores) or 1
+        total_kills = TRIBUTE_KILL_FRACTION * max(1, n - 1)
+        lam = sum(total_kills * ((t.training_score or 6) ** 2) / sum_sq * _kf(t) for t in alive)
+        k = top_n if top_n is not None else 2
+        if lam <= 0 or k < 0:
+            return DEFAULT_FALLBACK_ODDS
+        pmf = math.exp(-lam) * (lam ** k) / math.factorial(k)
+        return prob_to_american(max(0.005, min(0.99, pmf)))
+
+    return DEFAULT_FALLBACK_ODDS
+
+
+# ── Game-level prop market odds ────────────────────────────────────────────────
+
+def game_default_odds(
+    market_type: str,
+    all_tributes: list["Tribute"],
+    placement_num: int | None = None,
+    ou_line: float | None = None,
+    ou_side: str | None = None,
+) -> int:
+    """Compute default odds for game-level prop markets (no tribute/district/alliance)."""
+    alive_scores = _alive_scores(all_tributes)
+    n = len([t for t in all_tributes if t.status == "ALIVE"]) or 1
+    total = sum(alive_scores) or 1
+
+    if market_type == "BLOODBATH_KILLS_OU":
+        lam = BLOODBATH_DEATH_FRACTION * TRIBUTE_KILL_FRACTION * n
+        line = ou_line if ou_line is not None else round(lam - 0.5, 1)
+        m = int(math.floor(line)) + 1
+        p_over = _poisson_at_least(m, lam)
+        prob = p_over if ou_side == "OVER" else 1.0 - p_over
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    if market_type == "BLOODBATH_DEATHS_OU":
+        lam = BLOODBATH_DEATH_FRACTION * n
+        line = ou_line if ou_line is not None else round(lam - 0.5, 1)
+        m = int(math.floor(line)) + 1
+        p_over = _poisson_at_least(m, lam)
+        prob = p_over if ou_side == "OVER" else 1.0 - p_over
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    if market_type == "EXACT_BLOODBATH_DEATHS":
+        lam = BLOODBATH_DEATH_FRACTION * n
+        k = placement_num if placement_num is not None else max(1, round(lam))
+        if lam <= 0 or k < 0:
+            return DEFAULT_FALLBACK_ODDS
+        pmf = math.exp(-lam) * (lam ** k) / math.factorial(k)
+        return prob_to_american(max(0.005, min(0.99, pmf)))
+
+    if market_type == "ARENA_TRAP_DEATHS_OU":
+        # Expected Gamemaker/trap deaths ≈ (1 - TRIBUTE_KILL_FRACTION) * 0.5 * (n-1)
+        lam = (1.0 - TRIBUTE_KILL_FRACTION) * 0.5 * max(1, n - 1)
+        line = ou_line if ou_line is not None else max(0.5, round(lam - 0.5, 1))
+        m = int(math.floor(line)) + 1
+        p_over = _poisson_at_least(m, lam)
+        prob = p_over if ou_side == "OVER" else 1.0 - p_over
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    if market_type == "ARENA_ENV_DEATHS_OU":
+        # Expected environmental (Natural Causes + Mutt) deaths ≈ same fraction as trap
+        lam = (1.0 - TRIBUTE_KILL_FRACTION) * 0.5 * max(1, n - 1)
+        line = ou_line if ou_line is not None else max(0.5, round(lam - 0.5, 1))
+        m = int(math.floor(line)) + 1
+        p_over = _poisson_at_least(m, lam)
+        prob = p_over if ou_side == "OVER" else 1.0 - p_over
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    if market_type == "GAMES_DURATION":
+        # Gaussian PMF around 7-day expected duration (sigma = 1.5)
+        days = placement_num if placement_num is not None else 7
+        mean_days = 7.0
+        sigma = 1.5
+        lo = (days - 0.5 - mean_days) / (sigma * math.sqrt(2))
+        hi = (days + 0.5 - mean_days) / (sigma * math.sqrt(2))
+        pmf = max(0.0, 0.5 * (math.erf(hi) - math.erf(lo)))
+        return prob_to_american(max(0.005, min(0.99, pmf)))
+
+    if market_type == "SOLO_TRIBUTES_OU":
+        # Current count of unallied alive tributes as the expected value (Poisson approx)
+        lam = float(sum(1 for t in all_tributes if t.status == "ALIVE" and t.alliance_id is None))
+        line = ou_line if ou_line is not None else max(0.5, lam - 0.5)
+        if lam <= 0:
+            prob = 0.0 if ou_side == "OVER" else 1.0
+            return prob_to_american(max(0.01, min(0.99, prob)))
+        m = int(math.floor(line)) + 1
+        p_over = _poisson_at_least(m, lam)
+        prob = p_over if ou_side == "OVER" else 1.0 - p_over
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    if market_type == "BLOODBATH_NO_DEATHS":
+        # P(nobody dies in bloodbath) = product of P(each tribute survives)
+        sum_inv = sum(1.0 / max(s, 1) for s in alive_scores) or 1.0
+        p_all_survive = 1.0
+        for s in alive_scores:
+            inv = 1.0 / max(s, 1)
+            p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
+            p_death = max(0.03, min(0.92, p_death))
+            p_all_survive *= (1.0 - p_death)
+        return prob_to_american(max(0.005, min(0.99, p_all_survive)))
+
+    if market_type == "NUM_TENS_OU":
+        # Expected count of tributes scoring 10+ (~12% base rate per tribute)
+        lam = n * 0.12
+        line = ou_line if ou_line is not None else max(0.5, round(lam - 0.5, 1))
+        m = int(math.floor(line)) + 1
+        p_over = _poisson_at_least(m, lam)
+        prob = p_over if ou_side == "OVER" else 1.0 - p_over
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    if market_type in ("ARENA_IS_NATURAL", "ARENA_IS_ARTIFICIAL"):
+        return 100  # even money by default; admin adjusts from historical arena counts
+
+    if market_type == "DISTRICT_PARTNER_KILL":
+        # P(any tribute kills their district partner during the Games)
+        sum_inv = sum(1.0 / max(s, 1) for s in alive_scores) or 1.0
+        districts = {t.district for t in all_tributes if t.status == "ALIVE"}
+        p_none = 1.0
+        for d in districts:
+            d_alive = [t for t in all_tributes if t.district == d and t.status == "ALIVE"]
+            if len(d_alive) < 2:
+                continue
+            t1, t2 = d_alive[0], d_alive[1]
+            s1 = t1.training_score or 6
+            s2 = t2.training_score or 6
+            inv2 = 1.0 / max(s2, 1)
+            p_b_killed = min(0.95, TRIBUTE_KILL_FRACTION * n * (inv2 / sum_inv))
+            p_a_kills_b = p_b_killed * (s1 / max(total - s2, 1)) * DISTRICT_PAIR_KILL_SUPPRESSION
+            inv1 = 1.0 / max(s1, 1)
+            p_a_killed = min(0.95, TRIBUTE_KILL_FRACTION * n * (inv1 / sum_inv))
+            p_b_kills_a = p_a_killed * (s2 / max(total - s1, 1)) * DISTRICT_PAIR_KILL_SUPPRESSION
+            p_pair_kill = 1.0 - (1.0 - p_a_kills_b) * (1.0 - p_b_kills_a)
+            p_none *= (1.0 - p_pair_kill)
+        prob = 1.0 - p_none
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
+    # GAMES_FEAST, GAMES_BETRAYAL, ANY_BB_DOUBLE_KILL — no modellable prior
+
+    if market_type in (
+        "PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER",
+        "PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER",
+    ):
+        # Head-to-head probability: tribute_a's share of the two-tribute strength pool.
+        # Same formula for score and placement comparisons — training score is the
+        # best pre-Games proxy for relative finishing order as well.
+        sb = (tribute_b.training_score or 6) if tribute_b is not None else 6
+        p_a_wins = score_a / max(score_a + sb, 1)
+        prob = p_a_wins if market_type in ("PARTNER_SCORE_HIGHER", "PARTNER_PLACE_HIGHER") else 1.0 - p_a_wins
+        return prob_to_american(max(0.01, min(0.99, prob)))
 
     return DEFAULT_FALLBACK_ODDS

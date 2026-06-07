@@ -115,13 +115,42 @@ async def _migrate_schema() -> None:
             await conn.execute(text("ALTER TABLE tributes_new RENAME TO tributes"))
             await conn.execute(text("PRAGMA foreign_keys = ON"))
 
-        # Add tributes.kill_boost (accumulated kill-quality multiplier). Checked
-        # after the recreation above so it is added regardless of that path.
+        # Add tributes.kill_boost. Checked after the recreation above so it is
+        # added regardless of that path.
         rows = await conn.execute(text("PRAGMA table_info(tributes)"))
         trib_cols = {row[1] for row in rows.fetchall()}
         if "kill_boost" not in trib_cols:
             await conn.execute(text(
-                "ALTER TABLE tributes ADD COLUMN kill_boost FLOAT NOT NULL DEFAULT 1.0"
+                "ALTER TABLE tributes ADD COLUMN kill_boost FLOAT NOT NULL DEFAULT 0.0"
+            ))
+
+        # One-time migration: switch kill_boost from multiplicative (neutral=1.0)
+        # to additive (neutral=0.0) semantics. Marked in game_settings.
+        kb_marker = await conn.execute(
+            text("SELECT value FROM game_settings WHERE key = 'kill_boost_format'")
+        )
+        if kb_marker.fetchone() is None:
+            await conn.execute(text("UPDATE tributes SET kill_boost = 0.0"))
+            await conn.execute(text(
+                "INSERT INTO game_settings (key, value) "
+                "VALUES ('kill_boost_format', '\"v2\"')"
+            ))
+        if "debilitation_level" not in trib_cols:
+            await conn.execute(text(
+                "ALTER TABLE tributes ADD COLUMN debilitation_level VARCHAR(30)"
+            ))
+        # Tribute age (12–18); nullable so pre-existing tributes stay neutral.
+        if "age" not in trib_cols:
+            await conn.execute(text(
+                "ALTER TABLE tributes ADD COLUMN age INTEGER"
+            ))
+        if "times_played" not in trib_cols:
+            await conn.execute(text(
+                "ALTER TABLE tributes ADD COLUMN times_played INTEGER NOT NULL DEFAULT 0"
+            ))
+        if "highest_placement" not in trib_cols:
+            await conn.execute(text(
+                "ALTER TABLE tributes ADD COLUMN highest_placement INTEGER"
             ))
 
         # Migrate district_records from per-tribute rows to per-district aggregate rows
@@ -152,6 +181,7 @@ async def _migrate_schema() -> None:
             ("avg_training_score_nonbinary",   "INTEGER"),
             ("manmade_arena_wins",             "INTEGER"),
             ("reputation",                     "INTEGER"),
+            ("funding_level",                  "VARCHAR(20)"),
         ]
         for col, typ in _DR_NEW_COLS:
             if col not in dr_cols:
@@ -200,21 +230,96 @@ async def _migrate_schema() -> None:
             await conn.execute(text("ALTER TABLE markets_new RENAME TO markets"))
             await conn.execute(text("PRAGMA foreign_keys = ON"))
 
-        # Add Final 8 / Final 5 phases; push Finale to sort_order 5
-        final8_count = (await conn.execute(text(
-            "SELECT COUNT(*) FROM betting_phases WHERE name = 'Final 8'"
+        # Phase migrations only apply to pre-existing databases. A brand-new DB
+        # has an empty betting_phases table here (it is seeded with the full,
+        # current phase set in _seed_defaults), so skip all of this to avoid
+        # partially populating the table and short-circuiting that seed.
+        phase_rows = (await conn.execute(text(
+            "SELECT COUNT(*) FROM betting_phases"
         ))).scalar()
-        if final8_count == 0:
+        if phase_rows:
+            # Add Final 8 / Final 5 phases to legacy DBs that predate them.
+            final8_count = (await conn.execute(text(
+                "SELECT COUNT(*) FROM betting_phases WHERE name = 'Final 8'"
+            ))).scalar()
+            if final8_count == 0:
+                await conn.execute(text(
+                    "INSERT OR IGNORE INTO betting_phases (name, description, sort_order) "
+                    "VALUES ('Final 8', 'The top 8 tributes remain', 3)"
+                ))
+                await conn.execute(text(
+                    "INSERT OR IGNORE INTO betting_phases (name, description, sort_order) "
+                    "VALUES ('Final 5', 'The top 5 tributes remain', 4)"
+                ))
+
+        # Restructure phases: rename Mid-Games → Arena, insert the two sponsor
+        # phases, and drop the Finale phase. Guarded on Mid-Games so this only
+        # touches pre-existing databases (a fresh DB is seeded with the new
+        # phase set directly in _seed_defaults).
+        midgames_exists = (await conn.execute(text(
+            "SELECT COUNT(*) FROM betting_phases WHERE name = 'Mid-Games'"
+        ))).scalar()
+        if midgames_exists:
             await conn.execute(text(
-                "UPDATE betting_phases SET sort_order = 5 WHERE name = 'Finale' AND sort_order = 3"
+                "UPDATE betting_phases SET name = 'Arena', "
+                "description = 'The arena opens — all remaining markets go live', "
+                "sort_order = 3 WHERE name = 'Mid-Games'"
+            ))
+            await conn.execute(text(
+                "UPDATE betting_phases SET sort_order = 5 WHERE name = 'Final 8'"
+            ))
+            await conn.execute(text(
+                "UPDATE betting_phases SET sort_order = 6 WHERE name = 'Final 5'"
             ))
             await conn.execute(text(
                 "INSERT OR IGNORE INTO betting_phases (name, description, sort_order) "
-                "VALUES ('Final 8', 'The top 8 tributes remain', 3)"
+                "VALUES ('Sponsors Open', 'Sponsorship window opens — funded districts surge', 2)"
             ))
             await conn.execute(text(
                 "INSERT OR IGNORE INTO betting_phases (name, description, sort_order) "
-                "VALUES ('Final 5', 'The top 5 tributes remain', 4)"
+                "VALUES ('Sponsors Closing', 'Sponsorship window closes — funding edge fades', 4)"
+            ))
+            # Detach any markets pinned to the Finale phase, then remove it.
+            await conn.execute(text(
+                "UPDATE markets SET phase_id = NULL WHERE phase_id IN "
+                "(SELECT id FROM betting_phases WHERE name = 'Finale')"
+            ))
+            await conn.execute(text("DELETE FROM betting_phases WHERE name = 'Finale'"))
+
+        # Purge removed market types (finale milestones + sponsor events). Only
+        # delete markets that carry no bets/pending legs so existing wagers are
+        # never silently dropped; obsolete templates are always removed so the
+        # types can no longer be created.
+        _removed_types = (
+            "'MAKES_FINALE','MISSES_FINALE',"
+            "'DISTRICT_BOTH_FINALE','DISTRICT_ONE_FINALE',"
+            "'ALLIANCE_ALL_FINALE','ALLIANCE_ONE_FINALE',"
+            "'GAMES_PARTNER_FINALE','SPONSOR_EVENT'"
+        )
+        await conn.execute(text(
+            f"DELETE FROM markets WHERE type IN ({_removed_types}) "
+            "AND id NOT IN (SELECT market_id FROM bets) "
+            "AND id NOT IN (SELECT market_id FROM pending_parlay_legs)"
+        ))
+        await conn.execute(text(
+            f"DELETE FROM market_templates WHERE type_key IN ({_removed_types})"
+        ))
+
+        # Add alliance_id to modifier_assignments for alliance-scoped modifiers
+        rows = await conn.execute(text("PRAGMA table_info(modifier_assignments)"))
+        ma_cols = {row[1] for row in rows.fetchall()}
+        if "alliance_id" not in ma_cols:
+            await conn.execute(text(
+                "ALTER TABLE modifier_assignments ADD COLUMN "
+                "alliance_id INTEGER REFERENCES alliances(id) ON DELETE CASCADE"
+            ))
+
+        # Add parlays.is_public for the public tailing board (default: listed)
+        rows = await conn.execute(text("PRAGMA table_info(parlays)"))
+        parlay_cols = {row[1] for row in rows.fetchall()}
+        if parlay_cols and "is_public" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT 1"
             ))
 
 
@@ -227,15 +332,12 @@ _BUILTIN_MARKET_TYPES = [
     ("DEATH_CAUSE",             "Death Cause",                          "MODERATE",  "Tribute dies by a specific cause (natural, mutt, tribute, or Gamemakers)."),
     ("FIRST_BLOOD",             "First Blood",                          "MODERATE",  "Tribute gets the very first kill of the Games (Pre-Games/Bloodbath only)."),
     ("BLOODBATH_SURVIVOR",      "Bloodbath Survivor",                   "EASY",      "Tribute survives the opening Cornucopia bloodbath (Pre-Games/Bloodbath only)."),
-    ("SPONSOR_EVENT",           "Sponsor Event (Custom)",               "MODERATE",  "Custom sponsor-driven event with a user-defined label."),
     ("KILLS_OU",                "Kills Over/Under",                     "MODERATE",  "Tribute gets more or fewer kills than a set line (e.g. over/under 1.5)."),
     ("PLACEMENT_OU",            "Placement Over/Under",                 "MODERATE",  "Tribute finishes with a better or worse placement than a set line."),
     ("MAKES_FINAL_8",           "Makes Final 8",                        "MODERATE",  "Tribute is still alive when the Final 8 phase begins."),
     ("MISSES_FINAL_8",          "Eliminated Before Final 8",            "MODERATE",  "Tribute is eliminated before the Final 8 phase begins."),
     ("MAKES_FINAL_5",           "Makes Final 5",                        "MODERATE",  "Tribute is still alive when the Final 5 phase begins."),
     ("MISSES_FINAL_5",          "Eliminated Before Final 5",            "MODERATE",  "Tribute is eliminated before the Final 5 phase begins."),
-    ("MAKES_FINALE",            "Makes the Finale",                     "HARD",      "Tribute is still alive when the Finale phase begins."),
-    ("MISSES_FINALE",           "Eliminated Before Finale",             "MODERATE",  "Tribute is eliminated before the Finale phase begins."),
     ("ARENA_TYPE",              "Arena Type (Pre-Games)",               "EASY",      "Bet on whether the arena is Artificial or Natural. Resolves when Pre-Games ends."),
     ("EXACT_TRAINING_SCORE",    "Exact Training Score",                 "HARD",      "Guess a tribute's exact training score (1–12). Resolves when Pre-Games ends."),
     ("COMBINED_DISTRICT_SCORE", "Combined District Training Score",     "VERY_HARD", "Guess the combined training scores of both district tributes. Resolves when Pre-Games ends."),
@@ -248,8 +350,6 @@ _BUILTIN_MARKET_TYPES = [
     ("DISTRICT_ONE_FINAL_8",    "District At Least One Makes Final 8",  "MODERATE",  "At least one district tribute is alive when the Final 8 phase begins."),
     ("DISTRICT_BOTH_FINAL_5",   "District Both Make Final 5",           "VERY_HARD", "Both district tributes are alive when the Final 5 phase begins."),
     ("DISTRICT_ONE_FINAL_5",    "District At Least One Makes Final 5",  "MODERATE",  "At least one district tribute is alive when the Final 5 phase begins."),
-    ("DISTRICT_BOTH_FINALE",    "District Both Make the Finale",        "VERY_HARD", "Both district tributes are alive when the Finale phase begins."),
-    ("DISTRICT_ONE_FINALE",     "District At Least One Makes Finale",   "HARD",      "At least one district tribute is alive when the Finale phase begins."),
     # ── Alliance-level markets ─────────────────────────────────────────────────
     ("ALLIANCE_VICTOR",         "Alliance Victor",                      "HARD",      "A member of the alliance wins the Games. Resolves at game end."),
     ("ALLIANCE_KILLS_OU",       "Alliance Total Kills Over/Under",      "MODERATE",  "Bet over or under on the alliance's combined kill total. Resolves at game end."),
@@ -258,8 +358,39 @@ _BUILTIN_MARKET_TYPES = [
     ("ALLIANCE_ONE_FINAL_8",    "Alliance At Least One Makes Final 8",  "MODERATE",  "At least one alliance member is alive when the Final 8 phase begins."),
     ("ALLIANCE_ALL_FINAL_5",    "Alliance All Make Final 5",            "VERY_HARD", "All alliance members are alive when the Final 5 phase begins."),
     ("ALLIANCE_ONE_FINAL_5",    "Alliance At Least One Makes Final 5",  "MODERATE",  "At least one alliance member is alive when the Final 5 phase begins."),
-    ("ALLIANCE_ALL_FINALE",     "Alliance All Make the Finale",         "VERY_HARD", "All alliance members are alive when the Finale phase begins."),
-    ("ALLIANCE_ONE_FINALE",     "Alliance At Least One Makes Finale",   "HARD",      "At least one alliance member is alive when the Finale phase begins."),
+    ("FIRST_ALLIANCE_WIPED",    "First Alliance to be Wiped",           "HARD",      "This alliance is the first to have one or fewer living members. Resolves manually."),
+    ("ALLIANCE_MOST_KILLS",     "Alliance Gets Most Kills",             "HARD",      "This alliance is credited with the most kills of any alliance. Resolves at game end."),
+    ("EXACT_ALLIANCE_KILLS",    "Alliance Exact Kill Count",            "VERY_HARD", "This alliance is credited with exactly the guessed number of kills (top_n). Resolves at game end."),
+    # ── New tribute-level markets ──────────────────────────────────────────────
+    ("TRIBUTE_RUNNER_UP",       "Tribute Runner-Up (2nd Place)",        "HARD",      "Tribute finishes exactly 2nd — the runner-up to the Victor. Auto-resolves at game end."),
+    ("FIRST_TRIBUTE_TO_DIE",    "First Tribute to Die",                 "MODERATE",  "This tribute is the very first to die in the Games. Auto-resolves on the first death."),
+    ("FIRST_IN_ALLIANCE_DEATH", "First in Alliance to Die",             "MODERATE",  "This tribute is the first member of their alliance to die. Requires alliance_id. Auto-resolves on first alliance death."),
+    ("HIGHEST_TRAINING_SCORE",  "Highest Training Score",               "HARD",      "This tribute receives the highest individual training score. Auto-resolves when Pre-Games ends."),
+    ("LOWEST_TRAINING_SCORE",   "Lowest Training Score",                "HARD",      "This tribute receives the lowest individual training score. Auto-resolves when Pre-Games ends."),
+    ("TRIBUTE_KILLED_BLOODBATH","Killed in Bloodbath",                  "MODERATE",  "Tribute is killed during the opening Cornucopia bloodbath. Auto-resolves when Arena phase begins."),
+    # ── New district-level markets ─────────────────────────────────────────────
+    ("DISTRICT_HIGHEST_SCORE",  "District Highest Combined Score",      "HARD",      "This district has the highest combined training score total. Auto-resolves when Pre-Games ends."),
+    ("FIRST_DISTRICT_WIPE",     "First District Wipe",                  "MODERATE",  "This district is the first to have all members eliminated. Auto-resolves on the wipe-triggering death."),
+    ("DISTRICT_WIPED_BLOODBATH","District Wiped in Bloodbath",          "HARD",      "Both district tributes are killed during the opening bloodbath. Auto-resolves when Arena phase begins."),
+    # ── New alliance-level markets ─────────────────────────────────────────────
+    ("ALLIANCE_RUNNER_UP",      "Alliance Produces Runner-Up",          "HARD",      "A member of this alliance finishes 2nd overall. Auto-resolves at game end."),
+    ("ALLIANCE_WIPED_BLOODBATH","Alliance Wiped in Bloodbath",          "VERY_HARD", "All alliance members are killed during the opening bloodbath. Auto-resolves when Arena phase begins."),
+    # ── Game-level prop markets ────────────────────────────────────────────────
+    ("BLOODBATH_KILLS_OU",      "Bloodbath Kills Over/Under",           "MODERATE",  "Over or under on total tribute-on-tribute kills scored during the bloodbath. Auto-resolves when Arena phase begins."),
+    ("BLOODBATH_DEATHS_OU",     "Bloodbath Deaths Over/Under",          "MODERATE",  "Over or under on total tribute deaths in the bloodbath. Auto-resolves when Bloodbath phase ends."),
+    ("EXACT_BLOODBATH_DEATHS",  "Exact Bloodbath Deaths",               "VERY_HARD", "Guess the exact number of bloodbath deaths (placement_num). Auto-resolves when Bloodbath phase ends."),
+    ("BLOODBATH_NO_DEATHS",     "Bloodbath Contains No Deaths",         "LONGSHOT",  "Nobody dies in the bloodbath — a bloodless Cornucopia. Auto-resolves when Bloodbath ends."),
+    ("ANY_BB_DOUBLE_KILL",      "Any Tribute Records 2+ Bloodbath Kills","HARD",     "At least one tribute records two or more kills during the bloodbath. Resolves manually."),
+    ("ARENA_TRAP_DEATHS_OU",    "Arena Trap Deaths Over/Under",         "MODERATE",  "Over or under on deaths from Gamemaker traps/arena hazards. Resolves manually at game end."),
+    ("ARENA_ENV_DEATHS_OU",     "Arena Environmental Deaths Over/Under","MODERATE",  "Over or under on deaths from natural causes or mutts combined. Resolves manually at game end."),
+    ("ARENA_IS_NATURAL",        "Arena is a Natural Arena",             "EASY",      "The arena is a natural environment (wilderness, jungle, etc.). Auto-resolves when Pre-Games ends."),
+    ("ARENA_IS_ARTIFICIAL",     "Arena is an Artificial Arena",         "EASY",      "The arena is man-made (industrial, tech hazards, etc.). Auto-resolves when Pre-Games ends."),
+    ("NUM_TENS_OU",             "Number of 10+ Scores Over/Under",      "MODERATE",  "Over or under on how many tributes receive a training score of 10 or higher. Auto-resolves when Pre-Games ends."),
+    ("SOLO_TRIBUTES_OU",        "Solo (Unallied) Tributes Over/Under",  "MODERATE",  "Over or under on how many tributes enter with no alliance. Auto-resolves when Pre-Games ends."),
+    ("GAMES_DURATION",          "Games Duration (Days)",                "HARD",      "Guess how many days the Games last (placement_num = guessed days 5–10). Resolves manually at game end."),
+    ("GAMES_FEAST",             "Games Features a Feast",               "MODERATE",  "The Games will feature a Cornucopia feast event. Resolves manually."),
+    ("GAMES_BETRAYAL",          "Games Features a Betrayal",            "MODERATE",  "The Games will feature a notable alliance betrayal. Resolves manually."),
+    ("DISTRICT_PARTNER_KILL",   "Games Features a District Partner Kill","HARD",     "Any tribute kills their own district partner during the Games. Auto-resolves at game end."),
 ]
 
 
@@ -270,6 +401,7 @@ async def _seed_defaults() -> None:
         "game_active": json.dumps(False),
         "default_chips": json.dumps(config.DEFAULT_CHIPS),
         "current_phase_id": json.dumps(None),
+        "sponsor_state": json.dumps(None),
         "num_games": json.dumps(0),
         "arena_artificial_count": json.dumps(0),
         "arena_natural_count": json.dumps(0),
@@ -290,12 +422,13 @@ async def _seed_defaults() -> None:
         )
         if phase_count == 0:
             default_phases = [
-                ("Pre-Games",  "Markets open before tributes enter the arena",   0),
-                ("Bloodbath",  "The initial cornucopia bloodbath",                1),
-                ("Mid-Games",  "Main gameplay — arena events and hunts",         2),
-                ("Final 8",    "The top 8 tributes remain",                       3),
-                ("Final 5",    "The top 5 tributes remain",                       4),
-                ("Finale",     "Final tributes; victor is imminent",              5),
+                ("Pre-Games",        "Only District Victor and tribute score markets are open", 0),
+                ("Bloodbath",        "The initial cornucopia bloodbath — bloodbath markets open", 1),
+                ("Sponsors Open",    "Sponsorship window opens — funded districts surge",         2),
+                ("Arena",            "The arena opens — all remaining markets go live",           3),
+                ("Sponsors Closing", "Sponsorship window closes — funding edge fades",            4),
+                ("Final 8",          "The top 8 tributes remain",                                 5),
+                ("Final 5",          "The top 5 tributes remain",                                 6),
             ]
             for name, desc, order in default_phases:
                 session.add(BettingPhase(name=name, description=desc, sort_order=order))

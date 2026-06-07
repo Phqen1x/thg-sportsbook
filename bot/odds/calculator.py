@@ -9,12 +9,17 @@ import math
 # lines are unaffected), and beyond it the curve asymptotes to ODDS_RAIL so the
 # rail is reached only by genuinely extreme inputs. ODDS_TAU sets how quickly
 # the tail approaches the rail (larger = longshots compressed harder).
-ODDS_RAIL = 9900.0
-ODDS_KNEE = 2500.0
-ODDS_TAU = 11000.0
+ODDS_RAIL = 999900.0
+ODDS_KNEE = 50000.0
+ODDS_TAU = 1000000.0
 # Internal probability clamp, far below the rail so the soft knee (not the
 # clamp) governs the tail. Symmetric so both extremes behave identically.
-_PROB_MIN = 0.0002
+_PROB_MIN = 0.00001
+# Parlays should be less extreme than a pure multiplication of independent legs.
+# This dampener gently reduces the combined probability for multi-leg slips 
+# (increasing the house edge/vig) in a more reasonable linear fashion.
+PARLAY_VIG_PER_LEG = 0.96
+PARLAY_VIG_MIN = 0.75
 
 
 def _soft_rail(magnitude: float) -> float:
@@ -50,19 +55,16 @@ def prob_to_american(prob: float) -> int:
 
 
 def parlay_payout(wager: int, legs_odds: list[int]) -> int:
-    combined = 1.0
-    for o in legs_odds:
-        combined *= american_to_decimal(o)
-    return max(wager, round(wager * combined))
+    combined_odds = combined_american(legs_odds)
+    combined_decimal = american_to_decimal(combined_odds)
+    return max(wager, round(wager * combined_decimal))
 
 
 def combined_american(legs_odds: list[int]) -> int:
     if not legs_odds:
         return 100
-    combined = 1.0
-    for o in legs_odds:
-        combined *= american_to_decimal(o)
-    return decimal_to_american(combined)
+    combined_prob = parlay_combined_probability(legs_odds)
+    return prob_to_american(combined_prob)
 
 
 def straight_payout(wager: int, odds: int) -> int:
@@ -77,3 +79,28 @@ def cashout_value(original_wager: int, payout_if_win: int, rate: float) -> int:
 def implied_probability(odds: int) -> float:
     dec = american_to_decimal(odds)
     return 1.0 / dec
+
+
+def parlay_combined_probability(legs_odds: list[int]) -> float:
+    if not legs_odds:
+        return 0.5
+    
+    # Start with pure implied probabilities
+    combined = 1.0
+    for o in legs_odds:
+        combined *= implied_probability(o)
+    
+    # Apply a light parlay vig (multiplicative reduction in probability)
+    # per extra leg to keep odds more "reasonable" while maintaining a house edge.
+    n = len(legs_odds)
+    if n > 1:
+        dampener = max(PARLAY_VIG_MIN, PARLAY_VIG_PER_LEG ** (n - 1))
+        # Note: In probability terms, "vig" usually means increasing the 
+        # probability of the legs (so the user gets worse odds).
+        # Multiplying combined prob by e.g. 1.05 would do this.
+        # But here we want the payout to be "more reasonable" (likely higher 
+        # than the previous extreme dampening).
+        # We'll stick to a very light adjustment to keep it grounded.
+        return max(_PROB_MIN, min(0.99999, combined * (1.0 / dampener)))
+
+    return combined

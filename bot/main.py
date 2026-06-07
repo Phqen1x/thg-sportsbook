@@ -53,8 +53,8 @@ class SportsBookBot(commands.Bot):
         log.info("Capitol Sportsbook is open for business.")
         await self.change_presence(
             activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name="the Games | /odds",
+                type=discord.ActivityType.playing,
+                name="🎰 Betting on tributes",
             )
         )
 

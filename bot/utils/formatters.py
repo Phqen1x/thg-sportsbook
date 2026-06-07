@@ -36,6 +36,17 @@ def fmt_odds(n: int) -> str:
     return f"+{n}" if n >= 0 else str(n)
 
 
+def fmt_odds_with_mult(n: int) -> str:
+    main = fmt_odds(n)
+    if n > 0:
+        mult = n / 100.0 + 1.0
+    elif n < 0:
+        mult = 100.0 / abs(n) + 1.0
+    else:
+        mult = 1.0
+    return f"{main} ({mult:,.2f}x)"
+
+
 def fmt_pct(p: float) -> str:
     return f"{p * 100:.1f}%"
 
@@ -59,28 +70,27 @@ def market_type_label(t: str) -> str:
         "KILL_EVENT":         "Kill Event",
         "DEATH_CAUSE":        "Death Cause",
         "FIRST_BLOOD":        "First Blood",
-        "BLOODBATH_SURVIVOR": "Bloodbath Survivor",
-        "SPONSOR_EVENT":      "Sponsor Event",
+        "BLOODBATH_SURVIVOR":        "Bloodbath Survivor",
+        "TRIBUTE_KILLED_BLOODBATH":  "Bloodbath Kill",
         "KILLS_OU":                "Kills Over/Under",
         "PLACEMENT_OU":            "Placement Over/Under",
         "DISTRICT_VICTOR":         "District Victor",
         "DISTRICT_KILLS_OU":       "District Kills O/U",
-        "DISTRICT_BOTH_BLOODBATH": "District Both Bloodbath",
+        "DISTRICT_BOTH_BLOODBATH":   "District Both Bloodbath",
+        "DISTRICT_WIPED_BLOODBATH":  "District BB Wipe",
         "DISTRICT_BOTH_FINAL_8":   "District Both Final 8",
         "DISTRICT_ONE_FINAL_8":    "District One Final 8",
         "DISTRICT_BOTH_FINAL_5":   "District Both Final 5",
         "DISTRICT_ONE_FINAL_5":    "District One Final 5",
-        "DISTRICT_BOTH_FINALE":    "District Both Finale",
-        "DISTRICT_ONE_FINALE":     "District One Finale",
         "ALLIANCE_VICTOR":         "Alliance Victor",
         "ALLIANCE_KILLS_OU":       "Alliance Kills O/U",
-        "ALLIANCE_ALL_BLOODBATH":  "Alliance All Bloodbath",
+        "ALLIANCE_ALL_BLOODBATH":    "Alliance All Bloodbath",
+        "ALLIANCE_WIPED_BLOODBATH":  "Alliance BB Wipe",
+        "BLOODBATH_KILLS_OU":        "Bloodbath Kills O/U",
         "ALLIANCE_ALL_FINAL_8":    "Alliance All Final 8",
         "ALLIANCE_ONE_FINAL_8":    "Alliance One Final 8",
         "ALLIANCE_ALL_FINAL_5":    "Alliance All Final 5",
         "ALLIANCE_ONE_FINAL_5":    "Alliance One Final 5",
-        "ALLIANCE_ALL_FINALE":     "Alliance All Finale",
-        "ALLIANCE_ONE_FINALE":     "Alliance One Finale",
     }.get(t, t)
 
 

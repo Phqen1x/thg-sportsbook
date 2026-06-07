@@ -1,0 +1,198 @@
+[
+  {
+    "name": "Susurrus Oisin",
+    "district": 1,
+    "gender": "M",
+    "age": 17,
+    "sade_participant": false,
+    "seniority_date": "2024-01-01"
+  },
+  {
+    "name": "Jade Perez-Cruz",
+    "district": 1,
+    "gender": "F",
+    "age": 16,
+    "sade_participant": true,
+    "seniority_date": "2021-02-01",
+    "times_played": 2,
+    "highest_placement": 5
+  },
+  {
+    "name": "Maxentia Konishi",
+    "district": 2,
+    "gender": "F",
+    "age": 18,
+    "sade_participant": true,
+    "seniority_date": "2025-08-28"
+  },
+  {
+    "name": "Magnus Voss",
+    "district": 2,
+    "gender": "M",
+    "age": 18,
+    "sade_participant": true,
+    "seniority_date": "2025-05-28"
+  },
+  {
+    "name": "Lithia Coil",
+    "district": 3,
+    "gender": "F",
+    "age": 14,
+    "sade_participant": true,
+    "seniority_date": "2025-06-04"
+  },
+  {
+    "name": "Corsair Komzak",
+    "district": 3,
+    "gender": "M",
+    "age": 15,
+    "sade_participant": true,
+    "seniority_date": "2025-03-29"
+  },
+  {
+    "name": "Luna Sinclair",
+    "district": 4,
+    "gender": "F",
+    "age": 17,
+    "sade_participant": true,
+    "seniority_date": "2025-06-07"
+  },
+  {
+    "name": "Robin Kennedy",
+    "district": 4,
+    "gender": "M",
+    "age": 16,
+    "sade_participant": false,
+    "seniority_date": "2025-12-28"
+  },
+  {
+    "name": "Ophelia Stavros",
+    "district": 5,
+    "gender": "F",
+    "age": 15,
+    "sade_participant": false,
+    "seniority_date": "2025-06-07"
+  },
+  {
+    "name": "Melion Corayne",
+    "district": 5,
+    "gender": "M",
+    "age": 17,
+    "sade_participant": true,
+    "seniority_date": "2023-07-24"
+  },
+  {
+    "name": "Soda Fizzeé",
+    "district": 6,
+    "gender": "F",
+    "age": 14,
+    "sade_participant": true,
+    "seniority_date": "2025-03-02"
+  },
+  {
+    "name": "Koty Torque",
+    "district": 6,
+    "gender": "M",
+    "age": 16,
+    "sade_participant": true,
+    "seniority_date": "2023-12-10"
+  },
+  {
+    "name": "Cassia Sheffield",
+    "district": 7,
+    "gender": "F",
+    "age": 15,
+    "sade_participant": true,
+    "seniority_date": "2025-03-26"
+  },
+  {
+    "name": "Connor Carpenter",
+    "district": 7,
+    "gender": "M",
+    "age": 13,
+    "sade_participant": false,
+    "seniority_date": "2025-12-29"
+  },
+  {
+    "name": "Araceli Seide",
+    "district": 8,
+    "gender": "F",
+    "age": 16,
+    "sade_participant": true,
+    "seniority_date": "2025-07-16"
+  },
+  {
+    "name": "Styleno Matharvey",
+    "district": 8,
+    "gender": "M",
+    "age": 14,
+    "sade_participant": false,
+    "seniority_date": "2025-06-19"
+  },
+  {
+    "name": "Donatore Di Amore",
+    "district": 9,
+    "gender": "M",
+    "age": 18,
+    "sade_participant": true,
+    "seniority_date": "2022-06-01"
+  },
+  {
+    "name": "Soren Greene",
+    "district": 9,
+    "gender": "F",
+    "age": 12,
+    "sade_participant": false,
+    "seniority_date": "2025-04-29"
+  },
+  {
+    "name": "Fawn Crowley",
+    "district": 10,
+    "gender": "F",
+    "age": 13,
+    "sade_participant": false,
+    "seniority_date": "2025-12-29"
+  },
+  {
+    "name": "Bellissimo Hale",
+    "district": 10,
+    "gender": "M",
+    "age": 17,
+    "sade_participant": true,
+    "seniority_date": "2022-08-12"
+  },
+  {
+    "name": "Kaleb Ficher",
+    "district": 11,
+    "gender": "F",
+    "age": 15,
+    "sade_participant": false,
+    "non_binary": true,
+    "seniority_date": "2025-09-21"
+  },
+  {
+    "name": "Luke Moriarty",
+    "district": 11,
+    "gender": "M",
+    "age": 18,
+    "sade_participant": true,
+    "sade_champion": true,
+    "seniority_date": "2025-01-23"
+  },
+  {
+    "name": "Rowan Hale",
+    "district": 12,
+    "gender": "F",
+    "age": 14,
+    "sade_participant": false,
+    "seniority_date": "2025-07-08"
+  },
+  {
+    "name": "Oliver Gold Leier",
+    "district": 12,
+    "gender": "M",
+    "age": 12,
+    "sade_participant": false,
+    "seniority_date": "2025-07-19"
+  }
+]

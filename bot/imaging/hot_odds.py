@@ -32,14 +32,16 @@ _TRIBUTE_ROW_GAP = 2
 
 
 @dataclass
-class TributeCardData:
-    tribute_id: int
+class BoardCardData:
+    """One moneyline row on the Hot Odds board. Generic across the three board
+    modes — a tribute, a district, or an alliance — so the same renderer draws
+    all of them. ``badge`` is the small left-hand pill (e.g. "D5M", "D7", "CP"),
+    ``odds`` the headline moneyline, and ``sort_key`` controls row order."""
+    badge: str
     name: str
-    district: int
-    gender: str
-    training_score: int | None
+    odds: int | None
     status: str
-    win_odds: int | None
+    sort_key: tuple = ()
 
 
 @dataclass
@@ -91,7 +93,7 @@ def _draw_header(draw: ImageDraw.ImageDraw, img: Image.Image, chips: int, *, col
         draw.line((x1, y1, x2, y2), fill=c["header_gold"], width=1)
 
     title_font = cinzel(22)
-    draw.text((82, 14), "CAPITOL SPORTSBOOK", font=title_font, fill=c["header_gold"])
+    draw.text((82, 14), "PANEM SPORTSBOOK", font=title_font, fill=c["header_gold"])
     sub_font = rajdhani(13)
     draw.text((82, 44), "MAY THE ODDS BE EVER IN YOUR FAVOR", font=sub_font, fill=c["text_dim"])
 
@@ -109,9 +111,9 @@ def _draw_section_label(draw: ImageDraw.ImageDraw, y: int, text: str, *, colors:
     draw_text_centered(draw, text, font, c["header_gold"], WIDTH // 2, y + 12)
 
 
-def _draw_tribute_rows(
+def _draw_board_rows(
     draw: ImageDraw.ImageDraw,
-    cards: list[TributeCardData],
+    cards: list[BoardCardData],
     y_start: int,
     *,
     colors: dict,
@@ -133,7 +135,7 @@ def _draw_tribute_rows(
         cx = PAD + col * (col_w + PAD)
         cy = y_start + row_idx * (TRIBUTE_ROW_H + _TRIBUTE_ROW_GAP)
 
-        is_dead = card.status == "DEAD"
+        is_dead = card.status in ("DEAD", "ELIMINATED")
         row_fill = c["row_alt"] if row_idx % 2 == 0 else c["card_bg"]
         draw_rounded_rect(draw, (cx, cy, cx + col_w, cy + TRIBUTE_ROW_H), 5,
                           fill=row_fill, outline=c["divider"], outline_width=1)
@@ -141,7 +143,7 @@ def _draw_tribute_rows(
         pill_y1 = cy + 5
         pill_y2 = cy + TRIBUTE_ROW_H - 5
 
-        badge_text = f"D{card.district}{card.gender}"
+        badge_text = card.badge
         badge_tw = draw.textbbox((0, 0), badge_text, font=badge_font)[2]
         badge_w = badge_tw + 10
         badge_x = cx + 5
@@ -161,9 +163,9 @@ def _draw_tribute_rows(
                            st_x + st_w // 2, pill_y1 + 3)
 
         right_edge = st_x - 6
-        if card.win_odds is not None:
-            odds_str = fmt_odds(card.win_odds)
-            oc = odds_color(card.win_odds, c)
+        if card.odds is not None:
+            odds_str = fmt_odds(card.odds)
+            oc = odds_color(card.odds, c)
             ow = draw.textbbox((0, 0), odds_str, font=odds_font)[2] + 14
             chip_x = right_edge - ow
             draw_rounded_rect(draw, (chip_x, pill_y1, chip_x + ow, pill_y2), 4,
@@ -200,16 +202,14 @@ def _draw_placeholder_face(
 
 _TRIBUTE_NAME_RE = re.compile(
     r'^(D\d+(?:M|F|NB))\s+.+?\s+'
-    r'(?=(?:Wins|Finishes|Top|Gets|Kills|Dies|Survives|Makes|Eliminated|Training|Placement|First|Bloodbath|Finale)\b)'
+    r'(?=(?:Wins|Finishes|Top|Gets|Kills|Dies|Survives|Makes|Eliminated|Training|Placement|First|Bloodbath)\b)'
 )
 _ABBREVIATIONS = (
     ("Eliminated Before Final 8",  "Out - F8"),
     ("Eliminated Before Final 5",  "Out - F5"),
-    ("Eliminated Before Finale",   "Out - Finale"),
     ("Survives the Bloodbath",      "BB Survivor"),
     ("Gets Most Kills",             "Most Kills"),
     ("Gets First Kill",             "First Kill"),
-    ("Makes the Finale",            "Finale"),
     ("Wins the Games",              "Wins"),
     ("Training Score",              "Tr. Score"),
     ("Final 8",                     "F8"),
@@ -316,23 +316,16 @@ def _draw_footer(draw: ImageDraw.ImageDraw, img_h: int, *, colors: dict) -> None
 
 
 def render_hot_odds(
-    cards: list[TributeCardData],
+    cards: list[BoardCardData],
     featured: list[FeaturedMarket],
     user_chips: int,
+    board_title: str = "TRIBUTE MONEYLINES  ·  TRIBUTE TO WIN THE GAMES",
+    featured_title: str = "FEATURED MARKETS",
 ) -> io.BytesIO:
     theme = get_active_theme()
     c = theme.colors
 
-    ordered = sorted(cards, key=lambda card: (card.district, card.gender))
-    n = len(ordered)
-    n_left = math.ceil(n / 2)
-    left_col = ordered[:n_left]
-    right_col = ordered[n_left:]
-    sorted_cards = []
-    for i in range(n_left):
-        sorted_cards.append(left_col[i])
-        if i < len(right_col):
-            sorted_cards.append(right_col[i])
+    sorted_cards = sorted(cards, key=lambda card: card.sort_key)
 
     n_tribute_rows = math.ceil(len(sorted_cards) / 2) if sorted_cards else 1
     tribute_section_h = n_tribute_rows * (TRIBUTE_ROW_H + _TRIBUTE_ROW_GAP) - _TRIBUTE_ROW_GAP + PAD
@@ -358,14 +351,14 @@ def render_hot_odds(
     _draw_header(draw, img, user_chips, colors=c)
 
     cur_y = HEADER_H
-    _draw_section_label(draw, cur_y, "HUNGER GAMES  ·  TRIBUTE ODDS", colors=c)
+    _draw_section_label(draw, cur_y, board_title, colors=c)
     cur_y += SECTION_H + PAD
 
-    _draw_tribute_rows(draw, sorted_cards, cur_y, colors=c)
+    _draw_board_rows(draw, sorted_cards, cur_y, colors=c)
     cur_y += tribute_section_h
 
     if featured_8:
-        _draw_section_label(draw, cur_y, "FEATURED MARKETS", colors=c)
+        _draw_section_label(draw, cur_y, featured_title, colors=c)
         cur_y += SECTION_H + 8
         _draw_featured_markets(draw, featured_8, cur_y, colors=c)
 

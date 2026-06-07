@@ -9,14 +9,14 @@ from discord.ext import commands
 from sqlalchemy import select, func, or_
 
 from bot.database.engine import get_session, get_read_session, get_setting
-from bot.database.models import Bet, Market, MarketTemplate, Tribute, User
+from bot.database.models import Alliance, Bet, BettingPhase, Market, MarketTemplate, Tribute, User
 from bot.imaging.hot_odds import (
-    TributeCardData, FeaturedMarket, TributeDetailData,
+    BoardCardData, FeaturedMarket, TributeDetailData,
     render_hot_odds, render_tribute_detail,
 )
 from bot.imaging.base import render_async, fetch_image_bytes, buf_to_discord_file
 from bot.utils.formatters import fmt_chips, fmt_odds, fmt_pct, market_type_label, safe_defer
-from bot.utils.market_view import MarketPageView, sort_markets
+from bot.utils.market_view import MarketPageView, sort_markets, _type_section
 from bot.odds.calculator import implied_probability
 
 log = logging.getLogger("capitol.display")
@@ -120,6 +120,209 @@ async def _get_or_create_user(session, member: discord.Member) -> User:
     return u
 
 
+# ── Hot Odds board modes (district / alliance / tribute) ──────────────────────
+
+_GENDER_SORT = {"M": 0, "F": 1, "NB": 2}
+
+_BOARD_TITLES = {
+    "tribute":  "TRIBUTE MONEYLINES  ·  TRIBUTE TO WIN THE GAMES",
+    "district": "DISTRICT MONEYLINES  ·  DISTRICT TO WIN THE GAMES",
+    "alliance": "ALLIANCE MONEYLINES  ·  ALLIANCE TO WIN THE GAMES",
+}
+_FEATURED_TITLES = {
+    "tribute":  "FEATURED MARKETS",
+    "district": "FEATURED DISTRICT MARKETS",
+    "alliance": "FEATURED ALLIANCE MARKETS",
+}
+_MODE_BUTTON_LABELS = {
+    "district": "District Odds",
+    "alliance": "Alliance Odds",
+    "tribute":  "Tribute Odds",
+}
+# The headline moneyline shown as the board cards is excluded from each mode's
+# featured strip so the two halves never duplicate.
+_HEADLINE_TYPE = {
+    "tribute":  "TRIBUTE_WINS",
+    "district": "DISTRICT_VICTOR",
+    "alliance": "ALLIANCE_VICTOR",
+}
+
+
+def _alliance_badge(name: str) -> str:
+    """A short pill tag for an alliance card — initials for multi-word names,
+    otherwise the first few letters."""
+    parts = [p for p in name.split() if p]
+    tag = "".join(p[0] for p in parts[:4]) if len(parts) >= 2 else name[:3]
+    return (tag or "ALY").upper()
+
+
+def _group_status(statuses: list[str]) -> str:
+    """Collapse a group of member tribute statuses into one board status."""
+    if "VICTOR" in statuses:
+        return "VICTOR"
+    if "ALIVE" in statuses:
+        return "ALIVE"
+    return "DEAD"
+
+
+async def _current_phase_name() -> str | None:
+    """Name of the active betting phase, or None if no game/phase is set."""
+    raw = await get_setting("current_phase_id")
+    if not raw:
+        return None
+    try:
+        phase_id = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if phase_id is None:
+        return None
+    async with get_read_session() as session:
+        phase = await session.get(BettingPhase, phase_id)
+        return phase.name if phase else None
+
+
+def _featured_for_mode(
+    markets: list[Market], mode: str, bet_counts: dict[int, int]
+) -> list[FeaturedMarket]:
+    """Pick featured markets related to the board mode being viewed: tribute
+    props on the tribute board, district markets on the district board, etc."""
+    headline = _HEADLINE_TYPE[mode]
+    if mode == "tribute":
+        pool = [m for m in markets
+                if _type_section(m.type) in ("tribute", "props") and m.type != headline]
+    else:
+        pool = [m for m in markets
+                if _type_section(m.type) == mode and m.type != headline]
+
+    if bet_counts:
+        ranked = sorted(pool, key=lambda m: (-bet_counts.get(m.id, 0), abs(m.odds)))
+        chosen = _balance_polarities(ranked)
+    else:
+        chosen = _select_variety_markets(pool)
+
+    return [FeaturedMarket(label=m.label, odds=m.odds, market_type=m.type) for m in chosen]
+
+
+def _build_board(
+    mode: str,
+    tributes: list[Tribute],
+    alliances: list[Alliance],
+    markets: list[Market],
+    bet_counts: dict[int, int],
+) -> tuple[list[BoardCardData], list[FeaturedMarket]]:
+    """Build the moneyline cards + featured markets for one board mode."""
+    cards: list[BoardCardData] = []
+
+    if mode == "tribute":
+        win_odds = {m.tribute_a_id: m.odds for m in markets if m.type == "TRIBUTE_WINS"}
+        for t in tributes:
+            cards.append(BoardCardData(
+                badge=f"D{t.district}{t.display_gender}",
+                name=t.name,
+                odds=win_odds.get(t.id),
+                status=t.status,
+                sort_key=(t.district, _GENDER_SORT.get(t.display_gender, 3)),
+            ))
+
+    elif mode == "district":
+        victor = {m.placement_num: m.odds for m in markets if m.type == "DISTRICT_VICTOR"}
+        for d in sorted({t.district for t in tributes}):
+            members = [t for t in tributes if t.district == d]
+            cards.append(BoardCardData(
+                badge=f"D{d}",
+                name=f"District {d}",
+                odds=victor.get(d),
+                status=_group_status([t.status for t in members]),
+                sort_key=(d,),
+            ))
+
+    else:  # alliance
+        victor = {m.placement_num: m.odds for m in markets if m.type == "ALLIANCE_VICTOR"}
+        for a in alliances:
+            members = [t for t in tributes if t.alliance_id == a.id]
+            cards.append(BoardCardData(
+                badge=_alliance_badge(a.name),
+                name=a.name,
+                odds=victor.get(a.id),
+                status=_group_status([t.status for t in members]),
+                sort_key=(a.name.lower(),),
+            ))
+
+    return cards, _featured_for_mode(markets, mode, bet_counts)
+
+
+class OddsBoardView(discord.ui.View):
+    """Hot Odds board with District / Alliance / Tribute toggle buttons. The
+    underlying data is fetched once and cached on the view; each button press
+    just re-renders the board from that cache and swaps the attached image."""
+
+    def __init__(
+        self, *,
+        tributes: list[Tribute],
+        alliances: list[Alliance],
+        markets: list[Market],
+        bet_counts: dict[int, int],
+        user_chips: int,
+        mode: str,
+        available: list[str],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.tributes = tributes
+        self.alliances = alliances
+        self.markets = markets
+        self.bet_counts = bet_counts
+        self.user_chips = user_chips
+        self.mode = mode
+        self.available = available
+        self.message: discord.Message | None = None
+        self._build_buttons()
+
+    def _build_buttons(self) -> None:
+        self.clear_items()
+        for m in ("district", "alliance", "tribute"):
+            if m not in self.available:
+                continue
+            btn = discord.ui.Button(
+                label=_MODE_BUTTON_LABELS[m],
+                style=discord.ButtonStyle.primary if m == self.mode
+                      else discord.ButtonStyle.secondary,
+                disabled=m == self.mode,
+                row=0,
+            )
+            btn.callback = self._make_callback(m)
+            self.add_item(btn)
+
+    def _make_callback(self, mode: str):
+        async def _cb(interaction: discord.Interaction) -> None:
+            self.mode = mode
+            self._build_buttons()
+            buf = await self.render()
+            f = buf_to_discord_file(buf, "hot_odds.png")
+            try:
+                await interaction.response.edit_message(attachments=[f], view=self)
+            except discord.NotFound:
+                pass
+        return _cb
+
+    async def render(self):
+        cards, featured = _build_board(
+            self.mode, self.tributes, self.alliances, self.markets, self.bet_counts
+        )
+        return await render_async(
+            render_hot_odds, cards, featured, self.user_chips,
+            _BOARD_TITLES[self.mode], _FEATURED_TITLES[self.mode],
+        )
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
 class DisplayCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -214,7 +417,7 @@ class DisplayCog(commands.Cog):
             await interaction.followup.send(file=f, ephemeral=True)
             return
 
-        # ── Full board view ───────────────────────────────────────────────────
+        # ── Full board view (District / Alliance / Tribute toggle) ────────────
         async with get_session() as session:
             user = await _get_or_create_user(session, interaction.user)
             user_chips = user.chips
@@ -222,12 +425,17 @@ class DisplayCog(commands.Cog):
             trib_result = await session.execute(
                 select(Tribute).order_by(Tribute.district)
             )
-            tributes = trib_result.scalars().all()
+            tributes = list(trib_result.scalars().all())
+
+            alli_result = await session.execute(
+                select(Alliance).order_by(Alliance.name)
+            )
+            alliances = list(alli_result.scalars().all())
 
             mkt_result = await session.execute(
                 select(Market).where(Market.status == "OPEN").order_by(Market.id)
             )
-            markets = mkt_result.scalars().all()
+            markets = list(mkt_result.scalars().all())
 
             bet_count_rows = await session.execute(
                 select(Bet.market_id, func.count(Bet.id).label("cnt"))
@@ -241,43 +449,38 @@ class DisplayCog(commands.Cog):
                 row.market_id: row.cnt for row in bet_count_rows.all()
             }
 
-        win_odds_map: dict[int, int] = {}
-        for m in markets:
-            if m.type == "TRIBUTE_WINS":
-                win_odds_map[m.tribute_a_id] = m.odds
+        phase_name = await _current_phase_name()
 
-        non_win_markets = [m for m in markets if m.type != "TRIBUTE_WINS"]
+        # Which board modes have data to offer.
+        available: list[str] = []
+        if any(m.type == "DISTRICT_VICTOR" for m in markets):
+            available.append("district")
+        if alliances and any(m.type == "ALLIANCE_VICTOR" for m in markets):
+            available.append("alliance")
+        if tributes:
+            available.append("tribute")
+        if not available:
+            available = ["tribute"]
 
-        if bet_counts:
-            by_bets = sorted(
-                non_win_markets,
-                key=lambda m: (-bet_counts.get(m.id, 0), abs(m.odds)),
-            )
-            featured_mkts = _balance_polarities(by_bets)
+        # Pregames default to district odds (individual tribute victor moneylines
+        # aren't open yet); every other phase defaults to tribute odds.
+        if phase_name == "Pre-Games" and "district" in available:
+            mode = "district"
         else:
-            featured_mkts = _select_variety_markets(non_win_markets)
+            mode = "tribute" if "tribute" in available else available[0]
 
-        cards = [
-            TributeCardData(
-                tribute_id=t.id,
-                name=t.name,
-                district=t.district,
-                gender=t.display_gender,
-                training_score=t.training_score,
-                status=t.status,
-                win_odds=win_odds_map.get(t.id),
-            )
-            for t in tributes
-        ]
-
-        featured = [
-            FeaturedMarket(label=m.label, odds=m.odds, market_type=m.type)
-            for m in featured_mkts
-        ]
-
-        buf = await render_async(render_hot_odds, cards, featured, user_chips)
+        view = OddsBoardView(
+            tributes=tributes, alliances=alliances, markets=markets,
+            bet_counts=bet_counts, user_chips=user_chips,
+            mode=mode, available=available,
+        )
+        buf = await view.render()
         f = buf_to_discord_file(buf, "hot_odds.png")
-        await interaction.followup.send(file=f, ephemeral=True)
+        if len(available) > 1:
+            msg = await interaction.followup.send(file=f, view=view, ephemeral=True)
+            view.message = msg
+        else:
+            await interaction.followup.send(file=f, ephemeral=True)
 
     # ── /tributes ─────────────────────────────────────────────────────────────
 
