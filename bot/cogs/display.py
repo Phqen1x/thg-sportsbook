@@ -308,9 +308,13 @@ class OddsBoardView(discord.ui.View):
         cards, featured = _build_board(
             self.mode, self.tributes, self.alliances, self.markets, self.bet_counts
         )
+        from bot.imaging.hot_odds import DEFAULT_ANNOUNCEMENT
+        _ann_raw = await get_setting("capitol_announcement")
+        announcement = json.loads(_ann_raw) if _ann_raw else None
         return await render_async(
             render_hot_odds, cards, featured, self.user_chips,
             _BOARD_TITLES[self.mode], _FEATURED_TITLES[self.mode],
+            announcement or DEFAULT_ANNOUNCEMENT,
         )
 
     async def on_timeout(self) -> None:
@@ -411,7 +415,10 @@ class DisplayCog(commands.Cog):
                     for m in featured_mkts
                 ],
             )
-            buf = await render_async(render_tribute_detail, detail, user_chips)
+            from bot.imaging.hot_odds import DEFAULT_ANNOUNCEMENT
+            _ann_raw = await get_setting("capitol_announcement")
+            announcement = json.loads(_ann_raw) if _ann_raw else None
+            buf = await render_async(render_tribute_detail, detail, user_chips, announcement or DEFAULT_ANNOUNCEMENT)
             fname = f"tribute_{t.name.lower().replace(' ', '_')}.png"
             f = buf_to_discord_file(buf, fname)
             await interaction.followup.send(file=f, ephemeral=True)

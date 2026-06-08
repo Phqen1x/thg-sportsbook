@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw
 from bot.imaging.base import (
     COLORS, Theme, get_active_theme,
     cinzel, cinzel_regular, rajdhani, rajdhani_bold,
-    draw_rounded_rect, draw_text_centered, draw_text_right, odds_color,
+    draw_rounded_rect, draw_text_centered, draw_text_right, paste_logo, odds_color,
 )
 from bot.odds.calculator import combined_american
 from bot.utils.formatters import fmt_odds, fmt_chips, fmt_odds_with_mult
@@ -42,13 +42,16 @@ def _draw_ticket_border(draw: ImageDraw.ImageDraw, w: int, h: int, *, colors: di
                       outline_width=1)
 
 
-def _draw_header(draw: ImageDraw.ImageDraw, w: int, submitted: bool, *, colors: dict) -> None:
+def _draw_header(draw: ImageDraw.ImageDraw, img: Image.Image, w: int, submitted: bool, *, colors: dict) -> None:
     c = colors
     draw_rounded_rect(draw, (4, 4, w - 4, HEADER_H), 14,
                       fill=c["header_dark"],
                       outline=None)
     draw.rectangle((4, HEADER_H - 4, w - 4, HEADER_H), fill=c["header_dark"])
     draw.rectangle((4, HEADER_H, w - 4, HEADER_H + 3), fill=c["card_border"])
+
+    logo_size = 56
+    paste_logo(img, PAD, (HEADER_H - logo_size) // 2, logo_size)
 
     title_font = cinzel(24)
     sub_font = rajdhani(14)
@@ -186,7 +189,7 @@ def render_parlay_slip(
         HEADER_H + 12
         + n_legs * LEG_H + 20
         + SUMMARY_H
-        + FOOTER_H + 20
+        + 20
     )
     h = max(content_h, 500)
 
@@ -198,27 +201,15 @@ def render_parlay_slip(
         draw.line((gx, 0, gx, h), fill=(255, 255, 255, 3))
 
     _draw_ticket_border(draw, WIDTH, h, colors=c)
-    _draw_header(draw, WIDTH, submitted, colors=c)
+    _draw_header(draw, img, WIDTH, submitted, colors=c)
 
     cur_y = HEADER_H + 12
     cur_y = _draw_legs(draw, legs, cur_y, WIDTH, colors=c)
     _draw_summary(draw, legs, wager, payout, WIDTH, cur_y, colors=c)
-    _draw_barcode(draw, WIDTH, h - FOOTER_H - 30, colors=c)
 
     wm_layer = _draw_status_watermark(draw, WIDTH, h, submitted, colors=c)
     if wm_layer is not None:
         img = Image.alpha_composite(img, wm_layer)
-
-    # Status bar needs a fresh draw handle after alpha_composite
-    slip_status_color = c["won"] if submitted else c["pending"]
-    draw_final = ImageDraw.Draw(img)
-    draw_rounded_rect(draw_final, (4, h - 36, WIDTH - 4, h - 4), 10,
-                      fill=(*slip_status_color[:3], 40),
-                      outline=slip_status_color,
-                      outline_width=1)
-    status_text = "BET SUBMITTED — GOOD LUCK, TRIBUTE!" if submitted else "⚡  PENDING — USE /parlay submit TO LOCK IN"
-    sf = rajdhani_bold(14)
-    draw_text_centered(draw_final, status_text, sf, slip_status_color, WIDTH // 2, h - 27)
 
     theme.draw_fg(img, WIDTH, h)
 
@@ -283,7 +274,7 @@ def render_straight_result_slip(
     c = theme.colors
 
     RESULT_BADGE_H = 84
-    content_h = HEADER_H + 16 + 48 + 30 + 20 + 34 + RESULT_BADGE_H + 20 + 34 + FOOTER_H + 20
+    content_h = HEADER_H + 16 + 48 + 30 + 20 + 34 + RESULT_BADGE_H + 20 + 34 + 20
     h = max(content_h, 450)
 
     img = Image.new("RGBA", (WIDTH, h), c["bg"])
@@ -298,6 +289,7 @@ def render_straight_result_slip(
     draw_rounded_rect(draw, (4, 4, WIDTH - 4, HEADER_H), 14, fill=c["header_dark"], outline=None)
     draw.rectangle((4, HEADER_H - 4, WIDTH - 4, HEADER_H), fill=c["header_dark"])
     draw.rectangle((4, HEADER_H, WIDTH - 4, HEADER_H + 3), fill=c["card_border"])
+    paste_logo(img, PAD, (HEADER_H - 56) // 2, 56)
     draw_text_centered(draw, "CAPITOL SPORTSBOOK", cinzel(24), c["header_gold"], WIDTH // 2, 20)
     draw_text_centered(draw, "STRAIGHT BET RESULT", rajdhani(14), c["text_dim"], WIDTH // 2, 58)
 
@@ -326,9 +318,10 @@ def render_straight_result_slip(
 
     # Result badge
     rc = _result_color(status, c)
+    result_label = {"WON": "Bet Won!", "LOST": "Bet Lost!", "VOIDED": "Bet Voided!"}.get(status, status)
     draw_rounded_rect(draw, (PAD, cur_y, WIDTH - PAD, cur_y + RESULT_BADGE_H), 8,
                       fill=(*rc[:3], 25), outline=rc, outline_width=2)
-    draw_text_centered(draw, status, cinzel(54), rc, WIDTH // 2, cur_y + 12)
+    draw_text_centered(draw, result_label, cinzel(54), rc, WIDTH // 2, cur_y + 12)
     cur_y += RESULT_BADGE_H + 16
 
     # Payout / refund row
@@ -338,19 +331,6 @@ def render_straight_result_slip(
     elif status == "VOIDED":
         draw.text((PAD, cur_y), "REFUNDED", font=rajdhani(15), fill=c["text_dim"])
         draw_text_right(draw, fmt_chips(wager), rajdhani_bold(17), c["text_white"], WIDTH - PAD, cur_y)
-
-    _draw_barcode(draw, WIDTH, h - FOOTER_H - 30, colors=c)
-
-    if status == "WON":
-        bar_text = f"BET WON  —  {fmt_chips(payout)} PAID OUT!"
-    elif status == "VOIDED":
-        bar_text = "BET VOIDED  —  WAGER REFUNDED"
-    else:
-        bar_text = "BET LOST  —  BETTER LUCK NEXT TIME"
-
-    draw_rounded_rect(draw, (4, h - 36, WIDTH - 4, h - 4), 10,
-                      fill=(*rc[:3], 40), outline=rc, outline_width=1)
-    draw_text_centered(draw, bar_text, rajdhani_bold(14), rc, WIDTH // 2, h - 27)
 
     theme.draw_fg(img, WIDTH, h)
 
@@ -371,7 +351,7 @@ def render_parlay_result_slip(
 
     n_legs = max(len(legs), 1)
     RESULT_BADGE_H = 84
-    content_h = HEADER_H + 12 + RESULT_BADGE_H + 12 + n_legs * LEG_H + 20 + SUMMARY_H + FOOTER_H + 20
+    content_h = HEADER_H + 12 + RESULT_BADGE_H + 12 + n_legs * LEG_H + 20 + SUMMARY_H + 20
     h = max(content_h, 580)
 
     img = Image.new("RGBA", (WIDTH, h), c["bg"])
@@ -386,12 +366,13 @@ def render_parlay_result_slip(
     draw_rounded_rect(draw, (4, 4, WIDTH - 4, HEADER_H), 14, fill=c["header_dark"], outline=None)
     draw.rectangle((4, HEADER_H - 4, WIDTH - 4, HEADER_H), fill=c["header_dark"])
     draw.rectangle((4, HEADER_H, WIDTH - 4, HEADER_H + 3), fill=c["card_border"])
+    paste_logo(img, PAD, (HEADER_H - 56) // 2, 56)
     draw_text_centered(draw, "CAPITOL SPORTSBOOK", cinzel(24), c["header_gold"], WIDTH // 2, 20)
     draw_text_centered(draw, "PARLAY BET RESULT", rajdhani(14), c["text_dim"], WIDTH // 2, 58)
 
     rc = _result_color(status, c)
     cur_y = HEADER_H + 12
-    result_label = "PARLAY WON!" if status == "WON" else ("PARLAY LOST" if status == "LOST" else "PARLAY VOIDED")
+    result_label = {"WON": "Parlay Won!", "LOST": "Parlay Lost!", "VOIDED": "Parlay Voided!"}.get(status, status)
     draw_rounded_rect(draw, (PAD, cur_y, WIDTH - PAD, cur_y + RESULT_BADGE_H), 10,
                       fill=(*rc[:3], 25), outline=rc, outline_width=2)
     draw_text_centered(draw, result_label, cinzel(54), rc, WIDTH // 2, cur_y + 12)
@@ -399,9 +380,8 @@ def render_parlay_result_slip(
 
     cur_y = _draw_result_legs(draw, legs, cur_y, WIDTH, colors=c)
     _draw_summary(draw, legs, wager, payout, WIDTH, cur_y, colors=c)
-    _draw_barcode(draw, WIDTH, h - FOOTER_H - 30, colors=c)
 
-    wm_text = "PARLAY WON!" if status == "WON" else ("PARLAY LOST" if status == "LOST" else "VOIDED")
+    wm_text = {"WON": "Parlay Won!", "LOST": "Parlay Lost!", "VOIDED": "Parlay Voided!"}.get(status, status)
     wm_font = cinzel(36)
     bbox = draw.textbbox((0, 0), wm_text, font=wm_font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -413,18 +393,6 @@ def render_parlay_result_slip(
     base = Image.new("RGBA", (WIDTH, h), (0, 0, 0, 0))
     base.paste(rotated, (0, 0), mask=rotated)
     img = Image.alpha_composite(img, base)
-
-    if status == "WON":
-        bar_text = f"PARLAY WON  —  {fmt_chips(payout)} PAID OUT!"
-    elif status == "VOIDED":
-        bar_text = "PARLAY VOIDED  —  WAGER REFUNDED"
-    else:
-        bar_text = "PARLAY LOST  —  BETTER LUCK NEXT TIME"
-
-    draw_final = ImageDraw.Draw(img)
-    draw_rounded_rect(draw_final, (4, h - 36, WIDTH - 4, h - 4), 10,
-                      fill=(*rc[:3], 40), outline=rc, outline_width=1)
-    draw_text_centered(draw_final, bar_text, rajdhani_bold(14), rc, WIDTH // 2, h - 27)
 
     theme.draw_fg(img, WIDTH, h)
 

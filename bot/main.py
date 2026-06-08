@@ -37,10 +37,16 @@ class SportsBookBot(commands.Bot):
         await self.load_extension("bot.cogs.admin")
         await self.load_extension("bot.cogs.betting")
         await self.load_extension("bot.cogs.display")
+        await self.load_extension("bot.cogs.activity")
 
         if config.DEV_GUILD_ID:
             guild = discord.Object(id=config.DEV_GUILD_ID)
             self.tree.copy_global_to(guild=guild)
+            # Clear the global scope so previously-published global commands are
+            # deleted on sync; otherwise they show up alongside the guild copies
+            # as duplicates.
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
             await self.tree.sync(guild=guild)
             log.info(f"Slash commands synced to dev guild {config.DEV_GUILD_ID}")
         else:

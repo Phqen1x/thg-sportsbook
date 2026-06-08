@@ -1,0 +1,140 @@
+{% extends "admin/layout.html" %}
+{% block title %}Create Market — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Create Market</h1>
+  <a href="/admin/markets" class="btn btn-outline">← Back</a>
+</div>
+
+<div class="card form-card">
+  <form method="post" action="/admin/markets/new" id="market-form">
+    <div class="form-group">
+      <label class="form-label">Market Type *</label>
+      <select name="market_type" class="form-control" id="market-type-sel" onchange="onTypeChange(this.value)" required>
+        <option value="">— Select Type —</option>
+        {% for key, label in market_types %}
+        <option value="{{ key }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Label *</label>
+      <input type="text" name="label" class="form-control" placeholder="e.g. Will Katniss win?" required>
+    </div>
+
+    <div id="field-tribute-a" class="form-group hidden">
+      <label class="form-label">Tribute A</label>
+      <select name="tribute_a_id" class="form-control">
+        <option value="">— None —</option>
+        {% for t in tributes %}
+        <option value="{{ t.id }}">D{{ t.district }} {{ t.name }} ({{ t.display_gender }})</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div id="field-tribute-b" class="form-group hidden">
+      <label class="form-label">Tribute B (Kill Event — B is the victim)</label>
+      <select name="tribute_b_id" class="form-control">
+        <option value="">— None —</option>
+        {% for t in tributes %}
+        <option value="{{ t.id }}">D{{ t.district }} {{ t.name }} ({{ t.display_gender }})</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div id="field-placement" class="form-group hidden">
+      <label class="form-label" id="placement-label">Placement / District Number</label>
+      <input type="number" name="placement_num" class="form-control" min="1">
+    </div>
+
+    <div id="field-top-n" class="form-group hidden">
+      <label class="form-label">Top-N (e.g. 8 for Top 8)</label>
+      <input type="number" name="top_n" class="form-control" min="1">
+    </div>
+
+    <div id="field-ou" class="form-row hidden">
+      <div class="form-group">
+        <label class="form-label">O/U Line</label>
+        <input type="number" name="ou_line" class="form-control" step="0.5" min="0">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Side</label>
+        <select name="ou_side" class="form-control">
+          <option value="OVER">Over</option>
+          <option value="UNDER">Under</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Odds (American) *</label>
+        <input type="number" name="odds" class="form-control" value="-110" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Phase</label>
+        <select name="phase_id" class="form-control">
+          <option value="">— None —</option>
+          {% for p in phases %}
+          <option value="{{ p.id }}">{{ p.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Cashout Rate (blank = global default)</label>
+        <input type="number" name="cashout_rate" class="form-control" step="0.01" min="0" max="1" placeholder="e.g. 0.65">
+      </div>
+    </div>
+
+    <div class="form-checks">
+      <label class="form-check">
+        <input type="checkbox" name="cashout_allowed">
+        Allow Cashout on this Market
+      </label>
+      <label class="form-check">
+        <input type="checkbox" name="open_immediately">
+        Open Immediately
+      </label>
+    </div>
+
+    <div class="btn-group mt-3">
+      <button type="submit" class="btn btn-primary">Create Market</button>
+      <a href="/admin/markets" class="btn btn-outline">Cancel</a>
+    </div>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const TRIBUTE_A_TYPES = new Set([
+  'TRIBUTE_WINS','TRIBUTE_PLACEMENT','TRIBUTE_TOP_N','TRIBUTE_RUNNER_UP',
+  'TRIBUTE_KILLS','KILL_EVENT','DEATH_CAUSE','BLOODBATH_SURVIVOR',
+  'TRIBUTE_KILLED_BLOODBATH','FIRST_IN_ALLIANCE_DEATH','KILLS_OU',
+  'PLACEMENT_OU','MAKES_FINAL_8','MISSES_FINAL_8','MAKES_FINAL_5','MISSES_FINAL_5',
+  'EXACT_TRAINING_SCORE','TRAINING_SCORE_OU','PARTNER_PLACE_HIGHER','PARTNER_PLACE_LOWER',
+  'PARTNER_SCORE_HIGHER','PARTNER_SCORE_LOWER','HIGHEST_TRAINING_SCORE','LOWEST_TRAINING_SCORE',
+]);
+const TRIBUTE_B_TYPES = new Set(['KILL_EVENT']);
+const PLACEMENT_TYPES = new Set(['TRIBUTE_PLACEMENT','DISTRICT_VICTOR','DISTRICT_KILLS_OU','DISTRICT_BOTH_BLOODBATH','DISTRICT_BOTH_FINAL_8','DISTRICT_ONE_FINAL_8','DISTRICT_BOTH_FINAL_5','DISTRICT_ONE_FINAL_5']);
+const TOP_N_TYPES = new Set(['TRIBUTE_TOP_N']);
+const OU_TYPES = new Set(['KILLS_OU','PLACEMENT_OU','TRAINING_SCORE_OU','BLOODBATH_KILLS_OU','BLOODBATH_DEATHS_OU','DISTRICT_KILLS_OU','ALLIANCE_KILLS_OU','GAMES_DURATION','ARENA_TRAP_DEATHS_OU']);
+
+function show(id) { document.getElementById(id).classList.remove('hidden'); }
+function hide(id) { document.getElementById(id).classList.add('hidden'); }
+
+function onTypeChange(type) {
+  ['field-tribute-a','field-tribute-b','field-placement','field-top-n','field-ou'].forEach(hide);
+  if (TRIBUTE_A_TYPES.has(type)) show('field-tribute-a');
+  if (TRIBUTE_B_TYPES.has(type)) show('field-tribute-b');
+  if (PLACEMENT_TYPES.has(type)) { show('field-placement'); document.getElementById('placement-label').textContent = type.includes('DISTRICT') ? 'District Number' : 'Placement Number'; }
+  if (TOP_N_TYPES.has(type)) show('field-top-n');
+  if (OU_TYPES.has(type)) show('field-ou');
+}
+</script>
+{% endblock %}

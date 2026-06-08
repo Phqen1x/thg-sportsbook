@@ -28,6 +28,12 @@ data/
 *.sqlite
 *.sqlite3
 
+# ── Snap build artifacts ─────────────────────────────────────────────────────
+parts/
+prime/
+stage/
+*.snap
+
 # ── OS / editor cruft ───────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

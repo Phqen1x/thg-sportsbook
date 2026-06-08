@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block title %}Parlay Slip — Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Parlay Slip</h1>
+  <span class="text-dim">{{ legs | length }}/{{ max_legs }} legs</span>
+</div>
+
+<div class="parlay-layout">
+  <div class="card parlay-slip">
+    <div class="card-label">YOUR SLIP</div>
+    {% if legs %}
+    <table class="table">
+      <thead>
+        <tr><th>#</th><th>Market</th><th>Odds</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for leg in legs %}
+        {% set mkt = leg_markets.get(leg.id) %}
+        <tr>
+          <td class="text-dim">{{ loop.index }}</td>
+          <td>
+            {% if mkt %}
+              <div>{{ mkt.label }}</div>
+              <div class="text-dim" style="font-size:0.8rem">{{ mkt.type | replace('_', ' ') }}</div>
+            {% else %}
+              <span class="text-dim">Unknown</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if mkt %}
+              <span class="{% if mkt.odds > 0 %}text-pos{% else %}text-neg{% endif %} font-bold">
+                {{ mkt.odds | fmt_odds }}
+              </span>
+            {% endif %}
+          </td>
+          <td>
+            <form method="post" action="/parlay/remove/{{ leg.id }}">
+              <button class="btn btn-sm btn-danger">✕</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if combined is not none %}
+    <div class="parlay-combined">
+      <span class="text-dim">Combined odds</span>
+      <span class="font-bold {% if combined > 0 %}text-pos{% else %}text-neg{% endif %}">
+        {{ combined | fmt_odds }}
+      </span>
+    </div>
+    {% endif %}
+
+    {% if legs | length >= 2 %}
+    <form method="post" action="/parlay/submit" id="parlay-form" class="mt-2">
+      <div class="form-group">
+        <label class="form-label">Wager (chips)</label>
+        <input type="number" name="wager" class="form-control" min="1" max="{{ db_user.chips }}" value="100" required oninput="updateParlayPayout(this.value)">
+        <div class="quick-amounts">
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setParlayWager(100)">100</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setParlayWager(500)">500</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setParlayWager(1000)">1K</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setParlayWager({{ db_user.chips }})">MAX</button>
+        </div>
+      </div>
+      <div class="payout-preview">
+        <span class="text-dim">Potential payout</span>
+        <span id="parlay-payout" class="text-gold font-bold">—</span>
+      </div>
+      <div class="form-check mt-1">
+        <input type="checkbox" name="is_public" id="is_public" checked>
+        <label for="is_public" class="text-dim">Make this parlay public (visible to other members to tail)</label>
+      </div>
+      <div class="balance-row mt-1">
+        <span class="text-dim">Your balance</span>
+        <span class="text-gold">{{ db_user.chips | fmt_chips }} chips</span>
+      </div>
+      <button type="submit" class="btn btn-primary btn-full mt-2">Submit Parlay</button>
+    </form>
+    {% else %}
+    <div class="alert">Add at least 2 legs to submit a parlay.</div>
+    {% endif %}
+
+    {% if legs %}
+    <form method="post" action="/parlay/clear" class="mt-1">
+      <button class="btn btn-outline btn-sm btn-danger-outline" onclick="return confirm('Clear your entire parlay slip?')">Clear Slip</button>
+    </form>
+    {% endif %}
+
+    {% else %}
+    <div class="empty-state">
+      Your parlay slip is empty.<br>
+      <a href="/markets" class="btn btn-primary mt-2">Browse Markets</a>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="card parlay-add">
+    <div class="card-label">ADD A MARKET</div>
+    <p class="text-dim">Use the Markets page or the +Parlay button on any open market to add legs to your slip.</p>
+    <a href="/markets" class="btn btn-outline btn-full mt-1">Browse Open Markets</a>
+    <a href="/tail" class="btn btn-outline btn-full mt-1">Tail a Pre-Built Parlay</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const combinedOdds = {{ combined if combined is not none else 0 }};
+
+function calcParlayPayout(wager, odds) {
+  if (!odds) return 0;
+  if (odds > 0) return Math.round(wager * (odds / 100 + 1));
+  return Math.round(wager * (100 / Math.abs(odds) + 1));
+}
+
+function updateParlayPayout(val) {
+  const w = parseInt(val) || 0;
+  const p = w > 0 && combinedOdds ? calcParlayPayout(w, combinedOdds) : 0;
+  document.getElementById('parlay-payout').textContent = p > 0 ? p.toLocaleString() + ' chips' : '—';
+}
+
+function setParlayWager(n) {
+  const input = document.querySelector('#parlay-form input[name=wager]');
+  if (input) { input.value = n; updateParlayPayout(n); }
+}
+
+updateParlayPayout(100);
+</script>
+{% endblock %}

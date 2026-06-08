@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(os.environ.get("DOTENV_PATH"))
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -17,5 +17,9 @@ DEFAULT_CHIPS: int = int(os.environ.get("DEFAULT_CHIPS", "1000"))
 CASHOUT_ALLOWED: bool = os.environ.get("CASHOUT_ALLOWED", "false").lower() == "true"
 CASHOUT_RATE: float = float(os.environ.get("CASHOUT_RATE", "0.65"))
 
-DB_PATH: str = str(BASE_DIR / "data" / "sportsbook.db")
-FONTS_DIR: Path = BASE_DIR / "assets" / "fonts"
+# Public base URL of the web app (used by /play to link the standalone Activity).
+WEB_BASE_URL: str | None = (os.environ.get("WEB_BASE_URL") or "").rstrip("/") or None
+
+DB_PATH: str = os.environ.get("DB_PATH") or str(BASE_DIR / "data" / "sportsbook.db")
+FONTS_DIR: Path = Path(os.environ.get("FONTS_DIR") or str(BASE_DIR / "assets" / "fonts"))
+LOGO_PATH: Path = Path(os.environ.get("LOGO_PATH") or str(BASE_DIR / "panem.png"))

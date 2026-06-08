@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw
 from bot.imaging.base import (
     COLORS, Theme, get_active_theme,
     cinzel, cinzel_regular, rajdhani, rajdhani_bold,
-    draw_rounded_rect, draw_text_centered, draw_text_right, odds_color, status_color,
+    draw_rounded_rect, draw_text_centered, draw_text_right, paste_logo, odds_color, status_color,
 )
 from bot.utils.formatters import fmt_chips, fmt_odds, fmt_pct, fmt_odds_with_mult
 from bot.odds.calculator import implied_probability, parlay_payout, combined_american
@@ -53,15 +53,19 @@ def _col_x(col: int) -> int:
     return x
 
 
-def _draw_header(draw: ImageDraw.ImageDraw, username: str, chips: int, *, colors: dict) -> None:
+def _draw_header(draw: ImageDraw.ImageDraw, img: Image.Image, username: str, chips: int, *, colors: dict) -> None:
     c = colors
     draw.rectangle((0, 0, WIDTH, HEADER_H), fill=c["header_dark"])
     draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=c["card_border"])
 
+    logo_size = 44
+    paste_logo(img, 8, (HEADER_H - logo_size) // 2, logo_size)
+
     title_font = cinzel(20)
     sub_font = rajdhani(13)
-    draw.text((PAD, 14), "MY BETS", font=title_font, fill=c["header_gold"])
-    draw.text((PAD, 44), f"@{username}", font=sub_font, fill=c["text_dim"])
+    text_x = 8 + logo_size + 8
+    draw.text((text_x, 14), "MY BETS", font=title_font, fill=c["header_gold"])
+    draw.text((text_x, 44), f"@{username}", font=sub_font, fill=c["text_dim"])
 
     bal_val = cinzel(18)
     bal_lbl = rajdhani(12)
@@ -212,7 +216,7 @@ def render_my_bets(
     for gx in range(0, WIDTH, 40):
         draw.line((gx, 0, gx, h), fill=(255, 255, 255, 3))
 
-    _draw_header(draw, username, chips, colors=c)
+    _draw_header(draw, img, username, chips, colors=c)
     cur_y = HEADER_H
 
     if straight_bets:
@@ -286,9 +290,9 @@ def render_tail_board(
     for gx in range(0, WIDTH, 40):
         draw.line((gx, 0, gx, h), fill=(255, 255, 255, 3))
 
-    # Simplified header for tail board
     draw.rectangle((0, 0, WIDTH, HEADER_H), fill=c["header_dark"])
     draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=c["card_border"])
+    paste_logo(img, 8, (HEADER_H - 44) // 2, 44)
     title_font = cinzel(20)
     sub_font = rajdhani(13)
     draw_text_centered(draw, "TAILABLE PARLAYS", title_font, c["header_gold"], WIDTH // 2, 20)
@@ -379,9 +383,9 @@ def render_tail_detail(
     for gx in range(0, WIDTH, 40):
         draw.line((gx, 0, gx, h), fill=(255, 255, 255, 3))
 
-    # Header
     draw.rectangle((0, 0, WIDTH, HEADER_H), fill=c["header_dark"])
     draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=c["card_border"])
+    paste_logo(img, 8, (HEADER_H - 44) // 2, 44)
     title_font = cinzel(20)
     sub_font = rajdhani(13)
     draw_text_centered(draw, "PARLAY PREVIEW", title_font, c["header_gold"], WIDTH // 2, 20)

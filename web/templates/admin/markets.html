@@ -1,0 +1,117 @@
+{% extends "admin/layout.html" %}
+{% block title %}Markets — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Manage Markets</h1>
+  <a href="/admin/markets/new" class="btn btn-primary">+ Create Market</a>
+</div>
+
+<div class="filter-bar">
+  <a href="/admin/markets?status=all" class="btn btn-sm {% if status == 'all' %}btn-primary{% else %}btn-outline{% endif %}">All</a>
+  <a href="/admin/markets?status=open" class="btn btn-sm {% if status == 'open' %}btn-primary{% else %}btn-outline{% endif %}">Open</a>
+  <a href="/admin/markets?status=closed" class="btn btn-sm {% if status == 'closed' %}btn-primary{% else %}btn-outline{% endif %}">Closed</a>
+  <a href="/admin/markets?status=resolved" class="btn btn-sm {% if status == 'resolved' %}btn-primary{% else %}btn-outline{% endif %}">Resolved</a>
+</div>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>ID</th><th>Market</th><th>Odds</th><th>Bets</th><th>Status</th><th>Actions</th></tr>
+    </thead>
+    <tbody>
+      {% for mkt in markets %}
+      {% set ta = tributes_map.get(mkt.tribute_a_id) %}
+      {% set tb = tributes_map.get(mkt.tribute_b_id) %}
+      <tr>
+        <td class="text-dim">{{ mkt.id }}</td>
+        <td>
+          <div class="font-bold">{{ mkt.label }}</div>
+          <div class="text-dim" style="font-size:0.75rem">
+            {{ mkt.type | replace('_', ' ') }}
+            {% if ta %} &bull; {{ ta.name }}{% endif %}
+            {% if tb %} vs {{ tb.name }}{% endif %}
+          </div>
+        </td>
+        <td class="{% if mkt.odds > 0 %}text-pos{% else %}text-neg{% endif %} font-bold">
+          {{ mkt.odds | fmt_odds }}
+        </td>
+        <td>
+          <span class="{% if bet_counts.get(mkt.id, 0) > 0 %}text-gold{% else %}text-dim{% endif %}">
+            {{ bet_counts.get(mkt.id, 0) }}
+          </span>
+        </td>
+        <td>
+          <span class="badge badge-{{ mkt.status.lower() }}">{{ mkt.status }}</span>
+          {% if mkt.result is not none %}
+            <span class="badge {% if mkt.result %}badge-won{% else %}badge-lost{% endif %} ml-1">
+              {{ 'WIN' if mkt.result else 'LOSS' }}
+            </span>
+          {% endif %}
+        </td>
+        <td>
+          <div class="btn-group">
+            {% if mkt.status == 'CLOSED' %}
+            <form method="post" action="/admin/markets/{{ mkt.id }}/open">
+              <button class="btn btn-sm btn-primary">Open</button>
+            </form>
+            {% endif %}
+            {% if mkt.status == 'OPEN' %}
+            <form method="post" action="/admin/markets/{{ mkt.id }}/close">
+              <button class="btn btn-sm btn-outline">Close</button>
+            </form>
+            {% endif %}
+            {% if mkt.status in ('OPEN', 'CLOSED') %}
+            <button class="btn btn-sm btn-gold" onclick="openResolveModal({{ mkt.id }}, '{{ mkt.label | replace("'", "\\'") | truncate(40) }}')">Resolve</button>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="text-dim text-center">No markets found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Resolve Modal -->
+<div id="resolve-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-title">Resolve Market</div>
+    <div id="resolve-market-label" class="text-dim mb-2"></div>
+    <form method="post" id="resolve-form">
+      <div class="form-group">
+        <label class="form-label">Result</label>
+        <div class="radio-group">
+          <label class="radio-option">
+            <input type="radio" name="result" value="true" required> Won (YES)
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="result" value="false"> Lost (NO)
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="result" value="void"> Void (Refund all bets)
+          </label>
+        </div>
+      </div>
+      <div class="btn-group mt-2">
+        <button type="submit" class="btn btn-gold">Resolve</button>
+        <button type="button" class="btn btn-outline" onclick="closeResolveModal()">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function openResolveModal(id, label) {
+  document.getElementById('resolve-market-label').textContent = label;
+  document.getElementById('resolve-form').action = '/admin/markets/' + id + '/resolve';
+  document.getElementById('resolve-modal').classList.remove('hidden');
+}
+function closeResolveModal() {
+  document.getElementById('resolve-modal').classList.add('hidden');
+}
+</script>
+{% endblock %}

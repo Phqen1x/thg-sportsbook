@@ -1,0 +1,66 @@
+{% extends "admin/layout.html" %}
+{% block title %}Alliances — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Alliances</h1>
+</div>
+
+<div class="two-col">
+  <div>
+    {% for a in alliances %}
+    <div class="card mb-2">
+      <div class="alliance-header">
+        <span class="font-bold text-gold">{{ a.name }}</span>
+        <form method="post" action="/admin/alliances/{{ a.id }}/delete" onsubmit="return confirm('Delete alliance {{ a.name }}?')">
+          <button class="btn btn-sm btn-danger">Delete</button>
+        </form>
+      </div>
+      {% set members = all_tributes | selectattr('alliance_id', 'eq', a.id) | list %}
+      {% if members %}
+      <table class="table table-sm mt-1">
+        <tbody>
+          {% for t in members %}
+          <tr>
+            <td>D{{ t.district }} {{ t.name }}</td>
+            <td><span class="badge badge-{{ t.status.lower() }}">{{ t.status }}</span></td>
+            <td>
+              <form method="post" action="/admin/alliances/{{ a.id }}/remove-member/{{ t.id }}">
+                <button class="btn btn-sm btn-danger">Remove</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="text-dim" style="font-size:0.85rem">No members</div>
+      {% endif %}
+      <form method="post" action="/admin/alliances/{{ a.id }}/add-member" class="mt-1">
+        <div class="input-row">
+          <select name="tribute_id" class="form-control form-control-sm">
+            {% for t in tributes %}
+            <option value="{{ t.id }}">D{{ t.district }} {{ t.name }}</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm btn-primary">Add</button>
+        </div>
+      </form>
+    </div>
+    {% else %}
+    <div class="empty-state">No alliances yet.</div>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <div class="card-label">NEW ALLIANCE</div>
+    <form method="post" action="/admin/alliances/new">
+      <div class="form-group">
+        <label class="form-label">Alliance Name *</label>
+        <input type="text" name="name" class="form-control" placeholder="e.g. Career Pack" required>
+      </div>
+      <button type="submit" class="btn btn-primary">Create Alliance</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

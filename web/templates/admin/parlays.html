@@ -1,0 +1,76 @@
+{% extends "admin/layout.html" %}
+{% block title %}Parlay Templates — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Parlay Templates</h1>
+</div>
+
+<div class="two-col">
+  <div>
+    {% for tpl in templates %}
+    <div class="card mb-2">
+      <div class="alliance-header">
+        <div>
+          <span class="font-bold">{{ tpl.name }}</span>
+          {% if tpl.source == 'AUTO' %}<span class="badge badge-open ml-1">AUTO</span>{% endif %}
+          {% if tpl.active %}<span class="badge badge-alive ml-1">ACTIVE</span>{% else %}<span class="badge badge-dead ml-1">INACTIVE</span>{% endif %}
+        </div>
+        <div class="btn-group">
+          <form method="post" action="/admin/parlays/{{ tpl.id }}/toggle">
+            <button class="btn btn-sm btn-outline">{{ 'Deactivate' if tpl.active else 'Activate' }}</button>
+          </form>
+          <form method="post" action="/admin/parlays/{{ tpl.id }}/delete" onsubmit="return confirm('Delete this template?')">
+            <button class="btn btn-sm btn-danger">Delete</button>
+          </form>
+        </div>
+      </div>
+      {% if tpl.description %}<div class="text-dim" style="font-size:0.85rem">{{ tpl.description }}</div>{% endif %}
+      <table class="table table-sm mt-1">
+        <tbody>
+          {% for leg in tpl_legs.get(tpl.id, []) %}
+          {% set mkt = tpl_markets.get(leg.market_id) %}
+          <tr>
+            <td class="text-dim">{{ loop.index }}</td>
+            <td>{{ mkt.label if mkt else 'Market #' ~ leg.market_id }}</td>
+            <td>
+              {% if mkt %}
+              <span class="{% if mkt.odds > 0 %}text-pos{% else %}text-neg{% endif %}">{{ mkt.odds | fmt_odds }}</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <form method="post" action="/admin/parlays/{{ tpl.id }}/add-leg" class="mt-1">
+        <div class="input-row">
+          <input type="number" name="market_id" class="form-control form-control-sm" placeholder="Market ID">
+          <button class="btn btn-sm btn-outline">+ Add Leg</button>
+        </div>
+      </form>
+    </div>
+    {% else %}
+    <div class="empty-state">No parlay templates yet.</div>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <div class="card-label">NEW TEMPLATE</div>
+    <form method="post" action="/admin/parlays/new">
+      <div class="form-group">
+        <label class="form-label">Name *</label>
+        <input type="text" name="name" class="form-control" placeholder="e.g. Careers Parlay" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description</label>
+        <input type="text" name="description" class="form-control" placeholder="Optional description">
+      </div>
+      <div class="form-check mb-2">
+        <input type="checkbox" name="active" id="tpl_active">
+        <label for="tpl_active">Active (visible on Tail Board)</label>
+      </div>
+      <button type="submit" class="btn btn-primary">Create Template</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

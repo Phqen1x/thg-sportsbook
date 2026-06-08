@@ -13,7 +13,7 @@ from bot.imaging.base import (
     COLORS, Theme, get_active_theme,
     cinzel, cinzel_regular, rajdhani, rajdhani_bold,
     draw_rounded_rect, draw_text_centered, draw_text_right,
-    image_from_bytes, paste_image, odds_color,
+    image_from_bytes, paste_image, paste_logo, odds_color,
 )
 from bot.odds.calculator import implied_probability
 from bot.utils.formatters import fmt_odds, fmt_pct, fmt_chips
@@ -26,6 +26,7 @@ HEADER_H = 85
 SECTION_H = 42
 FOOTER_H = 38
 PAD = 16
+DEFAULT_ANNOUNCEMENT = "TODAY WE HONOR TOMORROW'S VICTORS. PLACE YOUR BETS WISELY."
 MARKET_ROW_H = 42
 TRIBUTE_ROW_H = 32
 _TRIBUTE_ROW_GAP = 2
@@ -81,16 +82,8 @@ def _draw_header(draw: ImageDraw.ImageDraw, img: Image.Image, chips: int, *, col
 
     draw.rectangle((0, HEADER_H - 3, WIDTH, HEADER_H), fill=c["card_border"])
 
-    cx, cy = 52, HEADER_H // 2
-    draw.ellipse((cx - 22, cy - 22, cx + 22, cy + 22), outline=c["header_gold"], width=2)
-    draw.ellipse((cx - 14, cy - 14, cx + 14, cy + 14), outline=c["header_gold"], width=1)
-    for angle_deg in range(0, 360, 45):
-        angle = math.radians(angle_deg)
-        x1 = cx + int(14 * math.cos(angle))
-        y1 = cy + int(14 * math.sin(angle))
-        x2 = cx + int(22 * math.cos(angle))
-        y2 = cy + int(22 * math.sin(angle))
-        draw.line((x1, y1, x2, y2), fill=c["header_gold"], width=1)
+    logo_size = 52
+    paste_logo(img, 16, (HEADER_H - logo_size) // 2, logo_size)
 
     title_font = cinzel(22)
     draw.text((82, 14), "PANEM SPORTSBOOK", font=title_font, fill=c["header_gold"])
@@ -299,7 +292,7 @@ def _draw_featured_markets(
     return y_start + rows * (col_h + 4)
 
 
-def _draw_footer(draw: ImageDraw.ImageDraw, img_h: int, *, colors: dict) -> None:
+def _draw_footer(draw: ImageDraw.ImageDraw, img_h: int, *, colors: dict, announcement: str = DEFAULT_ANNOUNCEMENT) -> None:
     c = colors
     draw.rectangle((0, img_h - FOOTER_H, WIDTH, img_h), fill=c["header_dark"])
     draw.rectangle((0, img_h - FOOTER_H, WIDTH, img_h - FOOTER_H + 2), fill=c["card_border"])
@@ -310,7 +303,7 @@ def _draw_footer(draw: ImageDraw.ImageDraw, img_h: int, *, colors: dict) -> None
     msg_font = rajdhani(12)
     draw_text_centered(
         draw,
-        "TODAY WE HONOR TOMORROW'S VICTORS. PLACE YOUR BETS WISELY.",
+        announcement,
         msg_font, c["text_dim"], WIDTH // 2, img_h - FOOTER_H + 11,
     )
 
@@ -321,6 +314,7 @@ def render_hot_odds(
     user_chips: int,
     board_title: str = "TRIBUTE MONEYLINES  ·  TRIBUTE TO WIN THE GAMES",
     featured_title: str = "FEATURED MARKETS",
+    announcement: str = DEFAULT_ANNOUNCEMENT,
 ) -> io.BytesIO:
     theme = get_active_theme()
     c = theme.colors
@@ -362,7 +356,7 @@ def render_hot_odds(
         cur_y += SECTION_H + 8
         _draw_featured_markets(draw, featured_8, cur_y, colors=c)
 
-    _draw_footer(draw, img_h, colors=c)
+    _draw_footer(draw, img_h, colors=c, announcement=announcement)
 
     theme.draw_fg(img, WIDTH, img_h)
 
@@ -375,6 +369,7 @@ def render_hot_odds(
 def render_tribute_detail(
     detail: TributeDetailData,
     user_chips: int,
+    announcement: str = DEFAULT_ANNOUNCEMENT,
 ) -> io.BytesIO:
     theme = get_active_theme()
     c = theme.colors
@@ -478,7 +473,7 @@ def render_tribute_detail(
         cur_y += SECTION_H + 8
         _draw_featured_markets(draw, featured_markets, cur_y, colors=c)
 
-    _draw_footer(draw, img_h, colors=c)
+    _draw_footer(draw, img_h, colors=c, announcement=announcement)
 
     theme.draw_fg(img, WIDTH, img_h)
 

@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Error {{ code }} — Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="error-page">
+  <div class="error-code">{{ code }}</div>
+  <div class="error-message">{{ message }}</div>
+  <a href="/" class="btn btn-primary mt-2">Return Home</a>
+</div>
+{% endblock %}

@@ -1,0 +1,43 @@
+{% extends "admin/layout.html" %}
+{% block title %}Settings — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Game Settings</h1>
+</div>
+
+<div class="card form-card">
+  <form method="post" action="/admin/settings">
+    <div class="form-group">
+      <label class="form-label">Active Theme</label>
+      <select name="active_theme" class="form-control">
+        <option value="dark" {% if theme == 'dark' %}selected{% endif %}>Dark (Default)</option>
+        <option value="forest" {% if theme == 'forest' %}selected{% endif %}>Forest</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Default Starting Chips (new players)</label>
+      <input type="number" name="default_chips" class="form-control" min="0" value="{{ default_chips }}">
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Global Cashout Rate (0.0 – 1.0)</label>
+      <input type="number" name="cashout_rate" class="form-control" step="0.01" min="0" max="1" value="{{ cashout_rate }}">
+      <div class="form-help">The fraction of potential payout returned on early cashout (e.g. 0.65 = 65%).</div>
+    </div>
+
+    <div class="form-check mb-2">
+      <input type="checkbox" name="cashout_allowed" id="cashout_allowed" {% if cashout_allowed == 'true' %}checked{% endif %}>
+      <label for="cashout_allowed">Allow Cashout Globally</label>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Capitol Announcement (shown on odds board)</label>
+      <input type="text" name="capitol_announcement" class="form-control" value="{{ announcement | replace('\"', '') }}" placeholder="e.g. May the odds be ever in your favor!">
+    </div>
+
+    <button type="submit" class="btn btn-primary">Save Settings</button>
+  </form>
+</div>
+{% endblock %}

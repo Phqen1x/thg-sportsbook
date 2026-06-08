@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Balance — Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Your Balance</h1>
+</div>
+
+<div class="balance-layout">
+  <div class="card balance-chip-card">
+    <div class="card-label">CHIP BALANCE</div>
+    <div class="chip-count">{{ db_user.chips | fmt_chips }}</div>
+    <div class="text-dim chip-label">chips</div>
+  </div>
+
+  <div class="card stats-card">
+    <div class="card-label">STATS</div>
+    <table class="table table-sm">
+      <tbody>
+        <tr><td class="text-dim">Total Wagered</td><td class="font-bold">{{ db_user.total_wagered | fmt_chips }}</td></tr>
+        <tr><td class="text-dim">Total Won</td><td class="text-pos font-bold">{{ db_user.total_won | fmt_chips }}</td></tr>
+        <tr>
+          <td class="text-dim">ROI</td>
+          <td class="{% if roi >= 0 %}text-pos{% else %}text-neg{% endif %} font-bold">
+            {% if roi >= 0 %}+{% endif %}{{ roi | round(1) }}%
+          </td>
+        </tr>
+        <tr><td class="text-dim">Straight Bets</td><td>{{ bets | length }}</td></tr>
+        <tr><td class="text-dim">Parlays</td><td>{{ parlays | length }}</td></tr>
+        <tr>
+          <td class="text-dim">Win Rate (Straight)</td>
+          <td>
+            {% set won_count = bets | selectattr('status', 'eq', 'WON') | list | length %}
+            {% set resolved = bets | selectattr('status', 'ne', 'PENDING') | selectattr('status', 'ne', 'VOIDED') | list | length %}
+            {% if resolved > 0 %}{{ (won_count / resolved * 100) | round(1) }}%{% else %}—{% endif %}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section-header mt-3">
+  <h2>Recent Activity</h2>
+  <a href="/my-bets" class="btn btn-outline btn-sm">View All Bets</a>
+</div>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>Type</th><th>Wager</th><th>Result</th><th>Date</th></tr>
+    </thead>
+    <tbody>
+      {% for bet in (bets | sort(attribute='placed_at', reverse=True))[:10] %}
+      <tr>
+        <td><span class="badge badge-open">STRAIGHT</span></td>
+        <td>{{ bet.wager | fmt_chips }}</td>
+        <td><span class="badge badge-{{ bet.status.lower().replace('_', '-') }}">{{ bet.status }}</span></td>
+        <td class="text-dim">{{ bet.placed_at.strftime('%b %d') }}</td>
+      </tr>
+      {% endfor %}
+      {% for p in (parlays | sort(attribute='placed_at', reverse=True))[:5] %}
+      <tr>
+        <td><span class="type-badge">PARLAY</span></td>
+        <td>{{ p.total_wager | fmt_chips }}</td>
+        <td><span class="badge badge-{{ p.status.lower().replace('_', '-') }}">{{ p.status }}</span></td>
+        <td class="text-dim">{{ p.placed_at.strftime('%b %d') }}</td>
+      </tr>
+      {% endfor %}
+      {% if not bets and not parlays %}
+      <tr><td colspan="4" class="text-dim text-center">No activity yet. <a href="/markets">Start betting!</a></td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

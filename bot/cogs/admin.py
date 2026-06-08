@@ -46,6 +46,7 @@ from bot.odds.defaults import (
     HIST_ALPHA,
     HIST_KILL_ALPHA,
     KILL_BOOST_SCALE,
+    MODIFIER_TEMPER,
     age_factor,
     alliance_default_odds,
     apply_group_influence,
@@ -582,6 +583,24 @@ async def open_market_autocomplete(
         result = await session.execute(
             select(Market)
             .where(Market.status.in_(["OPEN", "CLOSED"]))
+            .order_by(Market.id)
+        )
+        markets = result.scalars().all()
+    choices = []
+    for m in markets:
+        label = f"[{m.status}] {m.label}"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=str(m.id)))
+    return choices[:25]
+
+
+async def overridden_market_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(Market)
+            .where(Market.status.in_(["OPEN", "CLOSED"]), Market.odds_override == True)
             .order_by(Market.id)
         )
         markets = result.scalars().all()
@@ -1271,6 +1290,22 @@ async def _recalculate_markets(session) -> None:
         tribute_win_factors[t.id] = win
         tribute_kill_factors[t.id] = kill
 
+    # Field-average of the FINAL per-tribute factors (solo strength + alliance
+    # nudge). Each market's modifier is divided by this so it acts relative to the
+    # field: a tribute with the average boost set is priced off the base model
+    # unchanged, keeping the roster off the ±9900 rail even when most tributes
+    # share a large modifier (e.g. a district-wide career boost).
+    avg_win_factor = (
+        sum(tribute_win_factors.values()) / len(tribute_win_factors)
+        if tribute_win_factors
+        else 1.0
+    )
+    avg_kill_factor = (
+        sum(tribute_kill_factors.values()) / len(tribute_kill_factors)
+        if tribute_kill_factors
+        else 1.0
+    )
+
     _KILL_MARKET_TYPES = {"TRIBUTE_KILLS", "KILLS_OU", "FIRST_BLOOD", "KILL_EVENT"}
 
     for market in markets:
@@ -1283,11 +1318,26 @@ async def _recalculate_markets(session) -> None:
             else None
         )
         if trib_a:
-            mfactor = (
+            is_kill = market.type in _KILL_MARKET_TYPES
+            raw_factor = (
                 tribute_kill_factors.get(trib_a.id, 1.0)
-                if market.type in _KILL_MARKET_TYPES
+                if is_kill
                 else tribute_win_factors.get(trib_a.id, 1.0)
             )
+            # The modifier is applied to odds RELATIVE to the field average, not as
+            # an absolute multiplier. A tribute carrying the field-average set of
+            # boosts is left unchanged (×1.0); only above/below-average tributes
+            # move. This is what keeps the field off the ±9900 cap: an absolute
+            # multiplier applied to every tribute (e.g. a 2× career boost shared by
+            # most of the roster) would otherwise push the whole field toward the
+            # rail and pin the un-boosted handful at the opposite cap.
+            field_avg_factor = avg_kill_factor if is_kill else avg_win_factor
+            # Temper the relative modifier with an exponent < 1 so a single large
+            # assignment (e.g. a 2× career boost or a 0.2× curse) can't on its own
+            # drive a tribute to the rail. relative=1 (average) stays 1; extremes
+            # are pulled toward 1.
+            relative = raw_factor / max(field_avg_factor, 0.01)
+            mfactor = relative ** MODIFIER_TEMPER
             # Resolve historical average training score for this tribute's district/gender
             # so pregame training markets (HIGHEST_TRAINING_SCORE, etc.) can differentiate
             # districts before actual scores are revealed.
@@ -4708,6 +4758,53 @@ class AdminCog(commands.Cog):
         await interaction.followup.send(
             f"Odds for **{label}** set to **{fmt_odds(odds)}**.", ephemeral=True
         )
+
+    @market.command(
+        name="clear-override",
+        description="Remove manual odds override(s) and let the model reprice. Omit market to clear all.",
+    )
+    @app_commands.describe(market_id="Market to clear (leave blank to clear all overrides)")
+    @app_commands.autocomplete(market_id=overridden_market_autocomplete)
+    @is_admin()
+    async def market_clear_override(
+        self, interaction: discord.Interaction, market_id: str | None = None
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            if market_id is not None:
+                mkt = await session.get(Market, int(market_id))
+                if not mkt:
+                    await interaction.followup.send("Market not found.", ephemeral=True)
+                    return
+                if not mkt.odds_override:
+                    await interaction.followup.send(
+                        f"**{mkt.label}** has no manual override — nothing to clear.",
+                        ephemeral=True,
+                    )
+                    return
+                mkt.odds_override = False
+                await _recalculate_markets(session)
+                msg = f"Override cleared for **{mkt.label}**. Repriced to **{fmt_odds(mkt.odds)}**."
+            else:
+                result = await session.execute(
+                    select(Market).where(
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                        Market.odds_override == True,
+                    )
+                )
+                overridden = result.scalars().all()
+                if not overridden:
+                    await interaction.followup.send(
+                        "No markets have manual overrides.", ephemeral=True
+                    )
+                    return
+                for mkt in overridden:
+                    mkt.odds_override = False
+                await _recalculate_markets(session)
+                msg = f"Cleared overrides on **{len(overridden)}** market(s) and repriced."
+
+        await interaction.followup.send(msg, ephemeral=True)
 
     @market.command(
         name="recalc", description="Re-price all markets using the current odds model"
@@ -8259,6 +8356,33 @@ class AdminCog(commands.Cog):
         else:
             await interaction.followup.send(
                 f"Global victor average age set to **{age}**. Odds recalculated.",
+                ephemeral=True,
+            )
+
+    @settings.command(
+        name="announcement",
+        description="Set or clear the Capitol announcement shown in /odds image footers",
+    )
+    @app_commands.describe(text="Announcement text (leave blank to reset to default)")
+    @is_admin()
+    async def settings_announcement(
+        self,
+        interaction: discord.Interaction,
+        text: str | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.imaging.hot_odds import DEFAULT_ANNOUNCEMENT
+        if text is None:
+            await set_setting("capitol_announcement", None)
+            await interaction.followup.send(
+                f"Capitol announcement reset to default:\n> {DEFAULT_ANNOUNCEMENT}",
+                ephemeral=True,
+            )
+        else:
+            await set_setting("capitol_announcement", text)
+            await interaction.followup.send(
+                f"Capitol announcement updated:\n> {text}",
                 ephemeral=True,
             )
 

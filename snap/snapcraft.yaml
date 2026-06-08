@@ -1,0 +1,54 @@
+name: thg-sportsbook
+base: core24
+version: "0.1.0"
+summary: THG Capitol Sportsbook Discord Bot
+description: |
+  A Discord betting/sportsbook bot for The Hunger Games server simulations.
+
+  Before starting, create $SNAP_COMMON/.env containing at minimum:
+    BOT_TOKEN=your_discord_bot_token
+
+  Optional settings (see .env.example for the full list):
+    ADMIN_ROLE_ID, ANNOUNCEMENT_CHANNEL_ID, WITHDRAW_CHANNEL_ID,
+    DEV_GUILD_ID, DEFAULT_CHIPS, CASHOUT_ALLOWED, CASHOUT_RATE
+
+  The database persists in $SNAP_COMMON/data/sportsbook.db across upgrades.
+
+grade: stable
+confinement: strict
+
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+
+parts:
+  bot:
+    plugin: python
+    source: .
+
+  assets:
+    plugin: dump
+    source: assets
+    organize:
+      fonts: assets/fonts
+
+  launcher:
+    plugin: dump
+    source: snap/local
+    organize:
+      launcher: bin/launch
+
+apps:
+  thg-sportsbook:
+    command: bin/launch
+    daemon: simple
+    restart-condition: on-failure
+    restart-delay: 10s
+    plugs:
+      - network
+
+environment:
+  DB_PATH: $SNAP_COMMON/data/sportsbook.db
+  FONTS_DIR: $SNAP/assets/fonts
+  DOTENV_PATH: $SNAP_COMMON/.env

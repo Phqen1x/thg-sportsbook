@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="hero">
+  <div class="hero-inner">
+    <h1 class="hero-title">CAPITOL SPORTSBOOK</h1>
+    {% if phase_name %}
+    <div class="phase-badge">{{ phase_name }}</div>
+    {% endif %}
+    <div class="hero-stats">
+      <div class="hero-stat"><span class="stat-num">{{ alive_count }}</span><span class="stat-label">Tributes Alive</span></div>
+      <div class="hero-stat"><span class="stat-num">{{ open_count }}</span><span class="stat-label">Open Markets</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="section-header">
+  <h2>Live Win Odds</h2>
+  <a href="/markets" class="btn btn-outline btn-sm">View All Markets</a>
+</div>
+
+{% if tributes %}
+<div class="odds-grid">
+  {% for tribute in tributes %}
+  {% set mkt = win_markets.get(tribute.id) %}
+  <div class="odds-card {% if tribute.status == 'VICTOR' %}card-victor{% endif %}">
+    <div class="odds-card-header">
+      <span class="district-badge">D{{ tribute.district }}</span>
+      <span class="status-dot status-{{ tribute.status.lower() }}"></span>
+    </div>
+    <div class="tribute-name">{{ tribute.name }}</div>
+    <div class="tribute-sub">{{ tribute.display_gender }}{% if tribute.age %} &bull; Age {{ tribute.age }}{% endif %}{% if tribute.training_score %} &bull; Score {{ tribute.training_score }}{% endif %}</div>
+    {% if tribute.kills > 0 %}
+    <div class="kill-badge">{{ tribute.kills }} kill{{ 's' if tribute.kills != 1 }}</div>
+    {% endif %}
+    {% if mkt %}
+    <div class="odds-display {% if mkt.odds > 0 %}odds-pos{% else %}odds-neg{% endif %}">{{ mkt.odds | fmt_odds }}</div>
+    {% if user %}
+    <a href="/bet/{{ mkt.id }}" class="btn btn-primary btn-sm mt-1">Bet</a>
+    {% else %}
+    <span class="odds-locked">Login to bet</span>
+    {% endif %}
+    {% else %}
+    <div class="odds-display odds-na">—</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">No active tributes yet.</div>
+{% endif %}
+
+<div class="section-header mt-4">
+  <h2>Leaderboard</h2>
+  <a href="/leaderboard" class="btn btn-outline btn-sm">Full Leaderboard</a>
+</div>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>#</th><th>Player</th><th>Chips</th></tr>
+    </thead>
+    <tbody>
+      {% for u in leaderboard %}
+      <tr {% if loop.index == 1 %}class="row-gold"{% endif %}>
+        <td class="text-dim">{{ loop.index }}</td>
+        <td>{{ u.username }}</td>
+        <td class="text-gold font-bold">{{ u.chips | fmt_chips }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="text-dim text-center">No players yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

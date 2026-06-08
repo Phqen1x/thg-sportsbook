@@ -165,6 +165,12 @@ _ALLIANCE_ALPHA = 0.20
 # objectively weak allies (poor placement history, bloodbath-prone, cursed) hurt.
 ALLIANCE_FACTOR_ALPHA = 0.20
 
+# Exponent applied to each market's field-relative modifier (the tribute's own
+# boost set divided by the field average). Values < 1 temper the modifier so a
+# single large assignment — a 2× career boost shared by most of the roster, or a
+# 0.2× curse — pulls a tribute toward the rail more gently. 1.0 = full strength.
+MODIFIER_TEMPER = 0.45
+
 # How much district historical performance influences current tribute odds.
 # Win/survival markets use HIST_ALPHA; kill markets use HIST_KILL_ALPHA.
 HIST_ALPHA = 0.30
@@ -350,6 +356,31 @@ _GROUP_INFLUENCED_TYPES = {
 
 def _alive_scores(tributes: list["Tribute"]) -> list[int]:
     return [t.training_score or 6 for t in tributes if t.status == "ALIVE"]
+
+
+# How tightly raw training scores are compressed toward the field mean before
+# pricing. Raw scores in a full field of 24 give an average win probability of
+# only ~1/24 (~4%), so even a modest strength edge pushes favourites toward the
+# 99% rail and longshots below the 1% rail — leaving many markets pinned at the
+# ±9900 cap. Pulling each score partway to the mean keeps the whole field inside
+# a believable band (no tribute is ever a near-certainty or a no-hoper) while
+# preserving their order and relative gaps. 1.0 = raw scores, 0.0 = everyone
+# identical.
+SCORE_COMPRESSION = 0.5
+
+
+def _compressed_scores(tributes: list["Tribute"]) -> list[float]:
+    """Alive training scores pulled toward the field mean by SCORE_COMPRESSION."""
+    raw = _alive_scores(tributes)
+    if not raw:
+        return []
+    mean = sum(raw) / len(raw)
+    return [max(1.0, mean + SCORE_COMPRESSION * (s - mean)) for s in raw]
+
+
+def _compress(score: float, mean: float) -> float:
+    """Compress a single score toward the field mean by SCORE_COMPRESSION."""
+    return max(1.0, mean + SCORE_COMPRESSION * (score - mean))
 
 
 def _gauss_pmf(k: int, mean: float, sigma: float = 2.5) -> float:
@@ -589,14 +620,19 @@ def default_odds(
     ou_side: str | None = None,
     hist_avg_score: float | None = None,
 ) -> int:
-    alive_scores = _alive_scores(all_tributes)
+    raw_scores = _alive_scores(all_tributes)
+    n = len(raw_scores) or 1
+    field_mean = (sum(raw_scores) / len(raw_scores)) if raw_scores else 6.0
+    # Compress scores toward the field mean so no tribute prices as a near-certain
+    # winner or a no-hoper (see SCORE_COMPRESSION). Every market below derives from
+    # these compressed scores, so the compression is applied consistently.
+    alive_scores = _compressed_scores(all_tributes)
     total = sum(alive_scores) or 1
-    n = len([t for t in all_tributes if t.status == "ALIVE"]) or 1
 
     score_a = (
-        (tribute_a.training_score or 6)
+        _compress(tribute_a.training_score or 6, field_mean)
         if tribute_a is not None and tribute_a.status == "ALIVE"
-        else 1
+        else 1.0
     )
 
     # Normalised strength: the tribute's share of total field strength, so the
@@ -632,7 +668,7 @@ def default_odds(
         # weakness-weighting the bloodbath model uses. (Dividing B's score by
         # the whole-field total instead made every victim ~equally killable,
         # flattening the victim's strength out of the price entirely.)
-        score_b = (tribute_b.training_score or 6) if tribute_b.status == "ALIVE" else 1
+        score_b = _compress(tribute_b.training_score or 6, field_mean) if tribute_b.status == "ALIVE" else 1.0
         inv_b = 1.0 / max(score_b, 1)
         sum_inv = sum(1.0 / max(s, 1) for s in alive_scores) or 1.0
         p_b_killed = min(0.95, TRIBUTE_KILL_FRACTION * n * (inv_b / sum_inv))

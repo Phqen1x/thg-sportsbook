@@ -183,6 +183,29 @@ def image_from_bytes(data: bytes) -> Image.Image | None:
         return None
 
 
+_logo_cache: Image.Image | None = None
+
+
+def get_logo() -> Image.Image | None:
+    global _logo_cache
+    if _logo_cache is None:
+        path = config.LOGO_PATH
+        if path.exists():
+            try:
+                _logo_cache = Image.open(path).convert("RGBA")
+            except Exception:
+                log.warning(f"Failed to load logo from {path}")
+    return _logo_cache
+
+
+def paste_logo(img: Image.Image, x: int, y: int, size: int) -> None:
+    logo = get_logo()
+    if logo is None:
+        return
+    resized = logo.resize((size, size), Image.LANCZOS)
+    img.paste(resized, (x, y), mask=resized)
+
+
 T = TypeVar("T")
 
 

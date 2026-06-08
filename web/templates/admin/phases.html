@@ -1,0 +1,62 @@
+{% extends "admin/layout.html" %}
+{% block title %}Phases — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Betting Phases</h1>
+</div>
+
+<div class="two-col">
+  <div class="card">
+    <div class="card-label">PHASES</div>
+    <table class="table">
+      <thead>
+        <tr><th>Phase</th><th>Description</th><th>Order</th><th>Active</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for phase in phases %}
+        <tr {% if phase.id == active_phase_id %}class="row-gold"{% endif %}>
+          <td class="font-bold">{{ phase.name }}</td>
+          <td class="text-dim">{{ phase.description or '—' }}</td>
+          <td class="text-dim">{{ phase.sort_order }}</td>
+          <td>{% if phase.id == active_phase_id %}<span class="badge badge-alive">ACTIVE</span>{% endif %}</td>
+          <td>
+            <div class="btn-group">
+              {% if phase.id != active_phase_id %}
+              <form method="post" action="/admin/phases/{{ phase.id }}/activate">
+                <button class="btn btn-sm btn-primary">Activate</button>
+              </form>
+              {% endif %}
+              <form method="post" action="/admin/phases/{{ phase.id }}/delete" onsubmit="return confirm('Delete phase {{ phase.name }}?')">
+                <button class="btn btn-sm btn-danger">Delete</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-dim text-center">No phases yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="card-label">ADD PHASE</div>
+    <form method="post" action="/admin/phases/new">
+      <div class="form-group">
+        <label class="form-label">Name *</label>
+        <input type="text" name="name" class="form-control" placeholder="e.g. Pre-Games" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description</label>
+        <input type="text" name="description" class="form-control" placeholder="Optional description">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Sort Order</label>
+        <input type="number" name="sort_order" class="form-control" value="0">
+      </div>
+      <button type="submit" class="btn btn-primary">Add Phase</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Leaderboard — Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Chip Leaderboard</h1>
+</div>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>#</th><th>Player</th><th>Chips</th><th>Wagered</th><th>Won</th></tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr {% if loop.index == 1 %}class="row-gold"{% elif loop.index <= 3 %}class="row-top"{% endif %}>
+        <td class="rank-col">
+          {% if loop.index == 1 %}👑{% elif loop.index == 2 %}🥈{% elif loop.index == 3 %}🥉{% else %}{{ loop.index }}{% endif %}
+        </td>
+        <td class="font-bold">{{ u.username }}</td>
+        <td class="text-gold font-bold">{{ u.chips | fmt_chips }}</td>
+        <td class="text-dim">{{ u.total_wagered | fmt_chips }}</td>
+        <td class="text-pos">{{ u.total_won | fmt_chips }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="text-dim text-center">No players yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

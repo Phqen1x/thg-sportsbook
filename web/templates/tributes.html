@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Tributes — Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Tribute Roster</h1>
+</div>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr>
+        <th>District</th>
+        <th>Tribute</th>
+        <th>Gender</th>
+        <th>Age</th>
+        <th>Score</th>
+        <th>Kills</th>
+        <th>Alliance</th>
+        <th>Status</th>
+        <th>Win Odds</th>
+        {% if user %}<th></th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for tribute in tributes %}
+      {% set mkt = win_markets.get(tribute.id) %}
+      <tr class="{% if tribute.status == 'DEAD' %}row-dead{% elif tribute.status == 'VICTOR' %}row-victor{% endif %}">
+        <td><span class="district-badge">D{{ tribute.district }}</span></td>
+        <td class="font-bold">{{ tribute.name }}</td>
+        <td class="text-dim">{{ tribute.display_gender }}</td>
+        <td class="text-dim">{{ tribute.age or '—' }}</td>
+        <td>{% if tribute.training_score %}<span class="score-badge">{{ tribute.training_score }}</span>{% else %}—{% endif %}</td>
+        <td>{{ tribute.kills }}</td>
+        <td class="text-dim">{{ alliances.get(tribute.alliance_id, '—') }}</td>
+        <td>
+          {% if tribute.status == 'ALIVE' %}
+            <span class="badge badge-alive">ALIVE</span>
+          {% elif tribute.status == 'VICTOR' %}
+            <span class="badge badge-victor">VICTOR 👑</span>
+          {% else %}
+            <span class="badge badge-dead">DEAD</span>
+            {% if tribute.death_cause %}<div class="text-dim" style="font-size:0.75rem">{{ tribute.death_cause }}</div>{% endif %}
+          {% endif %}
+        </td>
+        <td>
+          {% if mkt %}
+            <span class="{% if mkt.odds > 0 %}text-pos{% else %}text-neg{% endif %} font-bold">{{ mkt.odds | fmt_odds }}</span>
+          {% else %}
+            <span class="text-dim">—</span>
+          {% endif %}
+        </td>
+        {% if user %}
+        <td>
+          {% if mkt and tribute.status == 'ALIVE' %}
+          <a href="/bet/{{ mkt.id }}" class="btn btn-primary btn-sm">Bet</a>
+          {% endif %}
+        </td>
+        {% endif %}
+      </tr>
+      {% else %}
+      <tr><td colspan="10" class="text-dim text-center">No tributes found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}My Bets — Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>My Bets</h1>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" onclick="showTab('straight')">Straight Bets ({{ straight_bets | length }})</button>
+  <button class="tab-btn" onclick="showTab('parlays')">Parlays ({{ parlays | length }})</button>
+</div>
+
+<div id="tab-straight" class="tab-panel">
+  <div class="card">
+    <table class="table">
+      <thead>
+        <tr><th>Market</th><th>Wager</th><th>Odds</th><th>Payout</th><th>Status</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for bet in straight_bets %}
+        {% set mkt = markets_map.get(bet.market_id) %}
+        <tr>
+          <td>
+            <div>{{ mkt.label if mkt else 'Market #' ~ bet.market_id }}</div>
+            <div class="text-dim" style="font-size:0.8rem">{{ bet.placed_at.strftime('%b %d, %Y') }}</div>
+          </td>
+          <td>{{ bet.wager | fmt_chips }}</td>
+          <td class="{% if bet.odds_at_placement > 0 %}text-pos{% else %}text-neg{% endif %}">{{ bet.odds_at_placement | fmt_odds }}</td>
+          <td class="text-gold">
+            {% if bet.status == 'WON' %}{{ bet.payout_if_win | fmt_chips }}
+            {% elif bet.status == 'CASHED_OUT' %}{{ bet.cashout_amount | fmt_chips }}
+            {% elif bet.status == 'VOIDED' %}{{ bet.wager | fmt_chips }} (refunded)
+            {% else %}{{ bet.payout_if_win | fmt_chips }} (if win)
+            {% endif %}
+          </td>
+          <td><span class="badge badge-{{ bet.status.lower().replace('_', '-') }}">{{ bet.status }}</span></td>
+          <td>
+            {% if bet.status == 'PENDING' and mkt %}
+              <form method="post" action="/cashout/bet/{{ bet.id }}" onsubmit="return confirm('Cash out this bet now?')">
+                <button class="btn btn-sm btn-outline">Cash Out</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-dim text-center">No straight bets yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div id="tab-parlays" class="tab-panel hidden">
+  {% for parlay in parlays %}
+  <div class="card parlay-card">
+    <div class="parlay-card-header">
+      <div>
+        <span class="font-bold">Parlay #{{ parlay.id }}</span>
+        <span class="text-dim ml-1">{{ parlay.placed_at.strftime('%b %d, %Y') }}</span>
+      </div>
+      <div class="parlay-card-right">
+        <span class="text-dim">{{ parlay.total_wager | fmt_chips }} wagered</span>
+        <span class="text-gold font-bold">
+          {% if parlay.status == 'WON' %}+{{ parlay.total_payout | fmt_chips }}
+          {% elif parlay.status == 'CASHED_OUT' %}{{ parlay.cashout_amount | fmt_chips }}
+          {% elif parlay.status == 'VOIDED' %}{{ parlay.total_wager | fmt_chips }} (refunded)
+          {% else %}{{ parlay.total_payout | fmt_chips }} potential
+          {% endif %}
+        </span>
+        <span class="badge badge-{{ parlay.status.lower().replace('_', '-') }}">{{ parlay.status }}</span>
+        {% if parlay.status == 'PENDING' %}
+        <form method="post" action="/cashout/parlay/{{ parlay.id }}" onsubmit="return confirm('Cash out this parlay?')">
+          <button class="btn btn-sm btn-outline ml-1">Cash Out</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    <table class="table table-sm mt-1">
+      <tbody>
+        {% for leg in parlay_legs.get(parlay.id, []) %}
+        {% set mkt = parlay_markets.get(leg.market_id) %}
+        <tr>
+          <td class="text-dim">Leg {{ loop.index }}</td>
+          <td>{{ mkt.label if mkt else 'Market #' ~ leg.market_id }}</td>
+          <td class="{% if leg.odds_at_placement > 0 %}text-pos{% else %}text-neg{% endif %}">{{ leg.odds_at_placement | fmt_odds }}</td>
+          <td><span class="badge badge-{{ leg.status.lower().replace('_', '-') }}">{{ leg.status }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty-state">No parlays yet. <a href="/parlay">Build a parlay</a></div>
+  {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function showTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  event.target.classList.add('active');
+}
+</script>
+{% endblock %}

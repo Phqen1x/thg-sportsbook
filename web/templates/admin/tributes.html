@@ -1,0 +1,97 @@
+{% extends "admin/layout.html" %}
+{% block title %}Tributes — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Manage Tributes</h1>
+  <a href="/admin/tributes/new" class="btn btn-primary">+ Add Tribute</a>
+</div>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr>
+        <th>D</th><th>Tribute</th><th>G</th><th>Age</th><th>Score</th>
+        <th>Kills</th><th>Alliance</th><th>Status</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tributes %}
+      <tr class="{% if t.status == 'DEAD' %}row-dead{% elif t.status == 'VICTOR' %}row-victor{% endif %}">
+        <td><span class="district-badge">{{ t.district }}</span></td>
+        <td class="font-bold">{{ t.name }}</td>
+        <td class="text-dim">{{ t.display_gender }}</td>
+        <td class="text-dim">{{ t.age or '—' }}</td>
+        <td>{{ t.training_score or '—' }}</td>
+        <td>{{ t.kills }}</td>
+        <td class="text-dim">{{ alliance_map.get(t.alliance_id, '—') }}</td>
+        <td>
+          <span class="badge badge-{{ t.status.lower() }}">{{ t.status }}</span>
+          {% if t.death_cause %}<div class="text-dim" style="font-size:0.75rem">{{ t.death_cause }}</div>{% endif %}
+        </td>
+        <td>
+          <div class="btn-group">
+            <a href="/admin/tributes/{{ t.id }}/edit" class="btn btn-sm btn-outline">Edit</a>
+            {% if t.status == 'ALIVE' %}
+            <button class="btn btn-sm btn-danger" onclick="openKillModal({{ t.id }}, '{{ t.name | replace("'", "\\'") }}')">Kill</button>
+            <form method="post" action="/admin/tributes/{{ t.id }}/victor" onsubmit="return confirm('Crown {{ t.name }} as Victor?')">
+              <button class="btn btn-sm btn-gold">Crown</button>
+            </form>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="text-dim text-center">No tributes yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Kill Modal -->
+<div id="kill-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-title">Eliminate Tribute</div>
+    <div id="kill-tribute-name" class="text-gold font-bold mb-1"></div>
+    <form method="post" id="kill-form">
+      <div class="form-group">
+        <label class="form-label">Death Cause</label>
+        <select name="death_cause" class="form-control">
+          <option>Another Tribute</option>
+          <option>Natural Causes</option>
+          <option>Mutt</option>
+          <option>Gamemakers</option>
+          <option>Starvation</option>
+          <option>Exposure</option>
+          <option>Arena Trap</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Killed By (Tribute ID, optional)</label>
+        <input type="text" name="killed_by_id" class="form-control" placeholder="Leave blank if not killed by another tribute">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Final Placement (e.g. 12)</label>
+        <input type="number" name="placement" class="form-control" min="1" value="">
+      </div>
+      <div class="btn-group mt-2">
+        <button type="submit" class="btn btn-danger">Confirm Elimination</button>
+        <button type="button" class="btn btn-outline" onclick="closeKillModal()">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function openKillModal(id, name) {
+  document.getElementById('kill-tribute-name').textContent = name;
+  document.getElementById('kill-form').action = '/admin/tributes/' + id + '/kill';
+  document.getElementById('kill-modal').classList.remove('hidden');
+}
+function closeKillModal() {
+  document.getElementById('kill-modal').classList.add('hidden');
+}
+</script>
+{% endblock %}

@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Markets — Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Betting Markets</h1>
+  {% if phase_name %}<div class="phase-badge">{{ phase_name }}</div>{% endif %}
+</div>
+
+<div class="filter-bar">
+  <a href="/markets?status=open" class="btn btn-sm {% if status == 'open' %}btn-primary{% else %}btn-outline{% endif %}">Open</a>
+  <a href="/markets?status=all" class="btn btn-sm {% if status == 'all' %}btn-primary{% else %}btn-outline{% endif %}">All</a>
+  <a href="/markets?status=resolved" class="btn btn-sm {% if status == 'resolved' %}btn-primary{% else %}btn-outline{% endif %}">Resolved</a>
+  <a href="/markets?status=closed" class="btn btn-sm {% if status == 'closed' %}btn-primary{% else %}btn-outline{% endif %}">Closed</a>
+</div>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Market</th>
+        <th>Type</th>
+        <th>Odds</th>
+        <th>Bets</th>
+        <th>Status</th>
+        {% if user %}<th></th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for market in markets %}
+      {% set ta = tributes_map.get(market.tribute_a_id) %}
+      {% set tb = tributes_map.get(market.tribute_b_id) %}
+      <tr>
+        <td>
+          <div class="market-label">{{ market.label }}</div>
+          {% if ta or tb %}
+          <div class="text-dim" style="font-size:0.8rem">
+            {% if ta %}{{ ta.name }}{% endif %}{% if tb %} vs {{ tb.name }}{% endif %}
+          </div>
+          {% endif %}
+        </td>
+        <td><span class="type-badge">{{ market.type | replace('_', ' ') }}</span></td>
+        <td>
+          {% if market.status == 'OPEN' or market.status == 'CLOSED' %}
+            <span class="font-bold {% if market.odds > 0 %}text-pos{% else %}text-neg{% endif %}">
+              {{ market.odds | fmt_odds }}
+            </span>
+          {% elif market.result is not none %}
+            <span class="badge {% if market.result %}badge-won{% else %}badge-lost{% endif %}">
+              {{ 'WON' if market.result else 'LOST' }}
+            </span>
+          {% else %}
+            <span class="badge badge-voided">VOIDED</span>
+          {% endif %}
+        </td>
+        <td class="text-dim">{{ bet_counts.get(market.id, 0) }}</td>
+        <td>
+          <span class="badge badge-{{ market.status.lower() }}">{{ market.status }}</span>
+        </td>
+        {% if user %}
+        <td>
+          {% if market.status == 'OPEN' %}
+            <div class="btn-group">
+              <a href="/bet/{{ market.id }}" class="btn btn-primary btn-sm">Bet</a>
+              <form method="post" action="/parlay/add/{{ market.id }}" style="display:inline">
+                <button class="btn btn-outline btn-sm" title="Add to parlay">+Parlay</button>
+              </form>
+            </div>
+          {% endif %}
+        </td>
+        {% endif %}
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="text-dim text-center">No markets found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

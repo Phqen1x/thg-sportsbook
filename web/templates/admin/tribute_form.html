@@ -1,0 +1,94 @@
+{% extends "admin/layout.html" %}
+{% block title %}{{ 'Edit' if tribute else 'Add' }} Tribute — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>{{ 'Edit' if tribute else 'Add' }} Tribute</h1>
+  <a href="/admin/tributes" class="btn btn-outline">← Back</a>
+</div>
+
+<div class="card form-card">
+  <form method="post" action="{{ '/admin/tributes/' ~ tribute.id ~ '/edit' if tribute else '/admin/tributes/new' }}">
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Name *</label>
+        <input type="text" name="name" class="form-control" value="{{ tribute.name if tribute else '' }}" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label">District *</label>
+        <input type="number" name="district" class="form-control" min="1" max="14" value="{{ tribute.district if tribute else 1 }}" required>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Gender *</label>
+        <select name="gender" class="form-control">
+          <option value="M" {% if tribute and tribute.gender == 'M' %}selected{% endif %}>Male</option>
+          <option value="F" {% if tribute and tribute.gender == 'F' %}selected{% endif %}>Female</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Age</label>
+        <input type="number" name="age" class="form-control" min="12" max="18" value="{{ tribute.age if tribute and tribute.age else '' }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Training Score</label>
+        <input type="number" name="training_score" class="form-control" min="1" max="12" value="{{ tribute.training_score if tribute and tribute.training_score else '' }}">
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Face Claim URL</label>
+      <input type="url" name="face_claim" class="form-control" value="{{ tribute.face_claim if tribute and tribute.face_claim else '' }}">
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Times Played (prior Games)</label>
+        <input type="number" name="times_played" class="form-control" min="0" value="{{ tribute.times_played if tribute else 0 }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Highest Placement (prior)</label>
+        <input type="number" name="highest_placement" class="form-control" min="1" value="{{ tribute.highest_placement if tribute and tribute.highest_placement else '' }}">
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Alliance</label>
+        <select name="alliance_id" class="form-control">
+          <option value="">None</option>
+          {% for a in alliances %}
+          <option value="{{ a.id }}" {% if tribute and tribute.alliance_id == a.id %}selected{% endif %}>{{ a.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Discord User ID</label>
+        <input type="text" name="discord_user_id" class="form-control" value="{{ tribute.discord_user_id if tribute and tribute.discord_user_id else '' }}">
+      </div>
+    </div>
+
+    <div class="form-checks">
+      <label class="form-check">
+        <input type="checkbox" name="non_binary" {% if tribute and tribute.non_binary %}checked{% endif %}>
+        Non-binary
+      </label>
+      <label class="form-check">
+        <input type="checkbox" name="sade_participant" {% if tribute and tribute.sade_participant %}checked{% endif %}>
+        SADE Participant
+      </label>
+      <label class="form-check">
+        <input type="checkbox" name="sade_champion" {% if tribute and tribute.sade_champion %}checked{% endif %}>
+        SADE Champion
+      </label>
+    </div>
+
+    <div class="btn-group mt-3">
+      <button type="submit" class="btn btn-primary">{{ 'Save Changes' if tribute else 'Create Tribute' }}</button>
+      <a href="/admin/tributes" class="btn btn-outline">Cancel</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

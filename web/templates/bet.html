@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Place Bet — Capitol Sportsbook{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Place a Bet</h1>
+</div>
+
+<div class="bet-layout">
+  <div class="card market-detail">
+    <div class="card-label">MARKET</div>
+    <div class="market-title">{{ market.label }}</div>
+    {% if tribute_a or tribute_b %}
+    <div class="tribute-row">
+      {% if tribute_a %}<span class="tribute-tag">{{ tribute_a.name }} (D{{ tribute_a.district }})</span>{% endif %}
+      {% if tribute_b %}<span class="text-dim">vs</span><span class="tribute-tag">{{ tribute_b.name }} (D{{ tribute_b.district }})</span>{% endif %}
+    </div>
+    {% endif %}
+    <div class="odds-big {% if market.odds > 0 %}text-pos{% else %}text-neg{% endif %}">
+      {{ market.odds | fmt_odds }}
+    </div>
+    <div class="text-dim">
+      {% if market.odds > 0 %}
+        Win {{ ((market.odds / 100) + 1) | round(2) }}× your wager
+      {% else %}
+        Win {{ ((100 / (market.odds | abs)) + 1) | round(2) }}× your wager
+      {% endif %}
+    </div>
+    <div class="divider"></div>
+    <div class="market-meta">
+      <div><span class="text-dim">Type</span> {{ market.type | replace('_', ' ') }}</div>
+      <div><span class="text-dim">Status</span> <span class="badge badge-open">OPEN</span></div>
+    </div>
+  </div>
+
+  <div class="card bet-form-card">
+    <div class="card-label">YOUR BET</div>
+    <div class="balance-row">
+      <span class="text-dim">Your balance</span>
+      <span class="text-gold font-bold">{{ db_user.chips | fmt_chips }} chips</span>
+    </div>
+
+    {% if existing %}
+    <div class="alert alert-warn">
+      You already have a pending bet on this market ({{ existing.wager | fmt_chips }} chips at {{ existing.odds_at_placement | fmt_odds }}).
+    </div>
+    {% else %}
+    <form method="post" action="/bet/{{ market.id }}" id="bet-form">
+      <div class="form-group">
+        <label class="form-label" for="wager">Wager Amount (chips)</label>
+        <input type="number" id="wager" name="wager" class="form-control" min="1" max="{{ db_user.chips }}" value="100" required oninput="updatePayout(this.value)">
+        <div class="quick-amounts">
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(100)">100</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(500)">500</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(1000)">1K</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(5000)">5K</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setWager({{ db_user.chips }})">MAX</button>
+        </div>
+      </div>
+      <div class="payout-preview">
+        <span class="text-dim">Potential payout</span>
+        <span id="payout-display" class="text-gold font-bold">—</span>
+      </div>
+      <button type="submit" class="btn btn-primary btn-full mt-2">Place Bet</button>
+    </form>
+    {% endif %}
+
+    <div class="mt-2">
+      <a href="/parlay/add/{{ market.id }}" class="btn btn-outline btn-full">
+        <form method="post" action="/parlay/add/{{ market.id }}">
+          <button type="submit" class="btn btn-outline btn-full">+ Add to Parlay Slip</button>
+        </form>
+      </a>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const odds = {{ market.odds }};
+
+function calcPayout(wager) {
+  if (odds > 0) return Math.round(wager * (odds / 100 + 1));
+  return Math.round(wager * (100 / Math.abs(odds) + 1));
+}
+
+function updatePayout(val) {
+  const w = parseInt(val) || 0;
+  document.getElementById('payout-display').textContent = w > 0 ? (calcPayout(w)).toLocaleString() + ' chips' : '—';
+}
+
+function setWager(n) {
+  const input = document.getElementById('wager');
+  input.value = n;
+  updatePayout(n);
+}
+
+updatePayout(100);
+</script>
+{% endblock %}

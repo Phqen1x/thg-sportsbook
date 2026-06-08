@@ -1,0 +1,72 @@
+{% extends "admin/layout.html" %}
+{% block title %}Admin — Capitol Sportsbook{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Admin Overview</h1>
+</div>
+
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="stat-num text-pos">{{ alive }}</div>
+    <div class="stat-label">Tributes Alive</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num text-dim">{{ dead }}</div>
+    <div class="stat-label">Eliminated</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num text-gold">{{ open_mkts }}</div>
+    <div class="stat-label">Open Markets</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num">{{ pending_bets }}</div>
+    <div class="stat-label">Pending Bets</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num">{{ total_bets }}</div>
+    <div class="stat-label">Total Bets</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num">{{ total_users }}</div>
+    <div class="stat-label">Players</div>
+  </div>
+</div>
+
+<div class="section-header mt-3">
+  <h2>Game Phase</h2>
+</div>
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>Phase</th><th>Description</th><th>Order</th><th>Active</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for phase in phases %}
+      <tr {% if phase.id == active_phase_id %}class="row-gold"{% endif %}>
+        <td class="font-bold">{{ phase.name }}</td>
+        <td class="text-dim">{{ phase.description or '—' }}</td>
+        <td class="text-dim">{{ phase.sort_order }}</td>
+        <td>{% if phase.id == active_phase_id %}<span class="badge badge-alive">ACTIVE</span>{% endif %}</td>
+        <td>
+          {% if phase.id != active_phase_id %}
+          <form method="post" action="/admin/phases/{{ phase.id }}/activate">
+            <button class="btn btn-sm btn-outline">Set Active</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="text-dim text-center">No phases yet. <a href="/admin/phases">Add phases</a></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="quick-actions mt-3">
+  <a href="/admin/tributes/new" class="btn btn-primary">+ Add Tribute</a>
+  <a href="/admin/markets/new" class="btn btn-primary">+ Create Market</a>
+  <a href="/admin/markets?status=open" class="btn btn-outline">Manage Open Markets</a>
+  <a href="/admin/chips" class="btn btn-outline">Manage Chips</a>
+</div>
+{% endblock %}
