@@ -329,15 +329,16 @@ _BLOODBATH_RESOLVE_TYPES = {"BLOODBATH_SURVIVOR"}
 _BLOODBATH_VOID_TYPES = {"FIRST_BLOOD"}
 
 # ── Phase-gated market availability ───────────────────────────────────────────
-# Markets open progressively as the Games advance. During Pre-Games only District
-# Victor and the training-score / scouting props are live; the bloodbath markets
-# join in the Bloodbath (and stay open through Sponsors Open); from the Arena on,
-# every market is open.
+# Markets open progressively as the Games advance. During Pre-Games the District
+# and individual-Tribute victor moneylines plus the training-score / scouting
+# props are live; the bloodbath markets join in the Bloodbath (and stay open
+# through Sponsors Open); from the Arena on, every market is open.
 _PREGAMES_OPEN_TYPES = _PREGAMES_PROP_TYPES | {
     "HIGHEST_TRAINING_SCORE",
     "LOWEST_TRAINING_SCORE",
     "DISTRICT_HIGHEST_SCORE",
     "DISTRICT_VICTOR",
+    "TRIBUTE_WINS",
 }
 _BLOODBATH_OPEN_TYPES = {
     "BLOODBATH_SURVIVOR",
@@ -2948,11 +2949,17 @@ class AdminCog(commands.Cog):
         description="Manage tributes",
         default_permissions=_ADMIN_PERMS,
     )
+    # Top-level (not under /admin) to stay within Discord's 8000-char limit on
+    # the admin command tree — same pattern as the tribute/restrict groups.
     market = app_commands.Group(
-        name="market", description="Manage markets", parent=admin
+        name="market",
+        description="Manage markets",
+        default_permissions=_ADMIN_PERMS,
     )
     market_type = app_commands.Group(
-        name="market_type", description="Manage custom market types", parent=admin
+        name="market_type",
+        description="Manage custom market types",
+        default_permissions=_ADMIN_PERMS,
     )
     resolve = app_commands.Group(
         name="resolve",
@@ -2966,13 +2973,17 @@ class AdminCog(commands.Cog):
         name="stats", description="Live running-game statistics", parent=admin
     )
     settings = app_commands.Group(
-        name="settings", description="Bot settings", parent=admin
+        name="settings",
+        description="Bot settings",
+        default_permissions=_ADMIN_PERMS,
     )
     alliance = app_commands.Group(
         name="alliance", description="Manage tribute alliances", parent=admin
     )
     history = app_commands.Group(
-        name="history", description="District historical records", parent=admin
+        name="history",
+        description="District historical records",
+        default_permissions=_ADMIN_PERMS,
     )
     restrict = app_commands.Group(
         name="restrict",
@@ -4934,17 +4945,21 @@ class AdminCog(commands.Cog):
 
     @market.command(
         name="bulk_open",
-        description="Open all closed markets (optionally phase-filtered)",
+        description="Open closed markets, optionally filtered by phase and/or market type",
     )
     @app_commands.describe(
-        phase_id="Phase filter (blank = open all closed markets)",
+        phase_id="Phase filter (blank = any phase)",
+        market_type="Market type filter (blank = all types). Bypasses phase-gating for that type.",
     )
-    @app_commands.autocomplete(phase_id=phase_autocomplete)
+    @app_commands.autocomplete(
+        phase_id=phase_autocomplete, market_type=market_type_autocomplete
+    )
     @is_admin()
     async def market_bulk_open(
         self,
         interaction: discord.Interaction,
         phase_id: str | None = None,
+        market_type: str | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
@@ -4960,14 +4975,22 @@ class AdminCog(commands.Cog):
                     return
                 phase_name = phase_obj.name
                 allowed = _open_types_for_phase(phase_name)
-            result = await session.execute(select(Market).where(Market.status == "CLOSED"))
+            query = select(Market).where(Market.status == "CLOSED")
+            if market_type:
+                query = query.where(Market.type == market_type)
+            result = await session.execute(query)
             count = 0
             for m in result.scalars().all():
                 if filter_phase_id is None or _market_should_open(m, filter_phase_id, allowed):
                     m.status = "OPEN"
                     count += 1
 
-        scope = f"in phase **{phase_name}**" if phase_name else "across all phases"
+        scope_bits: list[str] = []
+        if phase_name:
+            scope_bits.append(f"in phase **{phase_name}**")
+        if market_type:
+            scope_bits.append(f"of type **{market_type}**")
+        scope = " ".join(scope_bits) if scope_bits else "across all phases"
         await interaction.followup.send(
             f"Opened **{count}** market(s) {scope}.", ephemeral=True
         )
