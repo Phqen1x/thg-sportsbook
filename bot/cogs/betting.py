@@ -87,6 +87,12 @@ _ALLIANCE_MARKET_TYPES = {
 # just an exact-placement bet on 1st, so it counts as a placement market too.
 _PLACEMENT_TYPES = {"TRIBUTE_WINS", "TRIBUTE_PLACEMENT", "TRIBUTE_TOP_N", "PLACEMENT_OU"}
 
+# Every "who wins the Games" market. Exactly one tribute wins, so these are all
+# correlated — picking the individual victor (TRIBUTE_WINS) implies their district
+# and alliance win too. At most one may share a parlay; stacking them just inflates
+# the odds without making the slip meaningfully harder to hit.
+_VICTOR_TYPES = {"TRIBUTE_WINS", "DISTRICT_VICTOR", "ALLIANCE_VICTOR"}
+
 
 def _parse_id(raw: str) -> int | None:
     """Parse an ID coming from an autocomplete field. Returns None if the user
@@ -429,25 +435,22 @@ def _partner_comparison_conflict(existing_markets: list[Market], new_mkt: Market
 
 
 def _victor_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
-    """Block parlaying multiple District Victor or Alliance Victor bets.
+    """Allow at most one "who wins the Games" market per parlay.
 
-    Only one tribute wins the Games, so two bets each predicting a different
-    district (or alliance) as the source of the victor are mutually exclusive.
+    Individual-tribute, district, and alliance victor bets are all correlated —
+    only one tribute wins, and that result determines the winning district and
+    alliance at the same time. Stacking them (e.g. "D1 wins" + "D1M wins") just
+    inflates the odds without making the slip meaningfully harder to hit, so any
+    victor leg blocks adding another of any victor type.
     """
-    if new_mkt.type == "DISTRICT_VICTOR":
-        for m in existing_markets:
-            if m.type == "DISTRICT_VICTOR":
-                return (
-                    "You can't parlay two District Victor bets — only one tribute wins "
-                    "the Games, so only one district can produce the victor."
-                )
-    elif new_mkt.type == "ALLIANCE_VICTOR":
-        for m in existing_markets:
-            if m.type == "ALLIANCE_VICTOR":
-                return (
-                    "You can't parlay two Alliance Victor bets — only one tribute wins "
-                    "the Games, so only one alliance can produce the victor."
-                )
+    if new_mkt.type not in _VICTOR_TYPES:
+        return None
+    if any(m.type in _VICTOR_TYPES for m in existing_markets):
+        return (
+            "You can't parlay more than one victor bet — only one tribute wins the "
+            "Games, and that single result decides the winning tribute, district, "
+            "and alliance together. Pick just one victor market per parlay."
+        )
     return None
 
 

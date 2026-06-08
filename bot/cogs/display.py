@@ -469,8 +469,9 @@ class DisplayCog(commands.Cog):
         if not available:
             available = ["tribute"]
 
-        # Pregames default to district odds (individual tribute victor moneylines
-        # aren't open yet); every other phase defaults to tribute odds.
+        # Pregames default to the district board (the headline early-stage view);
+        # individual tribute victor odds are open too and reachable via the toggle.
+        # Every other phase defaults to the tribute board.
         if phase_name == "Pre-Games" and "district" in available:
             mode = "district"
         else:
