@@ -1527,6 +1527,12 @@ _MIN_PARLAY_LEGS = 3
 _MAX_PARLAY_LEGS = 8
 
 
+def _ordinal(n: int) -> str:
+    if 11 <= n % 100 <= 13:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
 def _parlay_prob(legs: list[Market]) -> float:
     return parlay_combined_probability([m.odds for m in legs])
 
@@ -1631,7 +1637,10 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                 alliance_members.setdefault(t.alliance_id, set()).add(t.id)
 
     # Build themed groupings: (theme_type, theme_key, candidate_markets)
-    groupings: list[tuple[str, int, list[Market]]] = []
+    # theme_key is int for tribute/alliance/district/veterans/kill_leaders,
+    # tuple[int,int] for cross_district and rival_alliances.
+    from itertools import combinations as _combinations
+    groupings: list[tuple[str, object, list[Market]]] = []
 
     # Tribute-centric: every market where this tribute appears on either side
     by_tribute: dict[int, list[Market]] = {}
@@ -1663,6 +1672,51 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
         if len(mkts) >= _MIN_PARLAY_LEGS:
             groupings.append(("district", district, mkts))
 
+    # Cross-district: pair two districts together — pools more markets and frames
+    # the parlay as an inter-district rivalry rather than a single-tribute showcase.
+    district_list = sorted(districts)
+    for d1, d2 in _combinations(district_list, 2):
+        d1_tids = {t.id for t in tributes_map.values() if t.district == d1}
+        d2_tids = {t.id for t in tributes_map.values() if t.district == d2}
+        mkts = _dedup_markets([
+            m for m in open_markets
+            if m.tribute_a_id in d1_tids | d2_tids or m.tribute_b_id in d1_tids | d2_tids
+        ])
+        if len(mkts) >= _MIN_PARLAY_LEGS:
+            groupings.append(("cross_district", (d1, d2), mkts))
+
+    # Rival alliances: two alliances pooled — frames the parlay as an alliance war.
+    aid_list = sorted(alliance_ids)
+    for a1, a2 in _combinations(aid_list, 2):
+        a1_tids = alliance_members.get(a1, set())
+        a2_tids = alliance_members.get(a2, set())
+        mkts = _dedup_markets([
+            m for m in open_markets
+            if m.tribute_a_id in a1_tids | a2_tids or m.tribute_b_id in a1_tids | a2_tids
+        ])
+        if len(mkts) >= _MIN_PARLAY_LEGS:
+            groupings.append(("rival_alliances", (a1, a2), mkts))
+
+    # Veterans: tributes with prior-game experience — the returning-class narrative.
+    vet_tids = {t.id for t in tributes_map.values() if t.times_played and t.times_played >= 1}
+    if vet_tids:
+        mkts = _dedup_markets([
+            m for m in open_markets
+            if m.tribute_a_id in vet_tids or m.tribute_b_id in vet_tids
+        ])
+        if len(mkts) >= _MIN_PARLAY_LEGS:
+            groupings.append(("veterans", 0, mkts))
+
+    # Kill leaders: current-game tributes with 2+ kills — the bloodbath narrative.
+    killer_tids = {t.id for t in tributes_map.values() if t.kills >= 2}
+    if killer_tids:
+        mkts = _dedup_markets([
+            m for m in open_markets
+            if m.tribute_a_id in killer_tids or m.tribute_b_id in killer_tids
+        ])
+        if len(mkts) >= _MIN_PARLAY_LEGS:
+            groupings.append(("kill_leaders", 0, mkts))
+
     if not groupings:
         return 0
 
@@ -1676,25 +1730,35 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
         ("LONGSHOT", n_each,                           6, 8),
     ]
 
-    # Tribute cap: no more than ceil(count/3) tribute-centric parlays total,
-    # and each individual tribute may only anchor one parlay.
+    # Hard cap: at most 1 tribute-centric parlay regardless of count.
+    # Creative themes (cross_district, rival_alliances, veterans, kill_leaders)
+    # always have priority; tribute is last resort only.
     import math as _math
-    max_tribute = _math.ceil(count / 3)
+    max_tribute = max(1, count // 5)
     tribute_count = 0
     used_tribute_keys: set[int] = set()
 
-    TierEntry = tuple[str, int, list[Market], str]  # theme_type, theme_key, legs, tier_name
+    TierEntry = tuple[str, object, list[Market], str]  # theme_type, theme_key, legs, tier_name
     selected: list[TierEntry] = []
     used_leg_sets: set[frozenset[int]] = set()
 
-    def _tribute_allowed(theme_type: str, theme_key: int) -> bool:
+    _CREATIVE_THEMES = {"cross_district", "rival_alliances", "veterans", "kill_leaders"}
+    _THEME_PRIORITY = {
+        "cross_district": 0, "rival_alliances": 0,
+        "veterans": 1, "kill_leaders": 1,
+        "alliance": 2, "district": 2,
+        "tribute": 3,
+    }
+
+    def _tribute_allowed(theme_type: str, theme_key: object) -> bool:
         if theme_type != "tribute":
             return True
+        assert isinstance(theme_key, int)
         return theme_key not in used_tribute_keys and tribute_count < max_tribute
 
     for tier_name, n_slots, min_l, max_l in tier_allocations:
         for _slot in range(n_slots):
-            tier_cands: list[tuple[str, int, list[Market]]] = []
+            tier_cands: list[tuple[str, object, list[Market]]] = []
             for theme_type, theme_key, mkts in groupings:
                 if not _tribute_allowed(theme_type, theme_key):
                     continue
@@ -1718,16 +1782,37 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                         if leg_key not in used_leg_sets:
                             tier_cands.append((theme_type, theme_key, legs))
 
+            # Last resort: allow a tribute even if cap is technically exceeded,
+            # rather than leaving a slot completely empty.
+            if not tier_cands:
+                for theme_type, theme_key, mkts in groupings:
+                    if theme_type == "tribute":
+                        assert isinstance(theme_key, int)
+                        if theme_key in used_tribute_keys:
+                            continue
+                    legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l)
+                    if len(legs) >= min_l:
+                        leg_key = frozenset(l.id for l in legs)
+                        if leg_key not in used_leg_sets:
+                            tier_cands.append((theme_type, theme_key, legs))
+
             if not tier_cands:
                 break
 
-            # More market-type diversity first, then more legs
-            tier_cands.sort(key=lambda c: (len({m.type for m in c[2]}), len(c[2])), reverse=True)
+            # Sort: creative/non-tribute themes first, then market-type diversity, then leg count.
+            tier_cands.sort(
+                key=lambda c: (
+                    _THEME_PRIORITY.get(c[0], 9),
+                    -len({m.type for m in c[2]}),
+                    -len(c[2]),
+                ),
+            )
             best_type, best_key, best_legs = tier_cands[0]
             selected.append((best_type, best_key, best_legs, tier_name))
             used_leg_sets.add(frozenset(l.id for l in best_legs))
             if best_type == "tribute":
                 tribute_count += 1
+                assert isinstance(best_key, int)
                 used_tribute_keys.add(best_key)
 
     # Persist
@@ -1735,6 +1820,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     for theme_type, theme_key, legs, difficulty in selected:
 
         if theme_type == "tribute":
+            assert isinstance(theme_key, int)
             t = tributes_map[theme_key]
             fname = t.name.split()[0]
             dr = district_records.get(t.district)
@@ -1773,45 +1859,240 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                 name = f"All In on {fname}"
 
         elif theme_type == "alliance":
+            assert isinstance(theme_key, int)
             aname = alliance_names.get(theme_key, "The Alliance")
             member_tids = alliance_members.get(theme_key, set())
             members = [tributes_map[tid] for tid in member_tids if tid in tributes_map]
             names_str = " & ".join(t.name.split()[0] for t in members[:3])
             combined_kills = sum(t.kills for t in members)
             vets = [t for t in members if t.times_played]
-            parts = [f"{names_str} march under the same banner"]
+            champs = [t for t in members if t.sade_champion]
+            parts = [f"{names_str} march under the {aname} banner"]
+            if champs:
+                parts.append(f"{champs[0].name.split()[0]} is a former SADE victor — the experience shows")
             if combined_kills:
                 parts.append(
                     f"{combined_kills} combined {'kill' if combined_kills == 1 else 'kills'} between them"
                 )
             if vets:
-                parts.append(f"{len(vets)} {'veteran' if len(vets) == 1 else 'veterans'} in the group")
+                parts.append(
+                    f"{len(vets)} returning {'tribute' if len(vets) == 1 else 'tributes'} "
+                    f"with prior arena experience"
+                )
+            # District record flavor for the alliance's home districts
+            alliance_districts = {tributes_map[tid].district for tid in member_tids if tid in tributes_map}
+            for d in sorted(alliance_districts)[:2]:
+                dr = district_records.get(d)
+                if dr and dr.wins:
+                    parts.append(f"District {d} has sent {dr.wins} victor{'s' if dr.wins != 1 else ''} before")
+                elif dr and dr.top8_finishes:
+                    parts.append(f"District {d} has {dr.top8_finishes} historical top-8 finishes")
             desc = ". ".join(parts).capitalize() + "."
-            name = f"{aname} Solidarity"
+            # Name varies by alliance strength
+            top_score = max((t.training_score or 0) for t in members) if members else 0
+            if champs:
+                name = f"{aname}: Returning Champions"
+            elif top_score >= 10:
+                name = f"{aname}: Trained to Kill"
+            elif combined_kills >= 3:
+                name = f"{aname}: Blood Pact"
+            else:
+                name = f"{aname} Solidarity"
 
-        else:  # district
+        elif theme_type == "district":
+            assert isinstance(theme_key, int)
             dr = district_records.get(theme_key)
             dist_tids = {t.id for t in tributes_map.values() if t.district == theme_key}
             dist_tributes = [tributes_map[tid] for tid in dist_tids if tid in tributes_map]
-            wins_clause = (
-                f" {dr.wins} all-time {'victory' if dr.wins == 1 else 'victories'} and"
-                if dr and dr.wins else ""
-            )
             score_count = sum(1 for t in dist_tributes if t.training_score)
-            score_sum = sum(t.training_score for t in dist_tributes if t.training_score)
-            score_clause = f" Average training score: {score_sum // score_count}." if score_count else ""
-            top8_clause = (
-                f" {dr.top8_finishes} top-8 finishes historically." if dr and dr.top8_finishes else ""
+            score_sum = sum(t.training_score or 0 for t in dist_tributes)
+            avg_score = score_sum // score_count if score_count else None
+            parts = []
+            if dr and dr.wins and dr.wins >= 3:
+                parts.append(f"District {theme_key} has {dr.wins} all-time victories — this is what a dynasty looks like")
+            elif dr and dr.wins:
+                parts.append(f"District {theme_key} has tasted victory before — {dr.wins} time{'s' if dr.wins != 1 else ''}")
+            else:
+                parts.append(f"District {theme_key} is hungry and has everything to prove")
+            if dr and dr.top5_finishes:
+                parts.append(f"{dr.top5_finishes} top-5 finishes in the historical record")
+            elif dr and dr.top8_finishes:
+                parts.append(f"{dr.top8_finishes} top-8 finishes historically")
+            if dr and dr.total_kills:
+                parts.append(f"{dr.total_kills} all-time kills out of this district")
+            if avg_score:
+                parts.append(f"current tributes average a {avg_score} training score")
+            if dr and dr.reputation and dr.reputation <= 2:
+                parts.append("one of Panem's most feared districts — the Capitol watches closely")
+            elif dr and dr.funding_level in ("rich", "well_funded"):
+                parts.append(f"Capitol funding gives District {theme_key} an edge in preparation")
+            desc = ". ".join(parts).capitalize() + "."
+            if dr and dr.wins and dr.wins >= 3:
+                name = f"District {theme_key}: Dynasty"
+            elif dr and dr.total_kills and dr.total_kills >= 10:
+                name = f"District {theme_key}: Killing Ground"
+            elif dr and dr.runner_up_finishes and dr.runner_up_finishes >= 2:
+                name = f"District {theme_key}: So Close"
+            else:
+                name = f"District {theme_key} Double Down"
+
+        elif theme_type == "cross_district":
+            assert isinstance(theme_key, tuple)
+            d1, d2 = theme_key
+            dr1 = district_records.get(d1)
+            dr2 = district_records.get(d2)
+            d1_tids = {t.id for t in tributes_map.values() if t.district == d1}
+            d2_tids = {t.id for t in tributes_map.values() if t.district == d2}
+            d1_tributes = [tributes_map[tid] for tid in d1_tids if tid in tributes_map]
+            d2_tributes = [tributes_map[tid] for tid in d2_tids if tid in tributes_map]
+            d1_kills = sum(t.kills for t in d1_tributes)
+            d2_kills = sum(t.kills for t in d2_tributes)
+            parts = [f"Districts {d1} and {d2} collide — back them both and let the arena decide"]
+            if dr1 and dr1.wins and dr2 and dr2.wins:
+                parts.append(
+                    f"District {d1} carries {dr1.wins} historical {'win' if dr1.wins == 1 else 'wins'}, "
+                    f"District {d2} has {dr2.wins}"
+                )
+            elif dr1 and dr1.wins:
+                parts.append(
+                    f"District {d1} has {dr1.wins} historical {'victory' if dr1.wins == 1 else 'victories'} "
+                    f"— District {d2} is still searching for its first"
+                )
+            elif dr2 and dr2.wins:
+                parts.append(
+                    f"District {d2} holds {dr2.wins} historical {'victory' if dr2.wins == 1 else 'victories'} "
+                    f"— District {d1} is still writing its story"
+                )
+            combined_kills = d1_kills + d2_kills
+            if combined_kills:
+                parts.append(f"{combined_kills} kills between these two districts so far this game")
+            if dr1 and dr1.avg_placement and dr2 and dr2.avg_placement:
+                better_d = d1 if dr1.avg_placement <= dr2.avg_placement else d2
+                better_avg = min(dr1.avg_placement, dr2.avg_placement)
+                parts.append(f"District {better_d} averages a placement of {better_avg} historically")
+            desc = ". ".join(parts).capitalize() + "."
+            d1_wins = dr1.wins or 0 if dr1 else 0
+            d2_wins = dr2.wins or 0 if dr2 else 0
+            if d1_wins + d2_wins >= 4:
+                name = f"Districts {d1} & {d2}: Legacy Wager"
+            elif d1_kills + d2_kills >= 4:
+                name = f"Districts {d1} & {d2}: Bloodbath Stakes"
+            else:
+                name = f"Districts {d1} & {d2}: Divided Loyalties"
+
+        elif theme_type == "rival_alliances":
+            assert isinstance(theme_key, tuple)
+            a1, a2 = theme_key
+            a1_name = alliance_names.get(a1, f"Alliance {a1}")
+            a2_name = alliance_names.get(a2, f"Alliance {a2}")
+            a1_members = [tributes_map[tid] for tid in alliance_members.get(a1, set()) if tid in tributes_map]
+            a2_members = [tributes_map[tid] for tid in alliance_members.get(a2, set()) if tid in tributes_map]
+            a1_kills = sum(t.kills for t in a1_members)
+            a2_kills = sum(t.kills for t in a2_members)
+            a1_vets = [t for t in a1_members if t.times_played]
+            a2_vets = [t for t in a2_members if t.times_played]
+            a1_top_score = max((t.training_score or 0) for t in a1_members) if a1_members else 0
+            a2_top_score = max((t.training_score or 0) for t in a2_members) if a2_members else 0
+            parts = [f"{a1_name} and {a2_name} are the last two alliances standing — these bets span them both"]
+            if a1_kills or a2_kills:
+                stronger = a1_name if a1_kills >= a2_kills else a2_name
+                parts.append(f"{stronger} leads the body count so far")
+            if a1_vets or a2_vets:
+                total_vets = len(a1_vets) + len(a2_vets)
+                parts.append(f"{total_vets} veteran{'s' if total_vets != 1 else ''} across both alliances bring prior-game experience")
+            if a1_top_score and a2_top_score:
+                elite = a1_name if a1_top_score >= a2_top_score else a2_name
+                parts.append(f"{elite} fields the higher-trained tributes")
+            # District record flavor
+            all_member_districts = {
+                tributes_map[tid].district
+                for tids in [alliance_members.get(a1, set()), alliance_members.get(a2, set())]
+                for tid in tids if tid in tributes_map
+            }
+            win_districts = [
+                d for d in sorted(all_member_districts)
+                if district_records.get(d) and district_records[d].wins
+            ]
+            if win_districts:
+                d = win_districts[0]
+                parts.append(f"District {d} has {district_records[d].wins} all-time {'victory' if district_records[d].wins == 1 else 'victories'} backing this fight")
+            desc = ". ".join(parts).capitalize() + "."
+            combined_kills = a1_kills + a2_kills
+            if combined_kills >= 4:
+                name = f"{a1_name} vs {a2_name}: War of Banners"
+            elif a1_vets or a2_vets:
+                name = f"{a1_name} vs {a2_name}: Experienced Hands"
+            else:
+                name = f"{a1_name} vs {a2_name}: Alliance Clash"
+
+        elif theme_type == "veterans":
+            vet_list = sorted(
+                [t for t in tributes_map.values() if t.times_played and t.times_played >= 1],
+                key=lambda t: (-(t.times_played or 0), -(t.training_score or 0)),
             )
-            desc = (
-                f"District {theme_key} has{wins_clause} something to prove."
-                f"{top8_clause}{score_clause} Back the district and let it carry you."
+            vet_names = " & ".join(t.name.split()[0] for t in vet_list[:3])
+            combined_kills = sum(t.kills for t in vet_list)
+            champs = [t for t in vet_list if t.sade_champion]
+            best_placement = min(
+                (t.highest_placement for t in vet_list if t.highest_placement), default=None
             )
-            name = (
-                f"District {theme_key}: Dynasty"
-                if dr and dr.wins and dr.wins >= 3
-                else f"District {theme_key} Double Down"
+            parts = [f"{vet_names} have been here before — arena experience money can't buy"]
+            if champs:
+                parts.append(f"{champs[0].name.split()[0]} is a former victor walking in with a target on their back")
+            if best_placement:
+                parts.append(f"best prior finish among the group: {best_placement}{_ordinal(best_placement)} place")
+            if combined_kills:
+                parts.append(f"{combined_kills} kills already this game across the returning class")
+            # Alliance context for vets
+            vet_alliances = {alliance_names[t.alliance_id] for t in vet_list if t.alliance_id and t.alliance_id in alliance_names}
+            if vet_alliances:
+                parts.append(f"running with: {', '.join(sorted(vet_alliances))}")
+            desc = ". ".join(parts).capitalize() + "."
+            max_times = max(t.times_played or 0 for t in vet_list) if vet_list else 0
+            if champs:
+                name = "The Victor's Return"
+            elif max_times >= 3:
+                name = "Grizzled Veterans"
+            elif len(vet_list) >= 4:
+                name = "The Returning Class"
+            else:
+                name = "Experience Counts"
+
+        else:  # kill_leaders
+            killers = sorted(
+                [t for t in tributes_map.values() if t.kills >= 2],
+                key=lambda t: (-t.kills, -(t.training_score or 0)),
             )
+            killer_names = " & ".join(t.name.split()[0] for t in killers[:3])
+            total_kills = sum(t.kills for t in killers)
+            parts = [f"{killer_names} have already drawn blood — these are the arena's most dangerous tributes"]
+            top_killer = killers[0] if killers else None
+            if top_killer:
+                dr = district_records.get(top_killer.district)
+                parts.append(
+                    f"{top_killer.name.split()[0]} leads with {top_killer.kills} kills"
+                    + (
+                        f", representing District {top_killer.district} "
+                        f"({dr.total_kills or 0} all-time kills from that district)"
+                        if dr and dr.total_kills else ""
+                    )
+                )
+            if len(killers) >= 2:
+                parts.append(f"{total_kills} combined kills between this group")
+            # Alliance context
+            killer_alliances = {
+                alliance_names[t.alliance_id]
+                for t in killers if t.alliance_id and t.alliance_id in alliance_names
+            }
+            if killer_alliances:
+                parts.append(f"hunting under: {', '.join(sorted(killer_alliances))}")
+            desc = ". ".join(parts).capitalize() + "."
+            if total_kills >= 8:
+                name = "Massacre in Progress"
+            elif total_kills >= 5:
+                name = "Blood on Their Hands"
+            else:
+                name = "The Killers' Column"
 
         tpl = ParlayTemplate(
             name=name, description=desc, source="AUTO",
