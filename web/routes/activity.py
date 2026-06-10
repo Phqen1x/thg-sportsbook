@@ -71,6 +71,7 @@ def _market_dict(m: Market, tributes: dict[int, Tribute] | None = None, bet_coun
         "ou_side": m.ou_side,
         "cashout_allowed": m.cashout_allowed,
         "cashout_rate": m.cashout_rate,
+        "odds_override": m.odds_override,
         "bet_count": bet_count,
     }
 
@@ -162,7 +163,8 @@ async def token(code: Annotated[str, Body(embed=True)]):
         access_token = tokens["access_token"]
         user_data = await discord_api.get_user(access_token)
         uid = int(user_data["id"])
-        is_admin = await discord_api.is_admin(uid)
+        member = await discord_api.get_member(uid)
+        is_admin = await discord_api.check_admin(member or {})
     except HTTPException:
         raise
     except Exception:
@@ -967,3 +969,121 @@ async def admin_tribute_victor(tribute_id: int, admin: SessionUser = Depends(bea
         await db.commit()
         name = t.name
     return {"ok": True, "message": f"{name} crowned Victor!"}
+
+
+@router.post("/admin/tribute/{tribute_id}/unkill")
+async def admin_tribute_unkill(tribute_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        t = await db.get(Tribute, tribute_id)
+        if not t or t.status == "ALIVE":
+            raise HTTPException(status_code=400, detail="Tribute not found or already alive.")
+        if t.killed_by_id:
+            killer = await db.get(Tribute, t.killed_by_id)
+            if killer:
+                killer.kills = max(0, (killer.kills or 1) - 1)
+        t.status = "ALIVE"
+        t.death_cause = None
+        t.placement = None
+        t.killed_by_id = None
+        await db.commit()
+        name = t.name
+    return {"ok": True, "message": f"{name} revived."}
+
+
+@router.post("/admin/market/{market_id}/reopen")
+async def admin_market_reopen(market_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        m = await db.get(Market, market_id)
+        if not m:
+            raise HTTPException(status_code=404, detail="Market not found.")
+        m.status = "CLOSED"
+        m.result = None
+        await db.commit()
+    return {"ok": True, "message": "Market reopened as Closed."}
+
+
+@router.post("/admin/market/{market_id}/set-odds")
+async def admin_market_set_odds(
+    market_id: int,
+    admin: SessionUser = Depends(bearer_admin),
+    odds: Annotated[int, Body(embed=True)] = -110,
+):
+    async with get_db() as db:
+        m = await db.get(Market, market_id)
+        if not m:
+            raise HTTPException(status_code=404, detail="Market not found.")
+        m.odds = odds
+        m.odds_override = True
+        await db.commit()
+    return {"ok": True, "message": f"Odds set to {odds:+d}."}
+
+
+@router.post("/admin/market/{market_id}/clear-override")
+async def admin_market_clear_override(market_id: int, admin: SessionUser = Depends(bearer_admin)):
+    from bot.cogs.admin import _recalculate_markets
+    async with get_db() as db:
+        m = await db.get(Market, market_id)
+        if not m:
+            raise HTTPException(status_code=404, detail="Market not found.")
+        m.odds_override = False
+        await _recalculate_markets(db)
+        await db.commit()
+    return {"ok": True, "message": "Override cleared and odds recalculated."}
+
+
+@router.post("/admin/markets/recalc")
+async def admin_markets_recalc(admin: SessionUser = Depends(bearer_admin)):
+    from bot.cogs.admin import _recalculate_markets
+    async with get_db() as db:
+        await _recalculate_markets(db)
+        await db.commit()
+    return {"ok": True, "message": "Odds recalculated."}
+
+
+@router.post("/admin/markets/bulk-close")
+async def admin_markets_bulk_close(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        markets = (await db.execute(select(Market).where(Market.status == "OPEN"))).scalars().all()
+        for m in markets:
+            m.status = "CLOSED"
+        await db.commit()
+        count = len(markets)
+    return {"ok": True, "message": f"Closed {count} open markets."}
+
+
+@router.post("/admin/chips/give-all")
+async def admin_chips_give_all(
+    admin: SessionUser = Depends(bearer_admin),
+    amount: Annotated[int, Body(embed=True)] = 0,
+):
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive.")
+    async with get_db() as db:
+        users = (await db.execute(select(User))).scalars().all()
+        for u in users:
+            u.chips += amount
+        await db.commit()
+        count = len(users)
+    return {"ok": True, "message": f"Gave {amount:,} chips to {count} players."}
+
+
+@router.post("/admin/chips/set")
+async def admin_chips_set(
+    admin: SessionUser = Depends(bearer_admin),
+    discord_id: Annotated[str, Body()] = "",
+    amount: Annotated[int, Body()] = 0,
+):
+    if amount < 0:
+        raise HTTPException(status_code=400, detail="Amount cannot be negative.")
+    try:
+        uid = int(discord_id.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Discord ID.")
+    async with get_db() as db:
+        db_user = await db.get(User, uid)
+        if not db_user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        db_user.chips = amount
+        await db.commit()
+        name = db_user.username
+    return {"ok": True, "message": f"Set {name} balance to {amount:,}."}

@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Markets — Capitol Sportsbook{% endblock %}
+{% block title %}Markets — Panem Sportsbook{% endblock %}
 
 {% block content %}
 <div class="page-header">
@@ -39,6 +39,52 @@
   <a href="/markets?status=resolved" class="btn btn-sm {% if status == 'resolved' %}btn-primary{% else %}btn-outline{% endif %}">Resolved</a>
   <a href="/markets?status=closed"   class="btn btn-sm {% if status == 'closed'   %}btn-primary{% else %}btn-outline{% endif %}">Closed</a>
 </div>
+
+{% if featured_parlays %}
+<div class="section-header" style="margin-top:.5rem">
+  <h2>Featured Parlays</h2>
+  <a href="/tail" class="btn btn-outline btn-sm">View All</a>
+</div>
+<div class="home-parlay-rail" style="margin-bottom:1rem">
+  {% for tpl in featured_parlays %}
+  <div class="home-parlay-card card">
+    <div class="home-parlay-head">
+      <span class="home-parlay-name">{{ tpl.name }}</span>
+      {% if tpl.difficulty %}
+      <span class="difficulty-badge difficulty-{{ tpl.difficulty.lower() }}">{{ tpl.difficulty }}</span>
+      {% endif %}
+    </div>
+    {% if tpl.description %}
+    <div class="text-dim home-parlay-desc">{{ tpl.description }}</div>
+    {% endif %}
+    <ul class="home-parlay-legs">
+      {% for leg in tpl.legs %}
+      <li>
+        <span class="text-dim" style="font-size:.8rem">{{ leg.label }}</span>
+        <span class="{% if leg.odds >= 0 %}text-pos{% else %}text-neg{% endif %} font-bold">
+          {{ leg.odds | fmt_odds }}
+        </span>
+      </li>
+      {% endfor %}
+    </ul>
+    <div class="home-parlay-footer">
+      {% if tpl.combined_odds is not none %}
+      <span class="home-parlay-odds {% if tpl.combined_odds >= 0 %}text-pos{% else %}text-neg{% endif %}">
+        {{ tpl.combined_odds | fmt_odds }}
+      </span>
+      {% else %}
+      <span class="text-dim">—</span>
+      {% endif %}
+      {% if user %}
+      <a href="/tail" class="btn btn-primary btn-sm">Tail</a>
+      {% else %}
+      <a href="/auth/login" class="btn btn-outline btn-sm">Login to Tail</a>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 
 <div class="card table-scroll">
   <table class="table" id="markets-table">

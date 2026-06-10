@@ -67,8 +67,10 @@ a:hover { color: var(--header-gold); }
   letter-spacing: 0.08em;
   text-decoration: none;
   white-space: nowrap;
+  display: flex; align-items: center; gap: .4rem;
 }
 .brand:hover { color: var(--text-gold); }
+.brand-logo { width: 22px; height: 22px; object-fit: contain; flex-shrink: 0; }
 
 .nav-links {
   display: flex;
@@ -296,6 +298,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 .badge-cashed-out { background: rgba(91,155,213,0.15); color: var(--cashed-out); }
 .badge-cashed_out { background: rgba(91,155,213,0.15); color: var(--cashed-out); }
 .badge-voided   { background: rgba(136,136,136,0.15);color: var(--voided); }
+.badge-override { background: rgba(255,152,0,0.15);  color: #ff9800; font-size:0.65rem; }
 
 .district-badge {
   display: inline-block;

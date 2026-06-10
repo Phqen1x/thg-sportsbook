@@ -42,6 +42,34 @@
   </div>
 </div>
 
+<div class="two-col mt-3">
+  <div class="card">
+    <div class="card-label">GIVE ALL PLAYERS</div>
+    <form method="post" action="/admin/chips/give-all" onsubmit="return confirm('Give chips to ALL players?')">
+      <div class="form-group">
+        <label class="form-label">Amount (per player)</label>
+        <input type="number" name="amount" class="form-control" min="1" value="500" required>
+      </div>
+      <button type="submit" class="btn btn-primary">Give to Everyone</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-label">SET BALANCE</div>
+    <form method="post" action="/admin/chips/set">
+      <div class="form-group">
+        <label class="form-label">Discord User ID</label>
+        <input type="text" name="discord_id" class="form-control" placeholder="123456789012345678" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label">New Balance</label>
+        <input type="number" name="amount" class="form-control" min="0" value="1000" required>
+      </div>
+      <button type="submit" class="btn btn-outline" onclick="return confirm('Set this exact balance?')">Set Balance</button>
+    </form>
+  </div>
+</div>
+
 <div class="section-header mt-3">
   <h2>All Players</h2>
 </div>
@@ -52,7 +80,7 @@
     </thead>
     <tbody>
       {% for u in users %}
-      <tr>
+      <tr style="cursor:pointer" onclick="fillChipId('{{ u.discord_id }}')" title="Click to fill ID fields">
         <td class="font-bold">{{ u.username }}</td>
         <td class="text-dim" style="font-size:0.8rem">{{ u.discord_id }}</td>
         <td class="text-gold font-bold">{{ u.chips | fmt_chips }}</td>
@@ -65,4 +93,12 @@
     </tbody>
   </table>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function fillChipId(id) {
+  document.querySelectorAll('input[name="discord_id"]').forEach(el => el.value = id);
+}
+</script>
 {% endblock %}

@@ -6,7 +6,7 @@
   <!-- %%BASE%% is rewritten server-side to /activity/ (standalone) or /.proxy/activity/ (in Discord)
        so every relative asset URL resolves through Discord's proxy. -->
   <base href="%%BASE%%">
-  <title>Capitol Sportsbook</title>
+  <title>Panem Sportsbook</title>
   <link rel="stylesheet" href="static/style.css?v=%%VERSION%%">
   <script>
     // Runtime config injected by web/app.py. proxy is "/.proxy" inside Discord, "" otherwise.
@@ -16,8 +16,8 @@
 <body>
   <div id="app">
     <div id="loading" class="loading">
-      <div class="loading-crest">⚔</div>
-      <div class="loading-text">Entering the Capitol…</div>
+      <div class="loading-crest"><img src="static/panem.png" alt="⚔" class="loading-logo"></div>
+      <div class="loading-text">Entering Panem…</div>
     </div>
   </div>
   <script type="module" src="static/app.js?v=%%VERSION%%"></script>

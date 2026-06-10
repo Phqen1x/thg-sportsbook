@@ -79,7 +79,7 @@ def _render_activity_index(in_discord: bool) -> HTMLResponse:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Capitol Sportsbook", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Panem Sportsbook", docs_url=None, redoc_url=None)
 
     templates = Jinja2Templates(directory=str(HERE / "templates"))
     templates.env.filters["fmt_odds"] = fmt_odds

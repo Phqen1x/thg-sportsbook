@@ -461,3 +461,11 @@ async def set_setting(key: str, value) -> None:
             row.value = json.dumps(value)
         else:
             session.add(GameSetting(key=key, value=json.dumps(value)))
+
+
+async def get_guild_setting(guild_id: int, key: str) -> str | None:
+    return await get_setting(f"{guild_id}:{key}")
+
+
+async def set_guild_setting(guild_id: int, key: str, value) -> None:
+    await set_setting(f"{guild_id}:{key}", value)

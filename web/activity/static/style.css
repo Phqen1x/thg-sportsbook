@@ -40,7 +40,7 @@ body {
   flex: 1; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: .75rem; text-align: center; padding: 2rem;
 }
-.loading-crest { font-size: 3rem; color: var(--header-gold); animation: pulse 1.6s ease-in-out infinite; }
+.loading-crest { font-size: 3rem; color: var(--header-gold); display: flex; align-items: center; justify-content: center; }
 .loading-text, .fatal p { color: var(--text-dim); font-family: 'Barlow Semi Condensed', sans-serif; }
 .loading-inline { padding: 2rem; text-align: center; color: var(--text-dim); }
 @keyframes pulse { 0%,100% { opacity: .4; } 50% { opacity: 1; } }
@@ -52,7 +52,9 @@ body {
   border-bottom: 1px solid var(--card-border);
   padding: .5rem .75rem; flex-wrap: wrap;
 }
-.brand { font-family: 'Barlow Semi Condensed', sans-serif; font-weight: 700; color: var(--header-gold); letter-spacing: .06em; font-size: .95rem; }
+.brand { font-family: 'Barlow Semi Condensed', sans-serif; font-weight: 700; color: var(--header-gold); letter-spacing: .06em; font-size: .95rem; display: flex; align-items: center; gap: .35rem; }
+.brand-logo { width: 20px; height: 20px; object-fit: contain; flex-shrink: 0; }
+.loading-logo { width: 3rem; height: 3rem; object-fit: contain; animation: pulse 1.6s ease-in-out infinite; }
 .tabs { display: flex; gap: .15rem; flex: 1; flex-wrap: wrap; overflow-x: auto; }
 .tabs a {
   color: var(--text-dim); text-decoration: none; font-weight: 600; font-size: .85rem;
@@ -60,7 +62,7 @@ body {
 }
 .tabs a:hover { color: var(--text-white); }
 .tabs a.active { color: var(--header-dark); background: var(--header-gold); }
-.me { display: flex; align-items: center; gap: .5rem; margin-left: auto; }
+.me { display: flex; align-items: center; gap: .5rem; margin-left: auto; text-decoration: none; cursor: pointer; }
 .chips { color: var(--text-gold); font-weight: 700; font-size: .85rem; }
 .avatar { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--card-border); }
 
@@ -146,6 +148,8 @@ body {
 .subtabs a { color: var(--text-dim); text-decoration: none; padding: .4rem .7rem; font-weight: 600; }
 .subtabs a.active { color: var(--header-gold); border-bottom: 2px solid var(--header-gold); }
 .admin-form { display: flex; flex-direction: column; gap: .5rem; margin-bottom: .6rem; }
+.admin-market-bar { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .6rem; }
+.card-label { font-size: .7rem; font-weight: 700; color: var(--text-dim); letter-spacing: .06em; margin-bottom: .25rem; }
 
 /* ── Buttons / inputs ────────────────────────────────────────────────────── */
 .btn {
@@ -262,6 +266,18 @@ body {
 .feat-parlay-desc { font-size: .78rem; }
 .feat-parlay-footer { display: flex; align-items: center; justify-content: space-between; margin-top: .25rem; }
 .feat-parlay-odds { font-weight: 700; font-size: 1rem; }
+
+/* ── Balance / profile ───────────────────────────────────────────────────── */
+.balance-layout { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; margin-bottom: .5rem; }
+.balance-chip-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .2rem; padding: 1rem .6rem; }
+.balance-chip-count { font-size: 2rem; font-weight: 800; color: var(--text-gold); line-height: 1; }
+.balance-stats-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+.balance-stats-table td { padding: .2rem .3rem; }
+.balance-stats-table td:last-child { text-align: right; font-weight: 700; }
+@media (max-width: 360px) {
+  .balance-layout { grid-template-columns: 1fr; }
+  .balance-chip-count { font-size: 1.6rem; }
+}
 
 /* ── Minimum touch targets ───────────────────────────────────────────────── */
 .btn { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; }

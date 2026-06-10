@@ -72,14 +72,14 @@ class SportsBookBot(commands.Bot):
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
             log.info(f"Slash commands synced to dev guild {config.DEV_GUILD_ID}")
-        else:
-            await self.tree.sync()
-            log.info("Slash commands synced globally")
+
+        await self.tree.sync()
+        log.info("Slash commands synced globally")
 
     async def on_ready(self) -> None:
         assert self.user is not None
         log.info(f"Logged in as {self.user} (ID: {self.user.id})")
-        log.info("Capitol Sportsbook is open for business.")
+        log.info("Panem Sportsbook is open for business.")
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.playing,

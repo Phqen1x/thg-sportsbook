@@ -1522,13 +1522,9 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
 # shows current prices. They're cleared on the next phase and removed leg-by-leg
 # as their markets resolve (see _resolve_market).
 
-_AUTO_PARLAY_SPECS = [
-    # Difficulty, Name, Description, Target Legs, Pool Key, Target Combined Prob
-    ("SAFE",     "🛡️ Safe Slip",        "The board's strongest favorites stacked for a steady payout.",  3, "fav", 0.35),
-    ("BALANCED", "⚖️ Balanced Builder",  "A spread of fair-priced markets for a healthy middle payout.",  3, "mid", 0.04),
-    ("LONGSHOT", "🎰 Longshot Lottery",  "Four longshots — slim odds of hitting, a huge payday if it does.", 4, "dog", 0.002),
-]
 AUTO_PARLAY_MAX_WAGER = 1_000
+_MIN_PARLAY_LEGS = 3
+_MAX_PARLAY_LEGS = 8
 
 
 def _parlay_prob(legs: list[Market]) -> float:
@@ -1540,62 +1536,55 @@ def _parlay_within_cap(legs: list[Market]) -> bool:
     return payout <= PARLAY_PAYOUT_CAP
 
 
-def _pick_conflict_free(
+def _pick_themed_legs(
     candidates: list[Market],
-    target: int,
+    max_legs: int = _MAX_PARLAY_LEGS,
+    min_legs: int = _MIN_PARLAY_LEGS,
     *,
-    prob_range: tuple[float, float] | None = None,
-    target_prob: float | None = None,
+    worst_odds_first: bool = False,
 ) -> list[Market]:
-    """Select mutually-compatible legs with optional probability bounds."""
-    best: list[Market] = []
-    best_distance: float | None = None
-    for start in range(len(candidates)):
+    """Greedily pick conflict-free, cap-safe legs.
+
+    By default sorts probability high→low (best odds first). Pass worst_odds_first=True
+    to pick the most difficult markets — used for LONGSHOT fallback.
+    """
+    sorted_cands = sorted(
+        candidates,
+        key=lambda m: implied_probability(m.odds),
+        reverse=not worst_odds_first,
+    )
+    for target in range(min(max_legs, len(sorted_cands)), min_legs - 1, -1):
         chosen: list[Market] = []
-        for m in candidates[start:]:
+        for m in sorted_cands:
             if _parlay_conflict(chosen, m) is not None:
                 continue
             chosen.append(m)
-            if len(chosen) < target:
-                continue
             if not _parlay_within_cap(chosen):
                 chosen.pop()
                 continue
-            prob = _parlay_prob(chosen)
-            if prob_range and not (prob_range[0] <= prob <= prob_range[1]):
-                chosen.pop()
-                continue
-            if target_prob is None:
-                return chosen
-            dist = abs(prob - target_prob)
-            if best_distance is None or dist < best_distance:
-                best = chosen.copy()
-                best_distance = dist
-            chosen.pop()
-    return best
-
-
-def _pick_auto_parlay(
-    candidates: list[Market],
-    target: int,
-    *,
-    prob_range: tuple[float, float] | None = None,
-    target_prob: float | None = None,
-) -> list[Market]:
-    for legs_target in range(target, 1, -1):
-        legs = _pick_conflict_free(
-            candidates,
-            legs_target,
-            prob_range=prob_range,
-            target_prob=target_prob,
-        )
-        if legs:
-            return legs
+            if len(chosen) == target:
+                break
+        if len(chosen) >= min_legs:
+            return chosen
     return []
 
 
-async def _generate_auto_parlays(session, phase_id: int | None) -> int:
-    """(Re)generate the three per-phase auto parlays. Returns how many were made."""
+def _dedup_markets(markets: list[Market]) -> list[Market]:
+    seen: set[int] = set()
+    result = []
+    for m in markets:
+        if m.id not in seen:
+            seen.add(m.id)
+            result.append(m)
+    return result
+
+
+async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) -> int:
+    """(Re)generate up to `count` themed auto parlays. Returns how many were made.
+
+    Each parlay is built around a central entity — one tribute, one alliance, or one
+    district — so every leg in the parlay is narratively coherent. Legs: 3–8.
+    """
     old = await session.execute(
         select(ParlayTemplate).where(ParlayTemplate.source == "AUTO")
     )
@@ -1605,28 +1594,205 @@ async def _generate_auto_parlays(session, phase_id: int | None) -> int:
 
     mkt_result = await session.execute(select(Market).where(Market.status == "OPEN"))
     open_markets = list(mkt_result.scalars().all())
-    if len(open_markets) < 2:
+    if len(open_markets) < _MIN_PARLAY_LEGS:
         return 0
 
-    by_prob = sorted(
-        open_markets, key=lambda m: implied_probability(m.odds), reverse=True
-    )
-    median = implied_probability(by_prob[len(by_prob) // 2].odds)
-    pools = {
-        "fav": by_prob,
-        "dog": list(reversed(by_prob)),
-        "mid": sorted(open_markets, key=lambda m: abs(implied_probability(m.odds) - median)),
-    }
+    # Load tribute/district/alliance context
+    tid_set: set[int] = set()
+    for m in open_markets:
+        if m.tribute_a_id:
+            tid_set.add(m.tribute_a_id)
+        if m.tribute_b_id:
+            tid_set.add(m.tribute_b_id)
 
-    created = 0
-    for difficulty, name, desc, target, pool_key, target_prob in _AUTO_PARLAY_SPECS:
-        legs = _pick_auto_parlay(
-            pools[pool_key],
-            min(target, len(open_markets)),
-            target_prob=target_prob,
+    tributes_map: dict[int, Tribute] = {}
+    if tid_set:
+        t_rows = await session.execute(select(Tribute).where(Tribute.id.in_(tid_set)))
+        tributes_map = {t.id: t for t in t_rows.scalars().all()}
+
+    districts = {t.district for t in tributes_map.values()}
+    district_records: dict[int, DistrictRecord] = {}
+    if districts:
+        dr_rows = await session.execute(
+            select(DistrictRecord).where(DistrictRecord.district.in_(districts))
         )
-        if len(legs) < 2:
+        district_records = {dr.district: dr for dr in dr_rows.scalars().all()}
+
+    alliance_ids = {t.alliance_id for t in tributes_map.values() if t.alliance_id}
+    alliance_names: dict[int, str] = {}
+    alliance_members: dict[int, set[int]] = {}
+    if alliance_ids:
+        a_rows = await session.execute(
+            select(Alliance).where(Alliance.id.in_(alliance_ids))
+        )
+        alliance_names = {a.id: a.name for a in a_rows.scalars().all()}
+        for t in tributes_map.values():
+            if t.alliance_id:
+                alliance_members.setdefault(t.alliance_id, set()).add(t.id)
+
+    # Build themed groupings: (theme_type, theme_key, candidate_markets)
+    groupings: list[tuple[str, int, list[Market]]] = []
+
+    # Tribute-centric: every market where this tribute appears on either side
+    by_tribute: dict[int, list[Market]] = {}
+    for m in open_markets:
+        for tid in (m.tribute_a_id, m.tribute_b_id):
+            if tid and tid in tributes_map:
+                by_tribute.setdefault(tid, []).append(m)
+    for tid, mkts in by_tribute.items():
+        deduped = _dedup_markets(mkts)
+        if len(deduped) >= _MIN_PARLAY_LEGS:
+            groupings.append(("tribute", tid, deduped))
+
+    # Alliance-centric: every market touching any member of this alliance
+    for aid, member_ids in alliance_members.items():
+        mkts = _dedup_markets([
+            m for m in open_markets
+            if m.tribute_a_id in member_ids or m.tribute_b_id in member_ids
+        ])
+        if len(mkts) >= _MIN_PARLAY_LEGS:
+            groupings.append(("alliance", aid, mkts))
+
+    # District-centric: every market touching any tribute from this district
+    for district in districts:
+        dist_tids = {t.id for t in tributes_map.values() if t.district == district}
+        mkts = _dedup_markets([
+            m for m in open_markets
+            if m.tribute_a_id in dist_tids or m.tribute_b_id in dist_tids
+        ])
+        if len(mkts) >= _MIN_PARLAY_LEGS:
+            groupings.append(("district", district, mkts))
+
+    if not groupings:
+        return 0
+
+    # Build exactly one parlay per difficulty tier by targeting leg count ranges:
+    #   SAFE:     2–4 legs, best available odds (probability high→low)
+    #   BALANCED: 4–6 legs, best available odds
+    #   LONGSHOT: 6–8 legs; fallback to worst-odds pick if not enough markets
+    _TIER_SPECS: list[tuple[str, int, int]] = [
+        ("SAFE",     2, 4),
+        ("BALANCED", 4, 6),
+        ("LONGSHOT", 6, 8),
+    ]
+
+    TierEntry = tuple[str, int, list[Market], str]  # theme_type, theme_key, legs, tier_name
+    selected: list[TierEntry] = []
+    used_leg_sets: set[frozenset[int]] = set()
+
+    for tier_name, min_l, max_l in _TIER_SPECS:
+        tier_cands: list[tuple[str, int, list[Market]]] = []
+        for theme_type, theme_key, mkts in groupings:
+            legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l)
+            if len(legs) >= min_l:
+                leg_key = frozenset(l.id for l in legs)
+                if leg_key not in used_leg_sets:
+                    tier_cands.append((theme_type, theme_key, legs))
+
+        # LONGSHOT fallback: no grouping has 6+ eligible markets — pick worst odds instead
+        if not tier_cands and tier_name == "LONGSHOT":
+            for theme_type, theme_key, mkts in groupings:
+                legs = _pick_themed_legs(
+                    mkts, max_legs=_MAX_PARLAY_LEGS, min_legs=_MIN_PARLAY_LEGS,
+                    worst_odds_first=True,
+                )
+                if len(legs) >= _MIN_PARLAY_LEGS:
+                    leg_key = frozenset(l.id for l in legs)
+                    if leg_key not in used_leg_sets:
+                        tier_cands.append((theme_type, theme_key, legs))
+
+        if not tier_cands:
             continue
+
+        # Among candidates for this tier, prefer more market-type diversity, then more legs
+        tier_cands.sort(key=lambda c: (len({m.type for m in c[2]}), len(c[2])), reverse=True)
+        best_type, best_key, best_legs = tier_cands[0]
+        selected.append((best_type, best_key, best_legs, tier_name))
+        used_leg_sets.add(frozenset(l.id for l in best_legs))
+
+    # Persist
+    created = 0
+    for theme_type, theme_key, legs, difficulty in selected:
+
+        if theme_type == "tribute":
+            t = tributes_map[theme_key]
+            fname = t.name.split()[0]
+            dr = district_records.get(t.district)
+            parts: list[str] = []
+            if t.sade_champion:
+                parts.append(f"{fname} has already worn the victor's crown — SADE experience the odds can't capture")
+            if t.times_played and t.times_played >= 2:
+                parts.append(f"{fname} has {t.times_played} prior games of experience")
+            elif t.times_played == 1:
+                parts.append(f"{fname} isn't new to this — one prior game under their belt")
+            if t.training_score and t.training_score >= 9:
+                parts.append(f"a training score of {t.training_score} puts them in elite territory")
+            elif t.training_score:
+                parts.append(f"training score: {t.training_score}")
+            if t.kills and t.kills >= 3:
+                parts.append(f"{t.kills} kills already makes {fname} one of the most dangerous in the arena")
+            elif t.kills:
+                parts.append(f"{t.kills} {'kill' if t.kills == 1 else 'kills'} this game")
+            if t.alliance_id and t.alliance_id in alliance_names:
+                parts.append(f"running with {alliance_names[t.alliance_id]}")
+            if dr and dr.wins:
+                parts.append(
+                    f"District {t.district} has {dr.wins} all-time "
+                    f"{'victory' if dr.wins == 1 else 'victories'}"
+                )
+            desc = ". ".join(parts).capitalize() + "." if parts else f"Everything riding on {fname}."
+            if t.sade_champion:
+                name = f"{fname}: Double Victor"
+            elif t.times_played and t.times_played >= 2:
+                name = f"{fname}: Veteran's Slate"
+            elif t.kills and t.kills >= 3:
+                name = f"{fname}: Blood Trail"
+            elif t.training_score and t.training_score >= 9:
+                name = f"{fname}: Top of the Class"
+            else:
+                name = f"All In on {fname}"
+
+        elif theme_type == "alliance":
+            aname = alliance_names.get(theme_key, "The Alliance")
+            member_tids = alliance_members.get(theme_key, set())
+            members = [tributes_map[tid] for tid in member_tids if tid in tributes_map]
+            names_str = " & ".join(t.name.split()[0] for t in members[:3])
+            combined_kills = sum(t.kills for t in members)
+            vets = [t for t in members if t.times_played]
+            parts = [f"{names_str} march under the same banner"]
+            if combined_kills:
+                parts.append(
+                    f"{combined_kills} combined {'kill' if combined_kills == 1 else 'kills'} between them"
+                )
+            if vets:
+                parts.append(f"{len(vets)} {'veteran' if len(vets) == 1 else 'veterans'} in the group")
+            desc = ". ".join(parts).capitalize() + "."
+            name = f"{aname} Solidarity"
+
+        else:  # district
+            dr = district_records.get(theme_key)
+            dist_tids = {t.id for t in tributes_map.values() if t.district == theme_key}
+            dist_tributes = [tributes_map[tid] for tid in dist_tids if tid in tributes_map]
+            wins_clause = (
+                f" {dr.wins} all-time {'victory' if dr.wins == 1 else 'victories'} and"
+                if dr and dr.wins else ""
+            )
+            score_count = sum(1 for t in dist_tributes if t.training_score)
+            score_sum = sum(t.training_score for t in dist_tributes if t.training_score)
+            score_clause = f" Average training score: {score_sum // score_count}." if score_count else ""
+            top8_clause = (
+                f" {dr.top8_finishes} top-8 finishes historically." if dr and dr.top8_finishes else ""
+            )
+            desc = (
+                f"District {theme_key} has{wins_clause} something to prove."
+                f"{top8_clause}{score_clause} Back the district and let it carry you."
+            )
+            name = (
+                f"District {theme_key}: Dynasty"
+                if dr and dr.wins and dr.wins >= 3
+                else f"District {theme_key} Double Down"
+            )
+
         tpl = ParlayTemplate(
             name=name, description=desc, source="AUTO",
             difficulty=difficulty, phase_id=phase_id,
@@ -1637,6 +1803,7 @@ async def _generate_auto_parlays(session, phase_id: int | None) -> int:
         for i, m in enumerate(legs):
             session.add(ParlayTemplateLeg(template_id=tpl.id, market_id=m.id, sort_order=i))
         created += 1
+
     return created
 
 
@@ -2941,7 +3108,7 @@ _ADMIN_PERMS = discord.Permissions(administrator=True)
 class AdminCog(commands.Cog):
     admin = app_commands.Group(
         name="admin",
-        description="Capitol Sportsbook admin commands",
+        description="Panem Sportsbook admin commands",
         default_permissions=_ADMIN_PERMS,
     )
     tribute = app_commands.Group(
@@ -7107,16 +7274,22 @@ class AdminCog(commands.Cog):
 
     @parlay.command(
         name="generate",
-        description="Regenerate the three auto featured parlays from open markets now",
+        description="Regenerate auto featured parlays from open markets now",
     )
+    @app_commands.describe(count="How many themed parlays to generate (default 3, max 10)")
     @is_admin()
-    async def parlay_generate(self, interaction: discord.Interaction) -> None:
+    async def parlay_generate(
+        self,
+        interaction: discord.Interaction,
+        count: int = 3,
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
+        count = max(1, min(count, 10))
         phase_raw = await get_setting("current_phase_id")
         phase_id = json.loads(phase_raw) if phase_raw else None
         async with get_session() as session:
-            made = await _generate_auto_parlays(session, phase_id)
+            made = await _generate_auto_parlays(session, phase_id, count=count)
         if made:
             await interaction.followup.send(
                 f"Generated **{made}** featured parlay(s) from the open markets.",
@@ -7124,7 +7297,7 @@ class AdminCog(commands.Cog):
             )
         else:
             await interaction.followup.send(
-                "Not enough open markets to build auto parlays right now.", ephemeral=True
+                "Not enough open markets to build themed parlays right now.", ephemeral=True
             )
 
     # ── PHASE COMMANDS ────────────────────────────────────────────────────────
@@ -8266,6 +8439,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         from bot import config as cfg
+        from bot.database.engine import get_guild_setting
 
         embed = discord.Embed(
             title="📢 CAPITOL ANNOUNCEMENT",
@@ -8273,17 +8447,85 @@ class AdminCog(commands.Cog):
             color=0xC9A227,
         )
         embed.set_footer(
-            text="Capitol Sportsbook — May the odds be ever in your favor."
+            text="Panem Sportsbook — May the odds be ever in your favor."
         )
 
-        if cfg.ANNOUNCEMENT_CHANNEL_ID:
-            channel = interaction.guild.get_channel(cfg.ANNOUNCEMENT_CHANNEL_ID)
+        channel_id = None
+        if interaction.guild_id:
+            raw = await get_guild_setting(interaction.guild_id, "announcement_channel_id")
+            if raw:
+                channel_id = json.loads(raw)
+        if channel_id is None:
+            channel_id = cfg.ANNOUNCEMENT_CHANNEL_ID
+
+        if channel_id:
+            channel = interaction.guild.get_channel(channel_id)
             if channel:
                 await channel.send(embed=embed)
                 await interaction.followup.send("Announcement posted.", ephemeral=True)
                 return
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @settings.command(
+        name="announce_channel",
+        description="Set the channel where /admin settings announce posts go",
+    )
+    @app_commands.describe(
+        channel="Channel for Capitol announcements (leave empty to clear)",
+    )
+    @is_admin()
+    async def announce_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.database.engine import set_guild_setting
+        if channel is None:
+            await set_guild_setting(interaction.guild_id, "announcement_channel_id", None)
+            await interaction.followup.send(
+                "Cleared the announcement channel. Announcements will now send as "
+                "an ephemeral reply unless ANNOUNCEMENT_CHANNEL_ID is set in the env.",
+                ephemeral=True,
+            )
+            return
+        await set_guild_setting(interaction.guild_id, "announcement_channel_id", channel.id)
+        await interaction.followup.send(
+            f"Capitol announcements will now be posted in {channel.mention}.",
+            ephemeral=True,
+        )
+
+    @settings.command(
+        name="admin_role",
+        description="Set the role that can use admin commands on this server",
+    )
+    @app_commands.describe(
+        role="Role to grant admin access (leave empty to clear and rely on server Administrator permission)",
+    )
+    @is_admin()
+    async def admin_role(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.database.engine import set_guild_setting
+        if role is None:
+            await set_guild_setting(interaction.guild_id, "admin_role_id", None)
+            await interaction.followup.send(
+                "Cleared the admin role. Only users with the server Administrator "
+                "permission can use admin commands (or ADMIN_ROLE_ID env var if set).",
+                ephemeral=True,
+            )
+            return
+        await set_guild_setting(interaction.guild_id, "admin_role_id", role.id)
+        await interaction.followup.send(
+            f"Admin commands are now accessible to members with the {role.mention} role.",
+            ephemeral=True,
+        )
 
     @settings.command(
         name="withdraw_channel",
@@ -8300,15 +8542,16 @@ class AdminCog(commands.Cog):
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
+        from bot.database.engine import set_guild_setting
         if channel is None:
-            await set_setting("withdraw_channel_id", None)
+            await set_guild_setting(interaction.guild_id, "withdraw_channel_id", None)
             await interaction.followup.send(
                 "Cleared the withdraw/deposit channel. Requests now fall back to "
                 "the WITHDRAW_CHANNEL_ID env var (if set).",
                 ephemeral=True,
             )
             return
-        await set_setting("withdraw_channel_id", channel.id)
+        await set_guild_setting(interaction.guild_id, "withdraw_channel_id", channel.id)
         await interaction.followup.send(
             f"Withdraw/deposit requests will now be posted in {channel.mention}.",
             ephemeral=True,

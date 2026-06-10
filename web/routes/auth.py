@@ -40,7 +40,10 @@ async def callback(code: str | None = None, state: str | None = None, error: str
         tokens = await discord_api.exchange_code(code)
         user_data = await discord_api.get_user(tokens["access_token"])
         uid = int(user_data["id"])
-        admin = await discord_api.is_admin(uid)
+        member = await discord_api.get_member(uid)
+        if member is None:
+            return RedirectResponse("/?error=You+must+be+a+server+member+to+log+in.")
+        admin = await discord_api.check_admin(member)
         user = SessionUser(
             discord_id=uid,
             username=user_data.get("global_name") or user_data.get("username", "Unknown"),

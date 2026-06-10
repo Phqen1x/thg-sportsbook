@@ -38,6 +38,11 @@
               <button class="btn btn-sm btn-gold">Crown</button>
             </form>
             {% endif %}
+            {% if t.status == 'DEAD' %}
+            <form method="post" action="/admin/tributes/{{ t.id }}/unkill" onsubmit="return confirm('Revive {{ t.name }}? This will revert their kill record.')">
+              <button class="btn btn-sm btn-outline">Unkill</button>
+            </form>
+            {% endif %}
           </div>
         </td>
       </tr>

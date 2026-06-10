@@ -19,17 +19,17 @@ class ActivityCog(commands.Cog):
 
     @app_commands.command(
         name="play",
-        description="Open the Capitol Sportsbook Activity — markets, odds, bets & parlays.",
+        description="Open the Panem Sportsbook Activity — markets, odds, bets & parlays.",
     )
     async def play(self, interaction: discord.Interaction) -> None:
         embed = discord.Embed(
-            title="⚔ Capitol Sportsbook",
+            title="⚔ Panem Sportsbook",
             description=(
-                "Launch the **Capitol Sportsbook** Activity to browse markets and odds, "
+                "Launch the **Panem Sportsbook** Activity to browse markets and odds, "
                 "place bets and parlays, tail public slips, and watch the leaderboard — "
                 "all without leaving Discord.\n\n"
                 "**To open it:** join a voice channel, click the **Activities** (rocket) "
-                "button, and pick **Capitol Sportsbook**."
+                "button, and pick **Panem Sportsbook**."
             ),
             color=0xC9A227,
         )

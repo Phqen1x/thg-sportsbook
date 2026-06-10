@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{% block title %}Capitol Sportsbook{% endblock %}</title>
+  <title>{% block title %}Panem Sportsbook{% endblock %}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -13,16 +13,16 @@
 <body>
 
 <nav class="navbar">
-  <a href="/" class="brand">⚔ CAPITOL SPORTSBOOK</a>
+  <a href="/" class="brand"><img src="/static/panem.png" alt="" class="brand-logo"> PANEM SPORTSBOOK</a>
   <div class="nav-links">
     <a href="/markets" {% if request.url.path == '/markets' %}class="active"{% endif %}>Markets</a>
     <a href="/tributes" {% if request.url.path == '/tributes' %}class="active"{% endif %}>Tributes</a>
     <a href="/leaderboard" {% if request.url.path == '/leaderboard' %}class="active"{% endif %}>Leaderboard</a>
+    <a href="/tail" {% if request.url.path == '/tail' %}class="active"{% endif %}>Parlays</a>
     {% if user %}
       <a href="/balance" {% if request.url.path == '/balance' %}class="active"{% endif %}>Balance</a>
       <a href="/my-bets" {% if request.url.path == '/my-bets' %}class="active"{% endif %}>My Bets</a>
       <a href="/parlay" {% if request.url.path == '/parlay' %}class="active"{% endif %}>Parlay</a>
-      <a href="/tail" {% if request.url.path == '/tail' %}class="active"{% endif %}>Tail</a>
       {% if user.is_admin %}
         <a href="/admin" class="nav-admin {% if request.url.path.startswith('/admin') %}active{% endif %}">Admin</a>
       {% endif %}
@@ -49,7 +49,7 @@
 </main>
 
 <footer class="footer">
-  <span>Capitol Sportsbook &mdash; May the odds be ever in your favor.</span>
+  <span>Panem Sportsbook &mdash; May the odds be ever in your favor.</span>
 </footer>
 
 <script src="/static/app.js?v={{ static_v }}"></script>

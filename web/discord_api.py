@@ -53,20 +53,39 @@ async def get_user(access_token: str) -> dict:
         return r.json()
 
 
-async def get_member_roles(user_id: int) -> list[int]:
+async def get_member(user_id: int) -> dict | None:
+    """Return the guild member dict, or None if not a member. Returns {} when no GUILD_ID is set."""
     if not config.GUILD_ID:
-        return []
+        return {}
     async with httpx.AsyncClient() as c:
         r = await c.get(
             f"{DISCORD_API}/guilds/{config.GUILD_ID}/members/{user_id}",
             headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
         )
-        if r.status_code != 200:
-            return []
-        return [int(x) for x in r.json().get("roles", [])]
+        return r.json() if r.status_code == 200 else None
 
 
-async def is_admin(user_id: int) -> bool:
-    if not config.ADMIN_ROLE_ID:
+async def check_admin(member: dict) -> bool:
+    """Check admin status from a pre-fetched member dict (see get_member).
+
+    Uses ADMIN_ROLE_ID if configured; otherwise falls back to the server
+    Administrator permission bit — one extra API call in that case.
+    """
+    if not config.GUILD_ID:
         return False
-    return config.ADMIN_ROLE_ID in await get_member_roles(user_id)
+    member_role_ids = {int(x) for x in member.get("roles", [])}
+    if config.ADMIN_ROLE_ID:
+        return config.ADMIN_ROLE_ID in member_role_ids
+    async with httpx.AsyncClient() as c:
+        roles_r = await c.get(
+            f"{DISCORD_API}/guilds/{config.GUILD_ID}/roles",
+            headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
+        )
+        if roles_r.status_code != 200:
+            return False
+        ADMINISTRATOR = 0x8
+        for role in roles_r.json():
+            if int(role["id"]) in member_role_ids:
+                if int(role["permissions"]) & ADMINISTRATOR:
+                    return True
+        return False

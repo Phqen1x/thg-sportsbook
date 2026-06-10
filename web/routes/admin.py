@@ -301,6 +301,24 @@ async def tribute_kill(
     return _redirect("/admin/tributes", msg=f"{t.name}+has+been+eliminated.")
 
 
+@router.post("/tributes/{tribute_id}/unkill")
+async def tribute_unkill(tribute_id: int, user: SessionUser = Depends(require_admin)):
+    async with get_db() as db:
+        t = await db.get(Tribute, tribute_id)
+        if not t or t.status == "ALIVE":
+            return _redirect("/admin/tributes", error="Tribute+not+found+or+already+alive.")
+        if t.killed_by_id:
+            killer = await db.get(Tribute, t.killed_by_id)
+            if killer:
+                killer.kills = max(0, (killer.kills or 1) - 1)
+        t.status = "ALIVE"
+        t.death_cause = None
+        t.placement = None
+        t.killed_by_id = None
+        await db.commit()
+    return _redirect("/admin/tributes", msg=f"{t.name}+revived.")
+
+
 @router.post("/tributes/{tribute_id}/victor")
 async def tribute_victor(tribute_id: int, user: SessionUser = Depends(require_admin)):
     async with get_db() as db:
@@ -408,6 +426,26 @@ async def market_create(
     return _redirect("/admin/markets", msg="Market+created.")
 
 
+@router.post("/markets/recalc")
+async def market_recalc(user: SessionUser = Depends(require_admin)):
+    from bot.cogs.admin import _recalculate_markets
+    async with get_db() as db:
+        await _recalculate_markets(db)
+        await db.commit()
+    return _redirect("/admin/markets", msg="Odds+recalculated.")
+
+
+@router.post("/markets/bulk-close")
+async def market_bulk_close(user: SessionUser = Depends(require_admin)):
+    async with get_db() as db:
+        markets = (await db.execute(select(Market).where(Market.status == "OPEN"))).scalars().all()
+        for m in markets:
+            m.status = "CLOSED"
+        await db.commit()
+        count = len(markets)
+    return _redirect("/admin/markets", msg=f"Closed+{count}+open+markets.")
+
+
 @router.post("/markets/{market_id}/open")
 async def market_open(market_id: int, user: SessionUser = Depends(require_admin)):
     async with get_db() as db:
@@ -428,6 +466,47 @@ async def market_close(market_id: int, user: SessionUser = Depends(require_admin
         m.status = "CLOSED"
         await db.commit()
     return _redirect("/admin/markets", msg="Market+closed.")
+
+
+@router.post("/markets/{market_id}/reopen")
+async def market_reopen(market_id: int, user: SessionUser = Depends(require_admin)):
+    async with get_db() as db:
+        m = await db.get(Market, market_id)
+        if not m:
+            return _redirect("/admin/markets", error="Market+not+found.")
+        m.status = "CLOSED"
+        m.result = None
+        await db.commit()
+    return _redirect("/admin/markets", msg="Market+reopened+as+Closed.")
+
+
+@router.post("/markets/{market_id}/set-odds")
+async def market_set_odds(
+    market_id: int,
+    user: SessionUser = Depends(require_admin),
+    odds: Annotated[int, Form()] = -110,
+):
+    async with get_db() as db:
+        m = await db.get(Market, market_id)
+        if not m:
+            return _redirect("/admin/markets", error="Market+not+found.")
+        m.odds = odds
+        m.odds_override = True
+        await db.commit()
+    return _redirect("/admin/markets", msg=f"Odds+set+to+{odds:+d}.")
+
+
+@router.post("/markets/{market_id}/clear-override")
+async def market_clear_override(market_id: int, user: SessionUser = Depends(require_admin)):
+    from bot.cogs.admin import _recalculate_markets
+    async with get_db() as db:
+        m = await db.get(Market, market_id)
+        if not m:
+            return _redirect("/admin/markets", error="Market+not+found.")
+        m.odds_override = False
+        await _recalculate_markets(db)
+        await db.commit()
+    return _redirect("/admin/markets", msg="Override+cleared+and+odds+recalculated.")
 
 
 @router.post("/markets/{market_id}/resolve")
@@ -622,6 +701,43 @@ async def chips_take(
         db_user.chips = max(0, db_user.chips - amount)
         await db.commit()
     return _redirect("/admin/chips", msg=f"Took+{amount:,}+chips+from+{db_user.username}.")
+
+
+@router.post("/chips/give-all")
+async def chips_give_all(
+    user: SessionUser = Depends(require_admin),
+    amount: Annotated[int, Form()] = 0,
+):
+    if amount <= 0:
+        return _redirect("/admin/chips", error="Amount+must+be+positive.")
+    async with get_db() as db:
+        users = (await db.execute(select(User))).scalars().all()
+        for u in users:
+            u.chips += amount
+        await db.commit()
+        count = len(users)
+    return _redirect("/admin/chips", msg=f"Gave+{amount:,}+chips+to+{count}+players.")
+
+
+@router.post("/chips/set")
+async def chips_set(
+    user: SessionUser = Depends(require_admin),
+    discord_id: Annotated[str, Form()] = "",
+    amount: Annotated[int, Form()] = 0,
+):
+    if amount < 0:
+        return _redirect("/admin/chips", error="Amount+cannot+be+negative.")
+    async with get_db() as db:
+        try:
+            uid = int(discord_id.strip())
+        except ValueError:
+            return _redirect("/admin/chips", error="Invalid+Discord+ID.")
+        db_user = await db.get(User, uid)
+        if not db_user:
+            return _redirect("/admin/chips", error="User+not+found.")
+        db_user.chips = amount
+        await db.commit()
+    return _redirect("/admin/chips", msg=f"Set+{db_user.username}+balance+to+{amount:,}.")
 
 
 # ── Settings ───────────────────────────────────────────────────────────────────

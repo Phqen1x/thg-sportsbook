@@ -110,15 +110,15 @@ function renderShell() {
   if (ME?.is_admin) tabs.push(["admin", "Admin"]);
   document.getElementById("app").innerHTML = `
     <header class="topbar">
-      <div class="brand">⚔ CAPITOL</div>
+      <div class="brand"><img src="static/panem.png" alt="" class="brand-logo"> PANEM</div>
       <nav class="tabs" id="tabs">
         ${tabs.map(([id, label]) =>
           `<a href="${location.pathname}${location.search}#${id}" data-tab="${id}">${label}</a>`).join("")}
       </nav>
-      <div class="me">
+      <a href="${location.pathname}${location.search}#balance" class="me">
         <span id="balance" class="chips">${fmtChips(ME?.chips)} chips</span>
         <img class="avatar" src="${esc(ME?.avatar_url || "")}" alt="">
-      </div>
+      </a>
     </header>
     <main id="view" class="view"></main>`;
   window.addEventListener("hashchange", route);
@@ -132,6 +132,7 @@ const VIEWS = {
   parlay: viewParlay,
   tail: viewTail,
   admin: viewAdmin,
+  balance: viewBalance,
 };
 
 async function route() {
@@ -166,9 +167,12 @@ function marketCard(m, { actions = "member" } = {}) {
       <button class="btn btn-outline" data-act="add-parlay" data-id="${m.id}">+ Parlay</button>`;
   } else if (actions === "admin") {
     buttons = `
-      ${m.status !== "OPEN" ? `<button class="btn btn-outline" data-act="m-open" data-id="${m.id}">Open</button>` : ""}
+      ${m.status === "CLOSED" ? `<button class="btn btn-outline" data-act="m-open" data-id="${m.id}">Open</button>` : ""}
       ${m.status === "OPEN" ? `<button class="btn btn-outline" data-act="m-close" data-id="${m.id}">Close</button>` : ""}
-      ${m.status !== "RESOLVED" ? `<button class="btn btn-primary" data-act="m-resolve" data-id="${m.id}">Resolve</button>` : ""}`;
+      ${m.status === "RESOLVED" ? `<button class="btn btn-outline" data-act="m-reopen" data-id="${m.id}">Reopen</button>` : ""}
+      ${m.status !== "RESOLVED" ? `<button class="btn btn-primary" data-act="m-resolve" data-id="${m.id}">Resolve</button>` : ""}
+      ${m.status !== "RESOLVED" ? `<button class="btn btn-outline" data-act="m-set-odds" data-id="${m.id}" data-odds="${m.odds}">Set Odds</button>` : ""}
+      ${m.odds_override ? `<button class="btn btn-outline" data-act="m-clear-override" data-id="${m.id}" title="Clear manual odds override">Unlock</button>` : ""}`;
   }
   return `
     <div class="card market-card">
@@ -505,6 +509,55 @@ async function viewTail(view) {
     })));
 }
 
+// ── Views: Balance / profile ───────────────────────────────────────────────────
+
+async function viewBalance(view) {
+  const [meData, betsData] = await Promise.all([api("/me"), api("/my-bets")]);
+  ME = { ...ME, ...meData };
+
+  const straight = betsData.straight_bets;
+  const parlays  = betsData.parlays;
+  const resolved = straight.filter((b) => b.status !== "PENDING" && b.status !== "VOIDED");
+  const wonCount = resolved.filter((b) => b.status === "WON").length;
+  const winRate  = resolved.length ? `${((wonCount / resolved.length) * 100).toFixed(1)}%` : "—";
+  const roi      = meData.roi ?? 0;
+
+  const activity = [
+    ...straight.map((b) => ({ type: "STRAIGHT", wager: b.wager, status: b.status, date: b.placed_at })),
+    ...parlays.map((p)  => ({ type: "PARLAY",   wager: p.total_wager, status: p.status, date: p.placed_at })),
+  ].sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 15);
+
+  view.innerHTML = `
+    <h2 class="section-title">Your Balance</h2>
+    <div class="balance-layout">
+      <div class="card balance-chip-card">
+        <div class="balance-chip-count">${fmtChips(meData.chips)}</div>
+        <div class="dim">chips</div>
+      </div>
+      <div class="card">
+        <table class="balance-stats-table">
+          <tr><td class="dim">Total Wagered</td><td class="chips">${fmtChips(meData.total_wagered)}</td></tr>
+          <tr><td class="dim">Total Won</td><td class="odds-pos">${fmtChips(meData.total_won)}</td></tr>
+          <tr><td class="dim">ROI</td><td class="${roi >= 0 ? "odds-pos" : "odds-neg"}">${roi >= 0 ? "+" : ""}${roi}%</td></tr>
+          <tr><td class="dim">Straight Bets</td><td>${straight.length}</td></tr>
+          <tr><td class="dim">Parlays</td><td>${parlays.length}</td></tr>
+          <tr><td class="dim">Win Rate</td><td>${winRate}</td></tr>
+        </table>
+      </div>
+    </div>
+    <h2 class="section-title">Recent Activity</h2>
+    <div class="list">
+      ${activity.length ? activity.map((a) => `
+        <div class="card bet-row">
+          <span class="badge">${esc(a.type)}</span>
+          <div class="bet-main">
+            <span class="dim">${fmtChips(a.wager)} chips wagered</span>
+          </div>
+          <span class="status status-${esc(a.status.toLowerCase())}">${esc(a.status)}</span>
+        </div>`).join("") : `<div class="empty">No activity yet.</div>`}
+    </div>`;
+}
+
 // ── Views: Admin (live-game ops) ───────────────────────────────────────────────
 
 async function viewAdmin(view) {
@@ -525,30 +578,62 @@ async function viewAdmin(view) {
 }
 
 async function adminMarkets(body) {
-  const data   = await api(`/markets?status=open`);
-  const closed = await api(`/markets?status=closed`);
-  const all = [...data.markets, ...closed.markets];
-  body.innerHTML = `<div class="list">
-    ${all.length ? all.map((m) => marketCard(m, { actions: "admin" })).join("") : `<div class="empty">No markets.</div>`}
-  </div>`;
+  const [openData, closedData, resolvedData] = await Promise.all([
+    api(`/markets?status=open`),
+    api(`/markets?status=closed`),
+    api(`/markets?status=resolved`),
+  ]);
+  const all = [...openData.markets, ...closedData.markets, ...resolvedData.markets];
+  body.innerHTML = `
+    <div class="admin-market-bar">
+      <button class="btn btn-outline btn-sm" id="m-recalc">Recalculate All Odds</button>
+      <button class="btn btn-outline btn-sm" id="m-bulk-close">Bulk Close All Open</button>
+    </div>
+    <div class="list">
+      ${all.length ? all.map((m) => marketCard(m, { actions: "admin" })).join("") : `<div class="empty">No markets.</div>`}
+    </div>`;
+  $("#m-recalc", body).addEventListener("click", async () => {
+    if (!confirm("Recalculate odds on all non-overridden markets?")) return;
+    await doAction("/admin/markets/recalc", "POST");
+  });
+  $("#m-bulk-close", body).addEventListener("click", async () => {
+    if (!confirm("Close all open markets?")) return;
+    await doAction("/admin/markets/bulk-close", "POST");
+  });
   body.querySelectorAll('[data-act="m-open"]').forEach((b) =>
     b.addEventListener("click", () => doAction(`/admin/market/${b.dataset.id}/open`, "POST")));
   body.querySelectorAll('[data-act="m-close"]').forEach((b) =>
     b.addEventListener("click", () => doAction(`/admin/market/${b.dataset.id}/close`, "POST")));
+  body.querySelectorAll('[data-act="m-reopen"]').forEach((b) =>
+    b.addEventListener("click", () => {
+      if (!confirm("Reopen this resolved market?")) return;
+      doAction(`/admin/market/${b.dataset.id}/reopen`, "POST");
+    }));
   body.querySelectorAll('[data-act="m-resolve"]').forEach((b) =>
     b.addEventListener("click", () => openResolveModal(Number(b.dataset.id))));
+  body.querySelectorAll('[data-act="m-set-odds"]').forEach((b) =>
+    b.addEventListener("click", () => openSetOddsModal(Number(b.dataset.id), Number(b.dataset.odds))));
+  body.querySelectorAll('[data-act="m-clear-override"]').forEach((b) =>
+    b.addEventListener("click", () => doAction(`/admin/market/${b.dataset.id}/clear-override`, "POST")));
 }
 
 async function adminChips(body) {
   const { users } = await api("/admin/users");
   body.innerHTML = `
     <div class="card admin-form">
-      <input id="chip-id" class="input" placeholder="Discord user ID">
+      <div class="card-label">GIVE / TAKE</div>
+      <input id="chip-id" class="input" placeholder="Discord user ID (click row below)">
       <input id="chip-amt" class="input" type="number" min="1" placeholder="Amount">
       <div class="row-buttons">
         <button class="btn btn-primary" id="chip-give">Give</button>
         <button class="btn btn-outline" id="chip-take">Take</button>
+        <button class="btn btn-outline" id="chip-set">Set Balance</button>
       </div>
+    </div>
+    <div class="card admin-form">
+      <div class="card-label">GIVE ALL PLAYERS</div>
+      <input id="chip-all-amt" class="input" type="number" min="1" placeholder="Amount per player" value="500">
+      <button class="btn btn-primary" id="chip-give-all">Give to Everyone</button>
     </div>
     <div class="list">
       ${users.map((u) => `
@@ -560,18 +645,32 @@ async function adminChips(body) {
     </div>`;
   body.querySelectorAll(".lb-row").forEach((r) =>
     r.addEventListener("click", () => { $("#chip-id", body).value = r.dataset.uid; }));
-  const send = async (path) => {
+  const send = async (path, extraBody) => {
     const discord_id = $("#chip-id", body).value.trim();
     const amount = Number($("#chip-amt", body).value);
     if (!discord_id || !amount) return toast("Enter a user ID and amount.", "error");
     try {
-      const r = await api(path, { method: "POST", body: { discord_id, amount } });
+      const r = await api(path, { method: "POST", body: { discord_id, amount, ...extraBody } });
       toast(r.message);
       adminChips(body);
     } catch (e) { toast(e.message, "error"); }
   };
   $("#chip-give", body).addEventListener("click", () => send("/admin/chips/give"));
   $("#chip-take", body).addEventListener("click", () => send("/admin/chips/take"));
+  $("#chip-set", body).addEventListener("click", () => {
+    if (!confirm("Set this exact chip balance?")) return;
+    send("/admin/chips/set");
+  });
+  $("#chip-give-all", body).addEventListener("click", async () => {
+    const amount = Number($("#chip-all-amt", body).value);
+    if (!amount || amount < 1) return toast("Enter a valid amount.", "error");
+    if (!confirm(`Give ${amount.toLocaleString()} chips to all ${users.length} players?`)) return;
+    try {
+      const r = await api("/admin/chips/give-all", { method: "POST", body: { amount } });
+      toast(r.message);
+      adminChips(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
 }
 
 async function adminTributes(body) {
@@ -589,6 +688,10 @@ async function adminTributes(body) {
             <button class="btn btn-outline btn-sm" data-act="kill"   data-id="${t.id}" data-name="${esc(t.name)}">Eliminate</button>
             <button class="btn btn-primary btn-sm" data-act="victor" data-id="${t.id}" data-name="${esc(t.name)}">Victor</button>
           </div>` : ""}
+        ${t.status === "DEAD" ? `
+          <div class="row-buttons">
+            <button class="btn btn-outline btn-sm" data-act="unkill" data-id="${t.id}" data-name="${esc(t.name)}">Unkill</button>
+          </div>` : ""}
       </div>`).join("")}
   </div>`;
   body.querySelectorAll('[data-act="kill"]').forEach((b) =>
@@ -597,6 +700,11 @@ async function adminTributes(body) {
     b.addEventListener("click", async () => {
       if (!confirm(`Crown ${b.dataset.name} as Victor?`)) return;
       await doAction(`/admin/tribute/${b.dataset.id}/victor`, "POST");
+    }));
+  body.querySelectorAll('[data-act="unkill"]').forEach((b) =>
+    b.addEventListener("click", async () => {
+      if (!confirm(`Revive ${b.dataset.name}? This will revert their kill record.`)) return;
+      await doAction(`/admin/tribute/${b.dataset.id}/unkill`, "POST");
     }));
 }
 
@@ -722,6 +830,28 @@ function openWagerModal({ title, onSubmit, after }) {
       overlay.remove();
       await refreshMe();
       if (after) after();
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+
+function openSetOddsModal(marketId, currentOdds) {
+  const overlay = modal(`
+    <h3>Set Manual Odds</h3>
+    <div class="dim">Locks odds — calculator will not override until cleared.</div>
+    <input id="so-odds" class="input" type="number" value="${currentOdds}" placeholder="e.g. -110 or +200">
+    <div class="row-buttons">
+      <button class="btn btn-primary" id="so-go">Set Odds</button>
+      <button class="btn btn-outline" id="so-cancel">Cancel</button>
+    </div>`);
+  $("#so-cancel", overlay).addEventListener("click", () => overlay.remove());
+  $("#so-go", overlay).addEventListener("click", async () => {
+    const odds = Number($("#so-odds", overlay).value);
+    if (!odds) return toast("Enter valid odds.", "error");
+    try {
+      const r = await api(`/admin/market/${marketId}/set-odds`, { method: "POST", body: { odds } });
+      toast(r.message);
+      overlay.remove();
+      route();
     } catch (e) { toast(e.message, "error"); }
   });
 }

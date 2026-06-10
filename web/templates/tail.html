@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Tail Board — Capitol Sportsbook{% endblock %}
+{% block title %}Tail Board — Panem Sportsbook{% endblock %}
 
 {% block content %}
 <div class="page-header">
@@ -43,6 +43,7 @@
       </tbody>
     </table>
 
+    {% if user and db_user %}
     <form method="post" action="/tail/{{ tpl.id }}" class="tail-form mt-1">
       <div class="form-group">
         <label class="form-label">Wager (chips)</label>
@@ -53,6 +54,11 @@
         <div class="text-dim" style="font-size:0.8rem">Balance: {{ db_user.chips | fmt_chips }} chips</div>
       </div>
     </form>
+    {% else %}
+    <div class="mt-1">
+      <a href="/auth/login" class="btn btn-outline btn-full">Login to Tail</a>
+    </div>
+    {% endif %}
   </div>
   {% endfor %}
 </div>

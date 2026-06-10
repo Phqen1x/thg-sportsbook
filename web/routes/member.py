@@ -474,13 +474,15 @@ async def parlay_submit(
 @router.get("/tail")
 async def tail_board(
     request: Request,
-    user: SessionUser = Depends(require_user),
+    user: SessionUser | None = Depends(optional_user),
     success: str = "",
     error: str = "",
 ):
     async with get_db() as db:
-        db_user = await _get_or_create_user(db, user)
-        await db.commit()
+        db_user = None
+        if user:
+            db_user = await _get_or_create_user(db, user)
+            await db.commit()
 
         templates_raw = (await db.execute(
             select(ParlayTemplate).where(ParlayTemplate.active == True).order_by(ParlayTemplate.created_at.desc())

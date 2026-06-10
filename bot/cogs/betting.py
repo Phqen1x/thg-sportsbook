@@ -119,6 +119,29 @@ def _exact_placement(m: Market) -> int | None:
     return None
 
 
+def _implied_milestones(m: Market) -> set[str]:
+    """Milestone types that are guaranteed true whenever market m wins."""
+    if m.tribute_a_id is None:
+        return set()
+    if m.type in {"TRIBUTE_WINS", "TRIBUTE_RUNNER_UP"}:
+        return {"MAKES_FINAL_5", "MAKES_FINAL_8"}
+    if m.type == "TRIBUTE_PLACEMENT" and m.placement_num is not None:
+        result: set[str] = set()
+        if m.placement_num <= 5:
+            result.add("MAKES_FINAL_5")
+        if m.placement_num <= 8:
+            result.add("MAKES_FINAL_8")
+        return result
+    if m.type == "TRIBUTE_TOP_N" and m.top_n is not None:
+        result = set()
+        if m.top_n <= 5:
+            result.add("MAKES_FINAL_5")
+        if m.top_n <= 8:
+            result.add("MAKES_FINAL_8")
+        return result
+    return set()
+
+
 def _placement_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
     """Return an error string if adding new_mkt would violate placement parlay rules.
 
@@ -302,6 +325,35 @@ def _survival_conflict(existing_markets: list[Market], new_mkt: Market) -> str |
     return None
 
 
+def _placement_milestone_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Block parlaying a placement bet with a survival milestone that is
+    guaranteed if the placement hits — those legs are never independent.
+
+    Wins/runner-up imply both MAKES_FINAL_5 and MAKES_FINAL_8; a top-5
+    placement implies MAKES_FINAL_8. The reverse direction is checked too
+    so order of addition doesn't matter.
+    """
+    _MSG = (
+        "You can't parlay a placement bet with a milestone that's guaranteed "
+        "if the placement hits — e.g. winning implies making top 5 and top 8, "
+        "so those milestone legs add no independent risk."
+    )
+    implied = _implied_milestones(new_mkt)
+    if implied and new_mkt.tribute_a_id is not None:
+        for m in existing_markets:
+            if m.tribute_a_id != new_mkt.tribute_a_id:
+                continue
+            if m.type in implied:
+                return _MSG
+    if new_mkt.type in {"MAKES_FINAL_5", "MAKES_FINAL_8"} and new_mkt.tribute_a_id is not None:
+        for m in existing_markets:
+            if m.tribute_a_id != new_mkt.tribute_a_id:
+                continue
+            if new_mkt.type in _implied_milestones(m):
+                return _MSG
+    return None
+
+
 # ── Training-score model ──────────────────────────────────────────────────────
 # A tribute receives exactly one training score, so every training-score bet on
 # the same tribute pins down (or constrains) that single number. Two such bets
@@ -424,11 +476,20 @@ def _partner_comparison_conflict(existing_markets: list[Market], new_mkt: Market
                 f"bet on the same tribute — they can never both be true."
             )
         else:
-            # Swapped perspectives, same direction — both claim to beat the other
+            # Swapped perspectives
             if m.type == new_mkt.type:
+                # Same direction (A beats B AND B beats A) — impossible
                 return (
                     f"You can't parlay both district partners each {category}ing higher "
                     f"(or lower) than the other — only one can come out ahead."
+                )
+            else:
+                # Opposite direction from a swapped pair is the same statement:
+                # "A scores higher than B" ≡ "B scores lower than A"
+                return (
+                    f"You can't parlay two equivalent district partner {category} "
+                    f"bets — stating that one tribute beats the other is the same "
+                    f"outcome regardless of which side you bet from."
                 )
 
     return None
@@ -460,6 +521,7 @@ def _parlay_conflict(existing_markets: list[Market], new_mkt: Market) -> str | N
     return (
         _milestone_conflict(existing_markets, new_mkt)
         or _placement_conflict(existing_markets, new_mkt)
+        or _placement_milestone_conflict(existing_markets, new_mkt)
         or _district_milestone_conflict(existing_markets, new_mkt)
         or _alliance_milestone_conflict(existing_markets, new_mkt)
         or _survival_conflict(existing_markets, new_mkt)
@@ -1459,12 +1521,15 @@ class BettingCog(commands.Cog):
     ) -> discord.abc.Messageable | None:
         """Resolve the withdraw/deposit admin channel, or None.
 
-        Prefers the channel set at runtime via `/admin settings withdraw_channel`
-        (stored in game_settings), falling back to the WITHDRAW_CHANNEL_ID env var.
+        Checks per-guild setting first (set via `/admin settings withdraw_channel`),
+        then falls back to the WITHDRAW_CHANNEL_ID env var.
         """
         if interaction.guild is None:
             return None
-        raw = await get_setting("withdraw_channel_id")
+        from bot.database.engine import get_guild_setting
+        raw = await get_guild_setting(interaction.guild_id, "withdraw_channel_id")
+        if not raw:
+            raw = await get_setting("withdraw_channel_id")
         channel_id = json.loads(raw) if raw else config.WITHDRAW_CHANNEL_ID
         if not channel_id:
             return None

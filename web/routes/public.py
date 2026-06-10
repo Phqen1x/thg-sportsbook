@@ -41,6 +41,68 @@ def _parlay_flavor(
     districts = sorted({t.district for t in tributes})
     drecs = {d: district_records[d] for d in districts if d in district_records}
 
+    # Detect a central tribute: one tribute that appears in the majority of legs.
+    # This fires for tribute-centric parlays where one competitor anchors every market.
+    tribute_freq: dict[int, int] = {}
+    for m in markets:
+        if m.tribute_a_id:
+            tribute_freq[m.tribute_a_id] = tribute_freq.get(m.tribute_a_id, 0) + 1
+        if m.tribute_b_id:
+            tribute_freq[m.tribute_b_id] = tribute_freq.get(m.tribute_b_id, 0) + 1
+    central_tid: int | None = None
+    if tribute_freq:
+        max_freq = max(tribute_freq.values())
+        dominant_tids = [tid for tid, cnt in tribute_freq.items() if cnt == max_freq]
+        if (
+            len(dominant_tids) == 1
+            and max_freq >= max(2, len(markets) // 2)
+            and dominant_tids[0] in tributes_map
+        ):
+            central_tid = dominant_tids[0]
+
+    if central_tid is not None:
+        t = tributes_map[central_tid]
+        fname = first(t)
+        dr = drecs.get(t.district)
+        parts: list[str] = []
+        if t.sade_champion:
+            parts.append(
+                f"{fname} has already worn the victor's crown — SADE experience the odds can't capture"
+            )
+        if t.times_played and t.times_played >= 2:
+            parts.append(f"{fname} has {t.times_played} prior games of experience")
+        elif t.times_played == 1:
+            parts.append(f"{fname} isn't new to this — one prior game under their belt")
+        if t.training_score and t.training_score >= 9:
+            parts.append(f"a training score of {t.training_score} puts them in elite territory")
+        elif t.training_score:
+            parts.append(f"training score: {t.training_score}")
+        if t.kills and t.kills >= 3:
+            parts.append(
+                f"{t.kills} kills already makes {fname} one of the most dangerous in the arena"
+            )
+        elif t.kills:
+            parts.append(f"{t.kills} {'kill' if t.kills == 1 else 'kills'} this game")
+        if t.alliance_id and t.alliance_id in alliance_names:
+            parts.append(f"running with {alliance_names[t.alliance_id]}")
+        if dr and dr.wins:
+            parts.append(
+                f"District {t.district} has {dr.wins} all-time "
+                f"{'victory' if dr.wins == 1 else 'victories'}"
+            )
+        desc = ". ".join(parts).capitalize() + "." if parts else f"Everything riding on {fname}."
+        if t.sade_champion:
+            name = f"{fname}: Double Victor"
+        elif t.times_played and t.times_played >= 2:
+            name = f"{fname}: Veteran's Slate"
+        elif t.kills and t.kills >= 3:
+            name = f"{fname}: Blood Trail"
+        elif t.training_score and t.training_score >= 9:
+            name = f"{fname}: Top of the Class"
+        else:
+            name = f"All In on {fname}"
+        return (name, desc)
+
     same_district = len(districts) == 1
     aid_set = {t.alliance_id for t in tributes if t.alliance_id}
     allied = len(aid_set) == 1 and len(tributes) >= 2 and all(t.alliance_id == next(iter(aid_set)) for t in tributes)
@@ -350,6 +412,63 @@ async def markets(
 
         phase_name = await _phase_name(db)
 
+        # Featured parlay templates (pinned above market list)
+        tpl_raw = (await db.execute(
+            select(ParlayTemplate).where(ParlayTemplate.active == True)
+            .order_by(ParlayTemplate.created_at.desc()).limit(6)
+        )).scalars().all()
+        featured_parlays = []
+        for tpl in tpl_raw:
+            legs = (await db.execute(
+                select(ParlayTemplateLeg)
+                .where(ParlayTemplateLeg.template_id == tpl.id)
+                .order_by(ParlayTemplateLeg.sort_order)
+            )).scalars().all()
+            leg_markets = []
+            for leg in legs:
+                mkt = await db.get(Market, leg.market_id)
+                if mkt:
+                    leg_markets.append(mkt)
+            odds_list = [m.odds for m in leg_markets if m.status == "OPEN"]
+            combined = combined_american(odds_list) if len(odds_list) >= 2 else None
+            featured_parlays.append({
+                "id": tpl.id, "name": tpl.name, "description": tpl.description,
+                "difficulty": tpl.difficulty, "combined_odds": combined,
+                "legs": leg_markets,
+            })
+
+        fp_tid_set: set[int] = set()
+        for fp in featured_parlays:
+            for mkt in fp["legs"]:
+                if mkt.tribute_a_id: fp_tid_set.add(mkt.tribute_a_id)
+                if mkt.tribute_b_id: fp_tid_set.add(mkt.tribute_b_id)
+        fp_tributes_map: dict = {}
+        fp_alliance_names: dict = {}
+        fp_district_records: dict = {}
+        if fp_tid_set:
+            pt_rows = (await db.execute(
+                select(Tribute).where(Tribute.id.in_(fp_tid_set))
+            )).scalars().all()
+            fp_tributes_map = {t.id: t for t in pt_rows}
+            aid_set = {t.alliance_id for t in pt_rows if t.alliance_id}
+            if aid_set:
+                a_rows = (await db.execute(
+                    select(Alliance).where(Alliance.id.in_(aid_set))
+                )).scalars().all()
+                fp_alliance_names = {a.id: a.name for a in a_rows}
+            fp_districts = {t.district for t in pt_rows}
+            dr_rows = (await db.execute(
+                select(DistrictRecord).where(DistrictRecord.district.in_(fp_districts))
+            )).scalars().all()
+            fp_district_records = {dr.district: dr for dr in dr_rows}
+        for fp in featured_parlays:
+            name, desc = _parlay_flavor(
+                fp["legs"], fp_tributes_map, fp_alliance_names,
+                fp_district_records, fp["name"], fp["description"],
+            )
+            fp["name"] = name
+            fp["description"] = desc
+
     return request.app.state.templates.TemplateResponse("markets.html", {
         "request": request,
         "user": user,
@@ -359,6 +478,7 @@ async def markets(
         "status": status,
         "type_filter": type_filter,
         "phase_name": phase_name,
+        "featured_parlays": featured_parlays,
     })
 
 
