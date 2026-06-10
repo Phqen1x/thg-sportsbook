@@ -8,7 +8,8 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
 from bot.cogs.betting import _parlay_conflict, PARLAY_PAYOUT_CAP, MAX_PARLAY_LEGS
-from bot.database.models import Bet, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
+from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
+from web.routes.public import _parlay_flavor
 from bot.odds.calculator import straight_payout, parlay_payout, combined_american, cashout_value
 from web.database import get_db
 from web.deps import optional_user, require_user
@@ -500,6 +501,43 @@ async def tail_board(
                     if mkt:
                         tpl_markets[leg.market_id] = mkt
 
+        # Build dynamic parlay flavor text for each template
+        tail_tid_set: set[int] = set()
+        for mkt in tpl_markets.values():
+            if mkt.tribute_a_id: tail_tid_set.add(mkt.tribute_a_id)
+            if mkt.tribute_b_id: tail_tid_set.add(mkt.tribute_b_id)
+
+        tail_tributes_map: dict = {}
+        tail_alliance_names: dict = {}
+        tail_district_records: dict = {}
+        if tail_tid_set:
+            pt_rows = (await db.execute(
+                select(Tribute).where(Tribute.id.in_(tail_tid_set))
+            )).scalars().all()
+            tail_tributes_map = {t.id: t for t in pt_rows}
+
+            aid_set = {t.alliance_id for t in pt_rows if t.alliance_id}
+            if aid_set:
+                a_rows = (await db.execute(
+                    select(Alliance).where(Alliance.id.in_(aid_set))
+                )).scalars().all()
+                tail_alliance_names = {a.id: a.name for a in a_rows}
+
+            parlay_districts = {t.district for t in pt_rows}
+            dr_rows = (await db.execute(
+                select(DistrictRecord).where(DistrictRecord.district.in_(parlay_districts))
+            )).scalars().all()
+            tail_district_records = {dr.district: dr for dr in dr_rows}
+
+        tpl_flavor: dict[int, dict] = {}
+        for tpl in templates_raw:
+            leg_mkts = [tpl_markets[leg.market_id] for leg in tpl_legs.get(tpl.id, []) if leg.market_id in tpl_markets]
+            name, desc = _parlay_flavor(
+                leg_mkts, tail_tributes_map, tail_alliance_names,
+                tail_district_records, tpl.name, tpl.description,
+            )
+            tpl_flavor[tpl.id] = {"name": name, "description": desc}
+
     return request.app.state.templates.TemplateResponse("tail.html", {
         "request": request,
         "user": user,
@@ -507,6 +545,7 @@ async def tail_board(
         "templates": templates_raw,
         "tpl_legs": tpl_legs,
         "tpl_markets": tpl_markets,
+        "tpl_flavor": tpl_flavor,
         "success": success,
         "error": error,
     })

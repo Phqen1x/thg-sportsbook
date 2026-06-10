@@ -11,15 +11,17 @@
 <div class="tail-grid">
   {% for tpl in templates %}
   {% set legs = tpl_legs.get(tpl.id, []) %}
+  {% set flavor = tpl_flavor.get(tpl.id, {}) %}
   <div class="card tail-card">
     <div class="tail-card-header">
-      <div class="tail-title">{{ tpl.name }}</div>
+      <div class="tail-title">{{ flavor.name if flavor.name else tpl.name }}</div>
       {% if tpl.difficulty %}
       <span class="difficulty-badge difficulty-{{ tpl.difficulty.lower() }}">{{ tpl.difficulty }}</span>
       {% endif %}
     </div>
-    {% if tpl.description %}
-    <div class="text-dim tail-desc">{{ tpl.description }}</div>
+    {% set desc = flavor.description if flavor.description else tpl.description %}
+    {% if desc %}
+    <div class="text-dim tail-desc">{{ desc }}</div>
     {% endif %}
 
     <table class="table table-sm mt-1">
