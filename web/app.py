@@ -15,7 +15,7 @@ HERE = Path(__file__).parent
 ACTIVITY_DIR = HERE / "activity"
 
 def _static_version() -> str:
-    """Short hash of app.js + style.css content for cache-busting."""
+    """Short hash of activity static files for cache-busting."""
     h = hashlib.md5()
     for name in ("static/app.js", "static/style.css"):
         f = ACTIVITY_DIR / name
@@ -23,7 +23,17 @@ def _static_version() -> str:
             h.update(f.read_bytes())
     return h.hexdigest()[:8]
 
+def _web_static_version() -> str:
+    """Short hash of web static files for cache-busting."""
+    h = hashlib.md5()
+    for name in ("style.css", "app.js"):
+        f = HERE / "static" / name
+        if f.exists():
+            h.update(f.read_bytes())
+    return h.hexdigest()[:8]
+
 _VERSION = _static_version()
+_WEB_VERSION = _web_static_version()
 
 # Discord embeds the Activity in an iframe served from *.discordsays.com and
 # proxies all traffic, so we must permit framing by Discord (and never send
@@ -75,6 +85,7 @@ def create_app() -> FastAPI:
     templates.env.filters["fmt_odds"] = fmt_odds
     templates.env.filters["fmt_chips"] = fmt_chips
     templates.env.globals["abs"] = abs
+    templates.env.globals["static_v"] = _WEB_VERSION
 
     app.state.templates = templates
 
