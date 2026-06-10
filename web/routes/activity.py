@@ -16,7 +16,7 @@ from sqlalchemy import func, select, text
 
 from bot.cogs.betting import _parlay_conflict, MAX_PARLAY_LEGS, PARLAY_PAYOUT_CAP
 from bot.database.models import (
-    Alliance, Bet, BettingPhase, Market, Parlay, PendingParlayLeg,
+    Alliance, Bet, BettingPhase, DistrictRecord, Market, Parlay, PendingParlayLeg,
     ParlayTemplate, ParlayTemplateLeg, Tribute, User,
 )
 from bot.odds.calculator import (
@@ -25,6 +25,7 @@ from bot.odds.calculator import (
 from web import config, discord_api
 from web.activity_auth import bearer_admin, bearer_user, mint_token
 from web.database import get_db
+from web.routes.public import _parlay_flavor
 from web.session import SessionUser
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
@@ -604,6 +605,7 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
             select(ParlayTemplate).where(ParlayTemplate.active == True).order_by(ParlayTemplate.created_at.desc())
         )).scalars().all()
 
+        tpl_leg_markets: dict[int, list] = {}
         out = []
         for tpl in templates_raw:
             legs = (await db.execute(
@@ -616,6 +618,7 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
                 mkt = await db.get(Market, leg.market_id)
                 if mkt:
                     leg_markets.append(mkt)
+            tpl_leg_markets[tpl.id] = leg_markets
             odds_list = [m.odds for m in leg_markets if m.status == "OPEN"]
             combined = combined_american(odds_list) if len(odds_list) >= 2 else None
             out.append({
@@ -627,6 +630,41 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
                 "combined_odds": combined,
                 "legs": [_market_dict(m) for m in leg_markets],
             })
+
+        # Generate dynamic flavor text from tribute/district history
+        act_tid_set: set[int] = set()
+        for mkts in tpl_leg_markets.values():
+            for m in mkts:
+                if m.tribute_a_id: act_tid_set.add(m.tribute_a_id)
+                if m.tribute_b_id: act_tid_set.add(m.tribute_b_id)
+
+        act_tributes_map: dict = {}
+        act_alliance_names: dict = {}
+        act_district_records: dict = {}
+        if act_tid_set:
+            pt_rows = (await db.execute(
+                select(Tribute).where(Tribute.id.in_(act_tid_set))
+            )).scalars().all()
+            act_tributes_map = {t.id: t for t in pt_rows}
+            aid_set = {t.alliance_id for t in pt_rows if t.alliance_id}
+            if aid_set:
+                a_rows = (await db.execute(
+                    select(Alliance).where(Alliance.id.in_(aid_set))
+                )).scalars().all()
+                act_alliance_names = {a.id: a.name for a in a_rows}
+            act_districts = {t.district for t in pt_rows}
+            dr_rows = (await db.execute(
+                select(DistrictRecord).where(DistrictRecord.district.in_(act_districts))
+            )).scalars().all()
+            act_district_records = {dr.district: dr for dr in dr_rows}
+
+        for entry in out:
+            name, desc = _parlay_flavor(
+                tpl_leg_markets[entry["id"]], act_tributes_map, act_alliance_names,
+                act_district_records, entry["name"], entry["description"],
+            )
+            entry["name"] = name
+            entry["description"] = desc
 
     return {"chips": db_user.chips, "templates": out}
 
