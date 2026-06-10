@@ -733,12 +733,10 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   align-items: center;
   gap: 0.75rem;
   background: var(--card-bg);
-  border: 1px solid var(--divider);
+  border: 1px solid var(--card-border);
   border-radius: var(--radius);
   padding: 0.6rem 0.9rem;
-  transition: border-color 0.12s;
 }
-.home-market-tile:hover { border-color: var(--card-border); }
 .home-market-tile-body { flex: 1; min-width: 0; }
 .home-market-label { font-weight: 600; font-size: 0.95rem; }
 .home-market-sub   { color: var(--text-dim); font-size: 0.8rem; margin-top: 0.1rem; }
@@ -778,82 +776,117 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 ::-webkit-scrollbar-thumb { background: var(--divider); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--card-border); }
 
+/* ── Table scroll wrapper (used on mobile) ────────────────────────────────── */
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
 /* ── Responsive: tablet (≤900px) ─────────────────────────────────────────── */
 @media (max-width: 900px) {
   .admin-layout { grid-template-columns: 1fr; }
   .admin-sidebar { position: static; }
+  .two-col { grid-template-columns: 1fr; }
 }
 
 /* ── Responsive: mobile (≤640px) ─────────────────────────────────────────── */
 @media (max-width: 640px) {
-  /* Navbar: allow horizontal scroll on small screens */
-  .navbar { padding: 0 0.75rem; height: auto; min-height: 52px; flex-wrap: wrap; gap: 0.25rem; padding-top: 0.4rem; padding-bottom: 0.4rem; }
-  .brand { font-size: 0.85rem; }
-  .nav-links { gap: 0.1rem; overflow-x: auto; scrollbar-width: none; flex-wrap: nowrap; padding-bottom: 0.1rem; }
+  /* Navbar: brand stays, links scroll horizontally below on their own line */
+  .navbar {
+    height: auto;
+    min-height: 52px;
+    padding: 0.4rem 0.75rem;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 0;
+  }
+  .brand { font-size: 0.88rem; padding: 0.3rem 0; flex: 1; }
+  .nav-links {
+    order: 3;
+    width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+    flex-wrap: nowrap;
+    gap: 0;
+    padding: 0.2rem 0 0.3rem;
+  }
   .nav-links::-webkit-scrollbar { display: none; }
-  .nav-links a { font-size: 0.78rem; padding: 0.2rem 0.45rem; white-space: nowrap; }
-  .nav-user { flex-shrink: 0; }
-  .nav-user span { display: none; }
+  .nav-links > a { font-size: 0.8rem; padding: 0.25rem 0.5rem; white-space: nowrap; }
+  .nav-user { order: 2; margin-left: auto; }
+  .nav-user > span { display: none; }
+  .nav-user .btn { font-size: 0.75rem; padding: 0.2rem 0.45rem; }
 
   /* Container */
-  .container { padding: 0.75rem; }
+  .container { padding: 0.75rem 0.6rem; }
 
   /* Typography */
-  h1 { font-size: 1.25rem; }
+  h1 { font-size: 1.2rem; }
   h2 { font-size: 1rem; }
 
   /* Hero */
-  .hero { padding: 1.5rem 1rem; }
-  .hero-title { font-size: 1.5rem; letter-spacing: 0.06em; }
-  .hero-stats { gap: 1.5rem; }
-  .stat-num { font-size: 1.5rem; }
+  .hero { padding: 1.25rem 0.75rem; }
+  .hero-title { font-size: 1.4rem; letter-spacing: 0.05em; }
+  .hero-stats { gap: 1.5rem; margin-top: 0.75rem; }
+  .stat-num { font-size: 1.4rem; }
+  .stat-label { font-size: 0.72rem; }
 
-  /* Tables: scroll horizontally */
-  .card:has(.table) { overflow-x: auto; }
-  .table { min-width: 480px; }
-  .table th, .table td { padding: 0.4rem 0.5rem; font-size: 0.82rem; }
+  /* Cards / tables */
+  .card { padding: 0.6rem 0.7rem; }
+  .table-scroll, .card { overflow-x: auto; }
+  .table { min-width: 460px; }
+  .table th, .table td { padding: 0.35rem 0.45rem; font-size: 0.82rem; }
 
   /* Buttons */
-  .btn { font-size: 0.82rem; padding: 0.4rem 0.7rem; min-height: 36px; }
-  .btn-sm { font-size: 0.75rem; padding: 0.3rem 0.5rem; min-height: 32px; }
-  .btn-group { flex-wrap: wrap; }
+  .btn { font-size: 0.85rem; padding: 0.4rem 0.7rem; min-height: 38px; }
+  .btn-sm { font-size: 0.78rem; padding: 0.3rem 0.5rem; min-height: 34px; }
+  .btn-group { flex-wrap: wrap; gap: 0.3rem; }
 
-  /* Filter bar wraps */
-  .filter-bar { flex-wrap: wrap; }
-
-  /* Page header stacks */
-  .page-header { flex-direction: column; align-items: flex-start; }
-  .section-header { flex-wrap: wrap; gap: 0.4rem; }
+  /* Filter/search/page layout */
+  .filter-bar { flex-wrap: wrap; gap: 0.3rem; }
+  .page-header { flex-direction: column; align-items: flex-start; gap: 0.35rem; }
+  .section-header { flex-wrap: wrap; gap: 0.3rem; }
 
   /* Forms */
   .form-row { grid-template-columns: 1fr; }
   .input-row { flex-wrap: wrap; }
-
-  /* Bet / parlay layouts already have their own media queries at 640px */
+  .form-control { font-size: 0.9rem; }
 
   /* Balance */
   .balance-layout { grid-template-columns: 1fr; }
-  .chip-count { font-size: 2.25rem; }
+  .chip-count { font-size: 2rem; }
 
   /* Tail grid: single column */
   .tail-grid { grid-template-columns: 1fr; }
 
-  /* Odds grid: 2 columns minimum */
-  .odds-grid { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+  /* Odds grid */
+  .odds-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 0.5rem; }
+  .odds-card { padding: 0.6rem; }
+  .odds-display { font-size: 1.25rem; }
 
-  /* Home tiles: tighten */
-  .home-market-label { font-size: 0.88rem; }
-  .home-market-odds  { font-size: 0.95rem; }
-  .home-market-actions .btn-sm { font-size: 0.68rem; padding: 0.25rem 0.4rem; }
-  .home-cat-pill { min-width: 52px; padding: 0.4rem 0.55rem; }
+  /* Home page */
+  .home-search-input { font-size: 0.9rem; padding: 0.45rem 0.9rem; }
+  .home-cat-pill { min-width: 54px; padding: 0.4rem 0.5rem; }
   .home-cat-icon { font-size: 1.2rem; }
-  .home-cat-label { font-size: 0.6rem; }
+  .home-cat-label { font-size: 0.62rem; }
+  .home-market-label { font-size: 0.9rem; }
+  .home-market-sub { font-size: 0.78rem; }
+  .home-market-odds { font-size: 0.95rem; }
+  .home-market-actions { flex-direction: column; gap: 0.25rem; }
+  .home-market-actions .btn-sm { width: 100%; justify-content: center; }
+  .home-promo-card { min-width: 200px; }
+  .home-parlay-card { min-width: 200px; }
 }
 
 /* ── Responsive: small mobile (≤400px) ───────────────────────────────────── */
 @media (max-width: 400px) {
-  .hero-title { font-size: 1.2rem; }
-  .brand { font-size: 0.78rem; }
-  .home-market-tile { flex-wrap: wrap; }
-  .home-market-tile-right { width: 100%; flex-direction: row; justify-content: space-between; align-items: center; border-top: 1px solid var(--divider); padding-top: 0.35rem; margin-top: 0.2rem; }
+  .hero-title { font-size: 1.15rem; }
+  .brand { font-size: 0.8rem; }
+  .home-market-tile { flex-wrap: wrap; gap: 0.5rem; }
+  .home-market-tile-right {
+    width: 100%;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    border-top: 1px solid var(--divider);
+    padding-top: 0.4rem;
+  }
+  .home-market-actions { flex-direction: row; width: auto; }
+  .home-market-actions .btn-sm { width: auto; }
 }
