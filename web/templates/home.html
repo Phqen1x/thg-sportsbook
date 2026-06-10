@@ -2,60 +2,153 @@
 {% block title %}Capitol Sportsbook{% endblock %}
 
 {% block content %}
-<div class="hero">
-  <div class="hero-inner">
-    <h1 class="hero-title">CAPITOL SPORTSBOOK</h1>
-    {% if phase_name %}
-    <div class="phase-badge">{{ phase_name }}</div>
-    {% endif %}
-    <div class="hero-stats">
-      <div class="hero-stat"><span class="stat-num">{{ alive_count }}</span><span class="stat-label">Tributes Alive</span></div>
-      <div class="hero-stat"><span class="stat-num">{{ open_count }}</span><span class="stat-label">Open Markets</span></div>
-    </div>
-  </div>
+{% if phase_name %}
+<div class="phase-banner-bar">Phase: {{ phase_name }}</div>
+{% endif %}
+
+{# ── Search bar ──────────────────────────────────────────────────────────── #}
+<div class="home-search-wrap">
+  <input type="search" id="home-search" class="home-search-input"
+    placeholder="Search tributes, districts, alliances, markets…" autocomplete="off">
 </div>
 
-<div class="section-header">
-  <h2>Live Win Odds</h2>
-  <a href="/markets" class="btn btn-outline btn-sm">View All Markets</a>
+{# ── Category pills ──────────────────────────────────────────────────────── #}
+<div class="home-cat-pills">
+  <button class="home-cat-pill active" data-cat="">
+    <span class="home-cat-icon">⚔️</span><span class="home-cat-label">All</span>
+  </button>
+  <button class="home-cat-pill" data-cat="victor">
+    <span class="home-cat-icon">🏆</span><span class="home-cat-label">Victor</span>
+  </button>
+  <button class="home-cat-pill" data-cat="tribute">
+    <span class="home-cat-icon">🗡️</span><span class="home-cat-label">Tributes</span>
+  </button>
+  <button class="home-cat-pill" data-cat="district">
+    <span class="home-cat-icon">🏰</span><span class="home-cat-label">Districts</span>
+  </button>
+  <button class="home-cat-pill" data-cat="alliance">
+    <span class="home-cat-icon">🤝</span><span class="home-cat-label">Alliances</span>
+  </button>
+  <button class="home-cat-pill" data-cat="props">
+    <span class="home-cat-icon">🎯</span><span class="home-cat-label">Props</span>
+  </button>
 </div>
 
-{% if tributes %}
-<div class="odds-grid">
-  {% for tribute in tributes %}
-  {% set mkt = win_markets.get(tribute.id) %}
-  <div class="odds-card {% if tribute.status == 'VICTOR' %}card-victor{% endif %}">
-    <div class="odds-card-header">
-      <span class="district-badge">D{{ tribute.district }}</span>
-      <span class="status-dot status-{{ tribute.status.lower() }}"></span>
+{# ── Promo banners ───────────────────────────────────────────────────────── #}
+{% if banners %}
+<div class="home-promo-rail">
+  {% for b in banners %}
+  <div class="home-promo-card" {% if b.color %}style="border-color:{{ b.color }}"{% endif %}>
+    <div class="home-promo-emoji">{{ b.emoji or "🏆" }}</div>
+    <div class="home-promo-body">
+      <div class="home-promo-title">{{ b.title }}</div>
+      {% if b.subtitle %}<div class="home-promo-sub">{{ b.subtitle }}</div>{% endif %}
     </div>
-    <div class="tribute-name">{{ tribute.name }}</div>
-    <div class="tribute-sub">{{ tribute.display_gender }}{% if tribute.age %} &bull; Age {{ tribute.age }}{% endif %}{% if tribute.training_score %} &bull; Score {{ tribute.training_score }}{% endif %}</div>
-    {% if tribute.kills > 0 %}
-    <div class="kill-badge">{{ tribute.kills }} kill{{ 's' if tribute.kills != 1 }}</div>
-    {% endif %}
-    {% if mkt %}
-    <div class="odds-display {% if mkt.odds > 0 %}odds-pos{% else %}odds-neg{% endif %}">{{ mkt.odds | fmt_odds }}</div>
-    {% if user %}
-    <a href="/bet/{{ mkt.id }}" class="btn btn-primary btn-sm mt-1">Bet</a>
-    {% else %}
-    <span class="odds-locked">Login to bet</span>
-    {% endif %}
-    {% else %}
-    <div class="odds-display odds-na">—</div>
-    {% endif %}
+    {% if b.cta %}<div class="home-promo-cta">{{ b.cta }}</div>{% endif %}
   </div>
   {% endfor %}
 </div>
-{% else %}
-<div class="empty-state">No active tributes yet.</div>
 {% endif %}
 
+{# ── Open Markets ────────────────────────────────────────────────────────── #}
+<div class="section-header">
+  <h2 id="mkts-heading">Open Markets{% if open_markets %} <span class="section-count">({{ open_markets|length }})</span>{% endif %}</h2>
+  <a href="/markets" class="btn btn-outline btn-sm">View All</a>
+</div>
+
+{% if open_markets %}
+<div id="market-tiles" class="home-market-grid">
+  {% for m in open_markets %}
+  {% set ta = tributes_map.get(m.tribute_a_id) %}
+  {% set tb = tributes_map.get(m.tribute_b_id) %}
+  <div class="home-market-tile"
+    data-label="{{ m.label | lower }}"
+    data-ta="{{ (ta.name if ta else '') | lower }}"
+    data-tb="{{ (tb.name if tb else '') | lower }}"
+    data-type="{{ m.type }}">
+    <div class="home-market-tile-body">
+      <div class="home-market-label">{{ m.label }}</div>
+      {% if ta or tb %}
+      <div class="home-market-sub">
+        {% if ta %}{{ ta.name }}{% endif %}{% if tb %} vs {{ tb.name }}{% endif %}
+      </div>
+      {% endif %}
+      <div class="home-market-meta">
+        {% set bc = bet_counts.get(m.id, 0) %}
+        {% if bc %}<span class="text-dim">{{ bc }} bet{{ 's' if bc != 1 }}</span>{% endif %}
+      </div>
+    </div>
+    <div class="home-market-tile-right">
+      <div class="home-market-odds {% if m.odds >= 0 %}text-pos{% else %}text-neg{% endif %}">
+        {{ m.odds | fmt_odds }}
+      </div>
+      {% if user %}
+      <div class="home-market-actions">
+        <a href="/bet/{{ m.id }}" class="btn btn-primary btn-sm">Bet</a>
+        <form method="post" action="/parlay/add/{{ m.id }}" style="display:inline">
+          <button class="btn btn-outline btn-sm">+P</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+<div id="no-markets" class="empty-state hidden">No markets match.</div>
+{% else %}
+<div class="empty-state">No open markets right now.</div>
+{% endif %}
+
+{# ── Featured Parlays ────────────────────────────────────────────────────── #}
+{% if featured_parlays %}
+<div class="section-header mt-4">
+  <h2>Featured Parlays</h2>
+  <a href="/tail" class="btn btn-outline btn-sm">View All</a>
+</div>
+<div class="home-parlay-rail">
+  {% for tpl in featured_parlays %}
+  <div class="home-parlay-card card">
+    <div class="home-parlay-head">
+      <span class="home-parlay-name">{{ tpl.name }}</span>
+      {% if tpl.difficulty %}
+      <span class="difficulty-badge difficulty-{{ tpl.difficulty.lower() }}">{{ tpl.difficulty }}</span>
+      {% endif %}
+    </div>
+    {% if tpl.description %}
+    <div class="text-dim home-parlay-desc">{{ tpl.description }}</div>
+    {% endif %}
+    <ul class="home-parlay-legs">
+      {% for leg in tpl.legs %}
+      <li>
+        <span class="text-dim" style="font-size:.8rem">{{ leg.label }}</span>
+        <span class="{% if leg.odds >= 0 %}text-pos{% else %}text-neg{% endif %} font-bold">
+          {{ leg.odds | fmt_odds }}
+        </span>
+      </li>
+      {% endfor %}
+    </ul>
+    <div class="home-parlay-footer">
+      {% if tpl.combined_odds is not none %}
+      <span class="home-parlay-odds {% if tpl.combined_odds >= 0 %}text-pos{% else %}text-neg{% endif %}">
+        {{ tpl.combined_odds | fmt_odds }}
+      </span>
+      {% else %}
+      <span class="text-dim">—</span>
+      {% endif %}
+      {% if user %}
+      <a href="/tail" class="btn btn-primary btn-sm">Tail</a>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{# ── Leaderboard ─────────────────────────────────────────────────────────── #}
 <div class="section-header mt-4">
   <h2>Leaderboard</h2>
   <a href="/leaderboard" class="btn btn-outline btn-sm">Full Leaderboard</a>
 </div>
-
 <div class="card">
   <table class="table">
     <thead>
@@ -74,4 +167,53 @@
     </tbody>
   </table>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const VICTOR_TYPES = new Set(["TRIBUTE_WINS","DISTRICT_VICTOR","ALLIANCE_VICTOR"]);
+  const tiles = Array.from(document.querySelectorAll(".home-market-tile"));
+  const noMkts = document.getElementById("no-markets");
+  const heading = document.getElementById("mkts-heading");
+  const totalCount = tiles.length;
+  let activeCat = "", searchQ = "";
+
+  function matchesCat(tile, cat) {
+    if (!cat) return true;
+    const type = tile.dataset.type;
+    if (cat === "victor")   return VICTOR_TYPES.has(type);
+    if (cat === "tribute")  return !VICTOR_TYPES.has(type) && (tile.dataset.ta || tile.dataset.tb);
+    if (cat === "district") return type === "DISTRICT_VICTOR";
+    if (cat === "alliance") return type === "ALLIANCE_VICTOR";
+    if (cat === "props")    return !VICTOR_TYPES.has(type) && !tile.dataset.ta && !tile.dataset.tb;
+    return true;
+  }
+
+  function refilter() {
+    const q = searchQ.toLowerCase();
+    let shown = 0;
+    tiles.forEach(t => {
+      const catOk = matchesCat(t, activeCat);
+      const searchOk = !q || t.dataset.label.includes(q) || t.dataset.ta.includes(q) || t.dataset.tb.includes(q);
+      const visible = catOk && searchOk;
+      t.style.display = visible ? "" : "none";
+      if (visible) shown++;
+    });
+    if (heading) heading.innerHTML = `Open Markets <span class="section-count">(${shown})</span>`;
+    if (noMkts) noMkts.classList.toggle("hidden", shown > 0);
+  }
+
+  document.querySelectorAll(".home-cat-pill").forEach(pill =>
+    pill.addEventListener("click", () => {
+      document.querySelectorAll(".home-cat-pill").forEach(p => p.classList.remove("active"));
+      pill.classList.add("active");
+      activeCat = pill.dataset.cat;
+      refilter();
+    }));
+
+  const searchEl = document.getElementById("home-search");
+  if (searchEl) searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); refilter(); });
+})();
+</script>
 {% endblock %}

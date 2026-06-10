@@ -7,15 +7,41 @@
   {% if phase_name %}<div class="phase-badge">{{ phase_name }}</div>{% endif %}
 </div>
 
+<div class="home-search-wrap">
+  <input type="search" id="mkt-search" class="home-search-input"
+    placeholder="Search tributes, markets…" autocomplete="off">
+</div>
+
+<div class="home-cat-pills" style="margin-bottom:.75rem">
+  <button class="home-cat-pill active" data-cat="">
+    <span class="home-cat-icon">⚔️</span><span class="home-cat-label">All</span>
+  </button>
+  <button class="home-cat-pill" data-cat="victor">
+    <span class="home-cat-icon">🏆</span><span class="home-cat-label">Victor</span>
+  </button>
+  <button class="home-cat-pill" data-cat="tribute">
+    <span class="home-cat-icon">🗡️</span><span class="home-cat-label">Tributes</span>
+  </button>
+  <button class="home-cat-pill" data-cat="district">
+    <span class="home-cat-icon">🏰</span><span class="home-cat-label">Districts</span>
+  </button>
+  <button class="home-cat-pill" data-cat="alliance">
+    <span class="home-cat-icon">🤝</span><span class="home-cat-label">Alliances</span>
+  </button>
+  <button class="home-cat-pill" data-cat="props">
+    <span class="home-cat-icon">🎯</span><span class="home-cat-label">Props</span>
+  </button>
+</div>
+
 <div class="filter-bar">
-  <a href="/markets?status=open" class="btn btn-sm {% if status == 'open' %}btn-primary{% else %}btn-outline{% endif %}">Open</a>
-  <a href="/markets?status=all" class="btn btn-sm {% if status == 'all' %}btn-primary{% else %}btn-outline{% endif %}">All</a>
+  <a href="/markets?status=open"     class="btn btn-sm {% if status == 'open'     %}btn-primary{% else %}btn-outline{% endif %}">Open</a>
+  <a href="/markets?status=all"      class="btn btn-sm {% if status == 'all'      %}btn-primary{% else %}btn-outline{% endif %}">All</a>
   <a href="/markets?status=resolved" class="btn btn-sm {% if status == 'resolved' %}btn-primary{% else %}btn-outline{% endif %}">Resolved</a>
-  <a href="/markets?status=closed" class="btn btn-sm {% if status == 'closed' %}btn-primary{% else %}btn-outline{% endif %}">Closed</a>
+  <a href="/markets?status=closed"   class="btn btn-sm {% if status == 'closed'   %}btn-primary{% else %}btn-outline{% endif %}">Closed</a>
 </div>
 
 <div class="card">
-  <table class="table">
+  <table class="table" id="markets-table">
     <thead>
       <tr>
         <th>Market</th>
@@ -26,11 +52,14 @@
         {% if user %}<th></th>{% endif %}
       </tr>
     </thead>
-    <tbody>
+    <tbody id="markets-body">
       {% for market in markets %}
       {% set ta = tributes_map.get(market.tribute_a_id) %}
       {% set tb = tributes_map.get(market.tribute_b_id) %}
-      <tr>
+      <tr data-type="{{ market.type }}"
+          data-label="{{ market.label | lower }}"
+          data-ta="{{ (ta.name if ta else '') | lower }}"
+          data-tb="{{ (tb.name if tb else '') | lower }}">
         <td>
           <div class="market-label">{{ market.label }}</div>
           {% if ta or tb %}
@@ -54,9 +83,7 @@
           {% endif %}
         </td>
         <td class="text-dim">{{ bet_counts.get(market.id, 0) }}</td>
-        <td>
-          <span class="badge badge-{{ market.status.lower() }}">{{ market.status }}</span>
-        </td>
+        <td><span class="badge badge-{{ market.status.lower() }}">{{ market.status }}</span></td>
         {% if user %}
         <td>
           {% if market.status == 'OPEN' %}
@@ -75,5 +102,51 @@
       {% endfor %}
     </tbody>
   </table>
+  <div id="no-rows" class="empty-state hidden">No markets match.</div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const VICTOR_TYPES = new Set(["TRIBUTE_WINS","DISTRICT_VICTOR","ALLIANCE_VICTOR"]);
+  const rows = Array.from(document.querySelectorAll("#markets-body tr[data-type]"));
+  const noRows = document.getElementById("no-rows");
+  let activeCat = "", searchQ = "";
+
+  function matchesCat(row, cat) {
+    if (!cat) return true;
+    const type = row.dataset.type;
+    if (cat === "victor")   return VICTOR_TYPES.has(type);
+    if (cat === "tribute")  return !VICTOR_TYPES.has(type) && (row.dataset.ta || row.dataset.tb);
+    if (cat === "district") return type === "DISTRICT_VICTOR";
+    if (cat === "alliance") return type === "ALLIANCE_VICTOR";
+    if (cat === "props")    return !VICTOR_TYPES.has(type) && !row.dataset.ta && !row.dataset.tb;
+    return true;
+  }
+
+  function refilter() {
+    const q = searchQ.toLowerCase();
+    let shown = 0;
+    rows.forEach(r => {
+      const ok = matchesCat(r, activeCat) &&
+        (!q || r.dataset.label.includes(q) || r.dataset.ta.includes(q) || r.dataset.tb.includes(q));
+      r.style.display = ok ? "" : "none";
+      if (ok) shown++;
+    });
+    if (noRows) noRows.classList.toggle("hidden", shown > 0);
+  }
+
+  document.querySelectorAll(".home-cat-pill").forEach(pill =>
+    pill.addEventListener("click", () => {
+      document.querySelectorAll(".home-cat-pill").forEach(p => p.classList.remove("active"));
+      pill.classList.add("active");
+      activeCat = pill.dataset.cat;
+      refilter();
+    }));
+
+  const searchEl = document.getElementById("mkt-search");
+  if (searchEl) searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); refilter(); });
+})();
+</script>
 {% endblock %}

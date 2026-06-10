@@ -618,6 +618,160 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 /* ── Market ───────────────────────────────────────────────────────────────── */
 .market-label { font-weight: 600; }
 
+/* ── Home: phase banner ───────────────────────────────────────────────────── */
+.phase-banner-bar {
+  background: var(--bg-mid);
+  border-left: 3px solid var(--header-gold);
+  color: var(--text-gold);
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius);
+  margin-bottom: 0.75rem;
+}
+
+/* ── Home: search bar ─────────────────────────────────────────────────────── */
+.home-search-wrap { margin-bottom: 0.75rem; }
+.home-search-input {
+  width: 100%;
+  background: var(--bg-mid);
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  color: var(--text-white);
+  font-family: 'Rajdhani', sans-serif;
+  font-size: 0.95rem;
+  padding: 0.5rem 1.1rem;
+  transition: border-color 0.15s;
+}
+.home-search-input:focus { outline: none; border-color: var(--card-border); }
+.home-search-input::placeholder { color: var(--text-dim); }
+
+/* ── Home: category pills ─────────────────────────────────────────────────── */
+.home-cat-pills {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  padding-bottom: 0.1rem;
+  margin-bottom: 1rem;
+  scrollbar-width: none;
+}
+.home-cat-pills::-webkit-scrollbar { display: none; }
+.home-cat-pill {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.2rem;
+  background: var(--card-bg);
+  border: 1px solid var(--divider);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  white-space: nowrap;
+  min-width: 64px;
+  font-family: 'Rajdhani', sans-serif;
+  color: var(--text-dim);
+  transition: border-color 0.15s, color 0.15s;
+}
+.home-cat-pill:hover { border-color: var(--card-border); color: var(--text-white); }
+.home-cat-pill.active { border-color: var(--header-gold); color: var(--header-gold); }
+.home-cat-icon  { font-size: 1.4rem; line-height: 1; }
+.home-cat-label { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+
+/* ── Home: promo banners ──────────────────────────────────────────────────── */
+.home-promo-rail {
+  display: flex;
+  gap: 0.75rem;
+  overflow-x: auto;
+  margin-bottom: 1.25rem;
+  scrollbar-width: none;
+  padding-bottom: 0.1rem;
+}
+.home-promo-rail::-webkit-scrollbar { display: none; }
+.home-promo-card {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-shrink: 0;
+  min-width: 240px;
+  max-width: 320px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+}
+.home-promo-emoji { font-size: 2rem; line-height: 1; flex-shrink: 0; }
+.home-promo-body  { flex: 1; min-width: 0; }
+.home-promo-title {
+  font-family: 'Cinzel', serif;
+  font-weight: 700;
+  color: var(--text-gold);
+  font-size: 0.9rem;
+  line-height: 1.25;
+}
+.home-promo-sub { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.15rem; }
+.home-promo-cta {
+  background: var(--header-gold);
+  color: var(--header-dark);
+  font-weight: 700;
+  font-size: 0.75rem;
+  border-radius: var(--radius);
+  padding: 0.3rem 0.6rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ── Home: market tiles grid ──────────────────────────────────────────────── */
+.section-count { font-family: 'Rajdhani', sans-serif; font-size: 0.9rem; font-weight: 500; color: var(--text-dim); }
+.home-market-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.home-market-tile {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: var(--card-bg);
+  border: 1px solid var(--divider);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.9rem;
+  transition: border-color 0.12s;
+}
+.home-market-tile:hover { border-color: var(--card-border); }
+.home-market-tile-body { flex: 1; min-width: 0; }
+.home-market-label { font-weight: 600; font-size: 0.95rem; }
+.home-market-sub   { color: var(--text-dim); font-size: 0.8rem; margin-top: 0.1rem; }
+.home-market-meta  { font-size: 0.75rem; margin-top: 0.1rem; }
+.home-market-tile-right { display: flex; flex-direction: column; align-items: flex-end; gap: 0.35rem; flex-shrink: 0; }
+.home-market-odds  { font-weight: 700; font-size: 1.05rem; }
+.home-market-actions { display: flex; gap: 0.3rem; }
+
+/* ── Home: featured parlays rail ──────────────────────────────────────────── */
+.home-parlay-rail {
+  display: flex;
+  gap: 0.75rem;
+  overflow-x: auto;
+  padding-bottom: 0.25rem;
+  scrollbar-width: none;
+}
+.home-parlay-rail::-webkit-scrollbar { display: none; }
+.home-parlay-card {
+  flex-shrink: 0;
+  min-width: 240px;
+  max-width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.home-parlay-head  { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.home-parlay-name  { font-family: 'Cinzel', serif; font-weight: 700; font-size: 0.9rem; flex: 1; min-width: 0; }
+.home-parlay-desc  { font-size: 0.8rem; }
+.home-parlay-legs  { list-style: none; display: flex; flex-direction: column; gap: 0.2rem; }
+.home-parlay-legs li { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.82rem; }
+.home-parlay-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 0.25rem; }
+.home-parlay-odds  { font-weight: 700; font-size: 1rem; font-family: 'Cinzel', serif; }
+
 /* ── Scrollbar ────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg-mid); }

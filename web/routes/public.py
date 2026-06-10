@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import func, select, text
 
-from bot.database.models import Alliance, Bet, BettingPhase, Market, Tribute, User
+from bot.odds.calculator import combined_american
+
+from bot.database.models import Alliance, Bet, BettingPhase, Market, ParlayTemplate, ParlayTemplateLeg, Tribute, User
 from web.database import get_db
 from web.deps import optional_user
 from web.session import SessionUser
@@ -31,29 +35,84 @@ async def home(request: Request, user: SessionUser | None = Depends(optional_use
         )).scalars().all()
         win_markets = {m.tribute_a_id: m for m in win_markets_raw}
 
+        open_markets = (await db.execute(
+            select(Market).where(Market.status == "OPEN").order_by(Market.created_at.desc())
+        )).scalars().all()
+
+        bet_counts_raw = (await db.execute(
+            select(Bet.market_id, func.count(Bet.id)).group_by(Bet.market_id)
+        )).all()
+        bet_counts = {row[0]: row[1] for row in bet_counts_raw}
+
+        tribute_ids = {m.tribute_a_id for m in open_markets if m.tribute_a_id} | \
+                      {m.tribute_b_id for m in open_markets if m.tribute_b_id}
+        tributes_map: dict = {}
+        if tribute_ids:
+            t_rows = (await db.execute(
+                select(Tribute).where(Tribute.id.in_(tribute_ids))
+            )).scalars().all()
+            tributes_map = {t.id: t for t in t_rows}
+
         leaderboard = (await db.execute(
             select(User).order_by(User.chips.desc()).limit(10)
         )).scalars().all()
 
-        open_count = (await db.execute(
-            select(func.count(Market.id)).where(Market.status == "OPEN")
-        )).scalar() or 0
-
+        open_count = len(open_markets)
         alive_count = (await db.execute(
             select(func.count(Tribute.id)).where(Tribute.status == "ALIVE")
         )).scalar() or 0
 
         phase_name = await _phase_name(db)
 
+        # Banners
+        banner_row = (await db.execute(
+            text("SELECT value FROM game_settings WHERE key='activity_banners'")
+        )).fetchone()
+        banners = json.loads(banner_row[0]) if banner_row else []
+
+        # Featured parlay templates
+        tpl_raw = (await db.execute(
+            select(ParlayTemplate).where(ParlayTemplate.active == True)
+            .order_by(ParlayTemplate.created_at.desc()).limit(6)
+        )).scalars().all()
+        featured_parlays = []
+        for tpl in tpl_raw:
+            legs = (await db.execute(
+                select(ParlayTemplateLeg)
+                .where(ParlayTemplateLeg.template_id == tpl.id)
+                .order_by(ParlayTemplateLeg.sort_order)
+            )).scalars().all()
+            leg_markets = []
+            for leg in legs:
+                mkt = await db.get(Market, leg.market_id)
+                if mkt:
+                    leg_markets.append(mkt)
+            odds_list = [m.odds for m in leg_markets if m.status == "OPEN"]
+            combined = combined_american(odds_list) if len(odds_list) >= 2 else None
+            featured_parlays.append({
+                "id": tpl.id, "name": tpl.name, "description": tpl.description,
+                "difficulty": tpl.difficulty, "combined_odds": combined,
+                "legs": leg_markets,
+            })
+
+    def fmt_odds(n):
+        return f"+{n}" if n >= 0 else str(n)
+
     return request.app.state.templates.TemplateResponse("home.html", {
         "request": request,
         "user": user,
         "tributes": tributes,
         "win_markets": win_markets,
+        "open_markets": open_markets,
+        "bet_counts": bet_counts,
+        "tributes_map": tributes_map,
         "leaderboard": leaderboard,
         "open_count": open_count,
         "alive_count": alive_count,
         "phase_name": phase_name,
+        "banners": banners,
+        "featured_parlays": featured_parlays,
+        "fmt_odds": fmt_odds,
     })
 
 
