@@ -196,7 +196,76 @@ body {
 .toast-error { border-color: var(--lost); color: #ffd9d9; }
 .toast-success { border-color: var(--won); }
 
+/* ── Home: search bar ────────────────────────────────────────────────────── */
+.home-search { padding: .5rem .75rem .25rem; }
+.home-search-input {
+  width: 100%; background: var(--bg-mid); border: 1px solid var(--divider);
+  border-radius: 999px; color: var(--text-white); padding: .45rem .9rem;
+  font-family: 'Rajdhani', sans-serif; font-size: .95rem;
+}
+.home-search-input:focus { outline: none; border-color: var(--card-border); }
+.home-search-input::placeholder { color: var(--text-dim); }
+
+/* ── Home: category pills ─────────────────────────────────────────────────── */
+.cat-pills {
+  display: flex; gap: .45rem; overflow-x: auto; padding: .5rem .75rem;
+  scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+.cat-pills::-webkit-scrollbar { display: none; }
+.cat-pill {
+  display: flex; flex-direction: column; align-items: center; gap: .15rem;
+  background: var(--card-bg); border: 1px solid var(--divider);
+  border-radius: var(--radius); padding: .45rem .6rem;
+  cursor: pointer; white-space: nowrap; min-width: 56px;
+  font-family: 'Rajdhani', sans-serif; color: var(--text-dim);
+  transition: border-color .12s, color .12s;
+}
+.cat-pill:hover { border-color: var(--card-border); color: var(--text-white); }
+.cat-pill.active { border-color: var(--header-gold); color: var(--header-gold); }
+.cat-icon { font-size: 1.3rem; line-height: 1; }
+.cat-label { font-size: .65rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+
+/* ── Home: promo banners ──────────────────────────────────────────────────── */
+.promo-rail {
+  display: flex; gap: .6rem; overflow-x: auto; padding: .25rem .75rem .5rem;
+  scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+.promo-rail::-webkit-scrollbar { display: none; }
+.promo-card {
+  display: flex; align-items: center; gap: .6rem; flex-shrink: 0;
+  background: var(--card-bg); border: 1px solid var(--card-border);
+  border-radius: var(--radius); padding: .6rem .8rem;
+  min-width: 220px; max-width: 280px;
+}
+.promo-emoji { font-size: 1.8rem; line-height: 1; flex-shrink: 0; }
+.promo-body { flex: 1; min-width: 0; }
+.promo-title { font-family: 'Cinzel', serif; font-weight: 700; color: var(--text-gold); font-size: .85rem; line-height: 1.2; }
+.promo-sub { color: var(--text-dim); font-size: .72rem; margin-top: .15rem; }
+.promo-cta {
+  background: var(--header-gold); color: var(--header-dark);
+  font-weight: 700; font-size: .72rem; border-radius: var(--radius);
+  padding: .3rem .55rem; white-space: nowrap; flex-shrink: 0;
+}
+
+/* ── Home: featured parlays rail ─────────────────────────────────────────── */
+.feat-rail {
+  display: flex; gap: .6rem; overflow-x: auto; padding: 0 .75rem .75rem;
+  scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+.feat-rail::-webkit-scrollbar { display: none; }
+.feat-parlay-card {
+  flex-shrink: 0; min-width: 220px; max-width: 280px;
+  display: flex; flex-direction: column; gap: .3rem;
+}
+.feat-parlay-head { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+.feat-parlay-name { font-weight: 700; font-size: .9rem; flex: 1; min-width: 0; }
+.feat-parlay-desc { font-size: .78rem; }
+.feat-parlay-footer { display: flex; align-items: center; justify-content: space-between; margin-top: .25rem; }
+.feat-parlay-odds { font-weight: 700; font-size: 1rem; }
+
 @media (min-width: 600px) {
   .brand { font-size: 1.1rem; }
   .tabs a { font-size: .9rem; }
+  .promo-card { min-width: 260px; }
+  .feat-parlay-card { min-width: 260px; }
 }

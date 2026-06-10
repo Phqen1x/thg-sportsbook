@@ -59,7 +59,6 @@ async function authenticate() {
     location.hostname.endsWith("discordsays.com") || params.has("frame_id");
 
   // Dev/standalone shortcut: allow a pre-minted token via ?token= or localStorage
-  // so the UI/API can be exercised in a normal browser tab.
   const devToken = params.get("token") || localStorage.getItem("sb_dev_token");
   if (!isEmbedded && devToken) {
     TOKEN = devToken;
@@ -77,7 +76,7 @@ async function authenticate() {
     response_type: "code",
     state: "",
     prompt: "none",
-    scope: ["identify", "guilds", "guilds.members.read"],
+    scope: ["identify"],
   });
   const result = await api("/token", { method: "POST", body: { code } });
   TOKEN = result.token;
@@ -186,17 +185,148 @@ function marketCard(m, { actions = "member" } = {}) {
     </div>`;
 }
 
-// ── Views: Markets ─────────────────────────────────────────────────────────────
+// Category filter logic: returns true if market matches category key
+const VICTOR_TYPES = new Set(["TRIBUTE_WINS", "DISTRICT_VICTOR", "ALLIANCE_VICTOR"]);
+
+function matchesCat(m, cat) {
+  if (!cat) return true;
+  if (cat === "victor")   return VICTOR_TYPES.has(m.type);
+  if (cat === "tribute")  return !VICTOR_TYPES.has(m.type) && (m.tribute_a != null || m.tribute_b != null);
+  if (cat === "district") return m.type === "DISTRICT_VICTOR";
+  if (cat === "alliance") return m.type === "ALLIANCE_VICTOR";
+  if (cat === "props")    return !VICTOR_TYPES.has(m.type) && m.tribute_a == null && m.tribute_b == null;
+  return true;
+}
+
+// ── Views: Markets (home) ──────────────────────────────────────────────────────
+
+const CATS = [
+  { key: "",         icon: "⚔️",  label: "All" },
+  { key: "victor",   icon: "🏆",  label: "Victor" },
+  { key: "tribute",  icon: "🗡️",  label: "Tributes" },
+  { key: "district", icon: "🏰",  label: "Districts" },
+  { key: "alliance", icon: "🤝",  label: "Alliances" },
+  { key: "props",    icon: "🎯",  label: "Props" },
+];
 
 async function viewMarkets(view) {
-  const data = await api(`/markets?status=open`);
-  const list = data.markets;
+  const [marketsData, tailData, bannersData] = await Promise.all([
+    api("/markets?status=open"),
+    api("/tail").catch(() => ({ templates: [] })),
+    api("/banners").catch(() => ({ banners: [] })),
+  ]);
+
+  const allMarkets = marketsData.markets;
+  const templates  = tailData.templates || [];
+  const banners    = bannersData.banners || [];
+
   view.innerHTML = `
-    ${data.phase_name ? `<div class="phase-banner">Phase: ${esc(data.phase_name)}</div>` : ""}
+    ${marketsData.phase_name
+      ? `<div class="phase-banner">Phase: ${esc(marketsData.phase_name)}</div>`
+      : ""}
+
+    <div class="home-search">
+      <input class="home-search-input" id="mkt-search"
+        placeholder="Search tributes, districts, alliances…" autocomplete="off" type="search">
+    </div>
+
+    <div class="cat-pills" id="cat-pills">
+      ${CATS.map((c) => `
+        <button class="cat-pill${c.key === "" ? " active" : ""}" data-cat="${esc(c.key)}">
+          <span class="cat-icon">${c.icon}</span>
+          <span class="cat-label">${c.label}</span>
+        </button>`).join("")}
+    </div>
+
+    ${banners.length ? `
+    <div class="promo-rail">
+      ${banners.map((b) => `
+        <div class="promo-card" style="${b.color ? `border-color:${esc(b.color)}` : ""}">
+          <div class="promo-emoji">${esc(b.emoji || "🏆")}</div>
+          <div class="promo-body">
+            <div class="promo-title">${esc(b.title)}</div>
+            ${b.subtitle ? `<div class="promo-sub">${esc(b.subtitle)}</div>` : ""}
+          </div>
+          ${b.cta ? `<div class="promo-cta">${esc(b.cta)}</div>` : ""}
+        </div>`).join("")}
+    </div>` : ""}
+
+    <h2 class="section-title" id="mkts-heading">Open Markets</h2>
     <div class="list" id="market-list">
-      ${list.length ? list.map((m) => marketCard(m)).join("") : `<div class="empty">No open markets right now.</div>`}
-    </div>`;
+      ${allMarkets.length
+        ? allMarkets.map((m) => marketCard(m)).join("")
+        : `<div class="empty">No open markets right now.</div>`}
+    </div>
+
+    ${templates.length ? `
+    <h2 class="section-title">Featured Parlays</h2>
+    <div class="feat-rail">
+      ${templates.map((t) => featuredParlayCard(t)).join("")}
+    </div>` : ""}`;
+
   bindMemberMarketActions(view);
+  bindFeaturedParlayActions(view);
+
+  let activeCat = "";
+  let searchQ   = "";
+
+  function refilter() {
+    const q = searchQ.toLowerCase();
+    const filtered = allMarkets.filter((m) => {
+      if (!matchesCat(m, activeCat)) return false;
+      if (!q) return true;
+      return (
+        m.label.toLowerCase().includes(q) ||
+        (m.tribute_a && m.tribute_a.toLowerCase().includes(q)) ||
+        (m.tribute_b && m.tribute_b.toLowerCase().includes(q))
+      );
+    });
+    const listEl = $("#market-list", view);
+    const heading = $("#mkts-heading", view);
+    if (heading) heading.textContent = `Open Markets${filtered.length !== allMarkets.length ? ` (${filtered.length})` : ""}`;
+    listEl.innerHTML = filtered.length
+      ? filtered.map((m) => marketCard(m)).join("")
+      : `<div class="empty">No markets match.</div>`;
+    bindMemberMarketActions(view);
+  }
+
+  const searchEl = $("#mkt-search", view);
+  searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); refilter(); });
+
+  view.querySelectorAll(".cat-pill").forEach((pill) =>
+    pill.addEventListener("click", () => {
+      view.querySelectorAll(".cat-pill").forEach((p) => p.classList.remove("active"));
+      pill.classList.add("active");
+      activeCat = pill.dataset.cat;
+      refilter();
+    }));
+}
+
+function featuredParlayCard(t) {
+  return `
+    <div class="feat-parlay-card card">
+      <div class="feat-parlay-head">
+        <span class="feat-parlay-name">${esc(t.name)}</span>
+        ${t.difficulty ? `<span class="badge">${esc(t.difficulty)}</span>` : ""}
+      </div>
+      ${t.description ? `<div class="dim feat-parlay-desc">${esc(t.description)}</div>` : ""}
+      <ul class="parlay-legs">
+        ${t.legs.map((m) => `<li>${esc(m.label)} <span class="${oddsClass(m.odds)}">${fmtOdds(m.odds)}</span></li>`).join("")}
+      </ul>
+      <div class="feat-parlay-footer">
+        <span class="${oddsClass(t.combined_odds)} feat-parlay-odds">${t.combined_odds == null ? "—" : fmtOdds(t.combined_odds)}</span>
+        <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}">Tail this</button>
+      </div>
+    </div>`;
+}
+
+function bindFeaturedParlayActions(view) {
+  view.querySelectorAll('[data-act="tail"]').forEach((b) =>
+    b.addEventListener("click", () => openWagerModal({
+      title: "Tail Parlay",
+      onSubmit: (wager) => api(`/tail/${b.dataset.id}`, { method: "POST", body: { wager } }),
+      after: () => { location.hash = "#mybets"; },
+    })));
 }
 
 function bindMemberMarketActions(view) {
@@ -381,19 +511,21 @@ async function viewAdmin(view) {
   const sub = (location.hash.split("/")[1]) || "markets";
   view.innerHTML = `
     <div class="subtabs">
-      <a href="#admin/markets" class="${sub === "markets" ? "active" : ""}">Markets</a>
-      <a href="#admin/chips" class="${sub === "chips" ? "active" : ""}">Chips</a>
+      <a href="#admin/markets"  class="${sub === "markets"  ? "active" : ""}">Markets</a>
+      <a href="#admin/chips"    class="${sub === "chips"    ? "active" : ""}">Chips</a>
       <a href="#admin/tributes" class="${sub === "tributes" ? "active" : ""}">Tributes</a>
+      <a href="#admin/banners"  class="${sub === "banners"  ? "active" : ""}">Banners</a>
     </div>
     <div id="admin-body"><div class="loading-inline">Loading…</div></div>`;
   const body = $("#admin-body", view);
-  if (sub === "chips") return adminChips(body);
+  if (sub === "chips")    return adminChips(body);
   if (sub === "tributes") return adminTributes(body);
+  if (sub === "banners")  return adminBanners(body);
   return adminMarkets(body);
 }
 
 async function adminMarkets(body) {
-  const data = await api(`/markets?status=open`);
+  const data   = await api(`/markets?status=open`);
   const closed = await api(`/markets?status=closed`);
   const all = [...data.markets, ...closed.markets];
   body.innerHTML = `<div class="list">
@@ -454,7 +586,7 @@ async function adminTributes(body) {
         <div class="tribute-name">${esc(t.name)} <span class="dim">${esc(t.gender)}</span></div>
         ${t.status === "ALIVE" ? `
           <div class="row-buttons">
-            <button class="btn btn-outline btn-sm" data-act="kill" data-id="${t.id}" data-name="${esc(t.name)}">Eliminate</button>
+            <button class="btn btn-outline btn-sm" data-act="kill"   data-id="${t.id}" data-name="${esc(t.name)}">Eliminate</button>
             <button class="btn btn-primary btn-sm" data-act="victor" data-id="${t.id}" data-name="${esc(t.name)}">Victor</button>
           </div>` : ""}
       </div>`).join("")}
@@ -465,6 +597,57 @@ async function adminTributes(body) {
     b.addEventListener("click", async () => {
       if (!confirm(`Crown ${b.dataset.name} as Victor?`)) return;
       await doAction(`/admin/tribute/${b.dataset.id}/victor`, "POST");
+    }));
+}
+
+async function adminBanners(body) {
+  const { banners } = await api("/banners").catch(() => ({ banners: [] }));
+  body.innerHTML = `
+    <div class="card admin-form" id="banner-form">
+      <input id="b-title"    class="input" placeholder="Title (required)" maxlength="80">
+      <input id="b-subtitle" class="input" placeholder="Subtitle (optional)" maxlength="120">
+      <div class="row-buttons">
+        <input id="b-emoji" class="input" placeholder="Emoji e.g. 🏆" style="max-width:90px" maxlength="8">
+        <input id="b-cta"   class="input" placeholder="Button text e.g. Opt In" maxlength="30">
+        <input id="b-color" class="input" placeholder="#hex accent (optional)" maxlength="20">
+      </div>
+      <button class="btn btn-primary" id="b-add">Add Banner</button>
+    </div>
+    <div class="list" id="banner-list">
+      ${banners.length
+        ? banners.map((b) => `
+          <div class="card market-card">
+            <div class="market-main">
+              <div class="market-label">${esc(b.emoji || "")} ${esc(b.title)}</div>
+              ${b.subtitle ? `<div class="market-sub">${esc(b.subtitle)}</div>` : ""}
+              ${b.cta ? `<div class="dim">${esc(b.cta)}</div>` : ""}
+            </div>
+            <button class="btn btn-outline btn-sm" data-act="del-banner" data-id="${esc(b.id)}">Remove</button>
+          </div>`).join("")
+        : `<div class="empty">No banners yet.</div>`}
+    </div>`;
+
+  $("#b-add", body).addEventListener("click", async () => {
+    const title    = $("#b-title", body).value.trim();
+    const subtitle = $("#b-subtitle", body).value.trim();
+    const emoji    = $("#b-emoji", body).value.trim() || "🏆";
+    const cta      = $("#b-cta", body).value.trim();
+    const color    = $("#b-color", body).value.trim();
+    if (!title) return toast("Title is required.", "error");
+    try {
+      const r = await api("/admin/banners/add", { method: "POST", body: { title, subtitle, emoji, cta, color } });
+      toast(r.message);
+      adminBanners(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  body.querySelectorAll('[data-act="del-banner"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/banners/${btn.dataset.id}`, { method: "DELETE" });
+        toast(r.message);
+        adminBanners(body);
+      } catch (e) { toast(e.message, "error"); }
     }));
 }
 
@@ -489,7 +672,6 @@ function modal(innerHtml) {
 }
 
 async function openBetModal(marketId) {
-  // Pull current odds from the open markets list (cheap + already cached server-side).
   const data = await api(`/markets?status=open`);
   const m = data.markets.find((x) => x.id === marketId);
   if (!m) return toast("Market is no longer open.", "error");
@@ -569,11 +751,11 @@ function openResolveModal(marketId) {
 function openKillModal(tributeId, name) {
   const overlay = modal(`
     <h3>Eliminate ${esc(name)}</h3>
-    <input id="k-cause" class="input" placeholder="Death cause" value="Another Tribute">
+    <input id="k-cause"  class="input" placeholder="Death cause" value="Another Tribute">
     <input id="k-killer" class="input" type="number" placeholder="Killed by (tribute ID, optional)">
-    <input id="k-place" class="input" type="number" placeholder="Final placement (optional)">
+    <input id="k-place"  class="input" type="number" placeholder="Final placement (optional)">
     <div class="row-buttons">
-      <button class="btn btn-lost" id="k-go">Eliminate</button>
+      <button class="btn btn-lost"    id="k-go">Eliminate</button>
       <button class="btn btn-outline" id="k-cancel">Cancel</button>
     </div>`);
   $("#k-cancel", overlay).addEventListener("click", () => overlay.remove());
@@ -601,7 +783,11 @@ function openKillModal(tributeId, name) {
     if (!location.hash) location.hash = "#markets";
     await route();
   } catch (e) {
-    document.getElementById("app").innerHTML =
-      `<div class="fatal"><div class="loading-crest">⚔</div><p>${esc(e.message)}</p></div>`;
+    document.getElementById("app").innerHTML = `
+      <div class="fatal">
+        <div class="loading-crest">⚔</div>
+        <p>${esc(e.message)}</p>
+        <button class="btn btn-outline" onclick="location.reload()">Try Again</button>
+      </div>`;
   }
 })();

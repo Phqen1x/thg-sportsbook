@@ -713,6 +713,67 @@ async def _settle_parlay(db, parlay_id: int) -> None:
                 db_user.chips += parlay.total_wager
 
 
+@router.get("/banners")
+async def banners(user: SessionUser = Depends(bearer_user)):
+    async with get_db() as db:
+        row = (await db.execute(text("SELECT value FROM game_settings WHERE key='activity_banners'"))).fetchone()
+    items = json.loads(row[0]) if row else []
+    return {"banners": items}
+
+
+@router.post("/admin/banners/add")
+async def admin_banners_add(
+    admin: SessionUser = Depends(bearer_admin),
+    title: Annotated[str, Body()] = "",
+    subtitle: Annotated[str, Body()] = "",
+    emoji: Annotated[str, Body()] = "🏆",
+    color: Annotated[str, Body()] = "",
+    cta: Annotated[str, Body()] = "",
+):
+    if not title.strip():
+        raise HTTPException(status_code=400, detail="Title is required.")
+    import time
+    banner = {
+        "id": str(int(time.time() * 1000)),
+        "title": title.strip()[:80],
+        "subtitle": subtitle.strip()[:120],
+        "emoji": emoji.strip()[:8] or "🏆",
+        "color": color.strip()[:20],
+        "cta": cta.strip()[:30],
+    }
+    async with get_db() as db:
+        row = (await db.execute(text("SELECT value FROM game_settings WHERE key='activity_banners'"))).fetchone()
+        existing = json.loads(row[0]) if row else []
+        existing.append(banner)
+        if row:
+            await db.execute(
+                text("UPDATE game_settings SET value=:v WHERE key='activity_banners'"),
+                {"v": json.dumps(existing)},
+            )
+        else:
+            await db.execute(
+                text("INSERT INTO game_settings (key, value) VALUES ('activity_banners', :v)"),
+                {"v": json.dumps(existing)},
+            )
+        await db.commit()
+    return {"ok": True, "message": "Banner added.", "banner": banner}
+
+
+@router.delete("/admin/banners/{banner_id}")
+async def admin_banners_delete(banner_id: str, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        row = (await db.execute(text("SELECT value FROM game_settings WHERE key='activity_banners'"))).fetchone()
+        existing = json.loads(row[0]) if row else []
+        updated = [b for b in existing if b.get("id") != banner_id]
+        if row:
+            await db.execute(
+                text("UPDATE game_settings SET value=:v WHERE key='activity_banners'"),
+                {"v": json.dumps(updated)},
+            )
+            await db.commit()
+    return {"ok": True, "message": "Banner removed."}
+
+
 @router.get("/admin/users")
 async def admin_users(admin: SessionUser = Depends(bearer_admin)):
     async with get_db() as db:
