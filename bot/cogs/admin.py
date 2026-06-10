@@ -1679,6 +1679,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     TierEntry = tuple[str, int, list[Market], str]  # theme_type, theme_key, legs, tier_name
     selected: list[TierEntry] = []
     used_leg_sets: set[frozenset[int]] = set()
+    tribute_used = False  # at most one tribute-centric parlay across all tiers
 
     for tier_name, min_l, max_l in _TIER_SPECS:
         tier_cands: list[tuple[str, int, list[Market]]] = []
@@ -1706,9 +1707,19 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
 
         # Among candidates for this tier, prefer more market-type diversity, then more legs
         tier_cands.sort(key=lambda c: (len({m.type for m in c[2]}), len(c[2])), reverse=True)
-        best_type, best_key, best_legs = tier_cands[0]
+
+        # Prefer non-tribute grouping if a tribute-centric parlay was already selected
+        best: tuple[str, int, list[Market]] | None = None
+        if tribute_used:
+            best = next((c for c in tier_cands if c[0] != "tribute"), None)
+        if best is None:
+            best = tier_cands[0]
+
+        best_type, best_key, best_legs = best
         selected.append((best_type, best_key, best_legs, tier_name))
         used_leg_sets.add(frozenset(l.id for l in best_legs))
+        if best_type == "tribute":
+            tribute_used = True
 
     # Persist
     created = 0
