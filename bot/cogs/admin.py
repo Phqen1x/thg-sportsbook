@@ -1666,60 +1666,69 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     if not groupings:
         return 0
 
-    # Build exactly one parlay per difficulty tier by targeting leg count ranges:
-    #   SAFE:     2–4 legs, best available odds (probability high→low)
-    #   BALANCED: 4–6 legs, best available odds
-    #   LONGSHOT: 6–8 legs; fallback to worst-odds pick if not enough markets
-    _TIER_SPECS: list[tuple[str, int, int]] = [
-        ("SAFE",     2, 4),
-        ("BALANCED", 4, 6),
-        ("LONGSHOT", 6, 8),
+    # Distribute `count` slots across tiers as evenly as possible.
+    # SAFE gets extras first, then BALANCED, so LONGSHOT is never short-changed.
+    n_each = count // 3
+    rem = count % 3
+    tier_allocations: list[tuple[str, int, int, int]] = [
+        ("SAFE",     n_each + (1 if rem >= 1 else 0), 2, 4),
+        ("BALANCED", n_each + (1 if rem >= 2 else 0), 4, 6),
+        ("LONGSHOT", n_each,                           6, 8),
     ]
+
+    # Tribute cap: no more than ceil(count/3) tribute-centric parlays total,
+    # and each individual tribute may only anchor one parlay.
+    import math as _math
+    max_tribute = _math.ceil(count / 3)
+    tribute_count = 0
+    used_tribute_keys: set[int] = set()
 
     TierEntry = tuple[str, int, list[Market], str]  # theme_type, theme_key, legs, tier_name
     selected: list[TierEntry] = []
     used_leg_sets: set[frozenset[int]] = set()
-    tribute_used = False  # at most one tribute-centric parlay across all tiers
 
-    for tier_name, min_l, max_l in _TIER_SPECS:
-        tier_cands: list[tuple[str, int, list[Market]]] = []
-        for theme_type, theme_key, mkts in groupings:
-            legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l)
-            if len(legs) >= min_l:
-                leg_key = frozenset(l.id for l in legs)
-                if leg_key not in used_leg_sets:
-                    tier_cands.append((theme_type, theme_key, legs))
+    def _tribute_allowed(theme_type: str, theme_key: int) -> bool:
+        if theme_type != "tribute":
+            return True
+        return theme_key not in used_tribute_keys and tribute_count < max_tribute
 
-        # LONGSHOT fallback: no grouping has 6+ eligible markets — pick worst odds instead
-        if not tier_cands and tier_name == "LONGSHOT":
+    for tier_name, n_slots, min_l, max_l in tier_allocations:
+        for _slot in range(n_slots):
+            tier_cands: list[tuple[str, int, list[Market]]] = []
             for theme_type, theme_key, mkts in groupings:
-                legs = _pick_themed_legs(
-                    mkts, max_legs=_MAX_PARLAY_LEGS, min_legs=_MIN_PARLAY_LEGS,
-                    worst_odds_first=True,
-                )
-                if len(legs) >= _MIN_PARLAY_LEGS:
+                if not _tribute_allowed(theme_type, theme_key):
+                    continue
+                legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l)
+                if len(legs) >= min_l:
                     leg_key = frozenset(l.id for l in legs)
                     if leg_key not in used_leg_sets:
                         tier_cands.append((theme_type, theme_key, legs))
 
-        if not tier_cands:
-            continue
+            # LONGSHOT fallback: relax to worst-odds if no grouping has 6+ legs
+            if not tier_cands and tier_name == "LONGSHOT":
+                for theme_type, theme_key, mkts in groupings:
+                    if not _tribute_allowed(theme_type, theme_key):
+                        continue
+                    legs = _pick_themed_legs(
+                        mkts, max_legs=_MAX_PARLAY_LEGS, min_legs=_MIN_PARLAY_LEGS,
+                        worst_odds_first=True,
+                    )
+                    if len(legs) >= _MIN_PARLAY_LEGS:
+                        leg_key = frozenset(l.id for l in legs)
+                        if leg_key not in used_leg_sets:
+                            tier_cands.append((theme_type, theme_key, legs))
 
-        # Among candidates for this tier, prefer more market-type diversity, then more legs
-        tier_cands.sort(key=lambda c: (len({m.type for m in c[2]}), len(c[2])), reverse=True)
+            if not tier_cands:
+                break
 
-        # Prefer non-tribute grouping if a tribute-centric parlay was already selected
-        best: tuple[str, int, list[Market]] | None = None
-        if tribute_used:
-            best = next((c for c in tier_cands if c[0] != "tribute"), None)
-        if best is None:
-            best = tier_cands[0]
-
-        best_type, best_key, best_legs = best
-        selected.append((best_type, best_key, best_legs, tier_name))
-        used_leg_sets.add(frozenset(l.id for l in best_legs))
-        if best_type == "tribute":
-            tribute_used = True
+            # More market-type diversity first, then more legs
+            tier_cands.sort(key=lambda c: (len({m.type for m in c[2]}), len(c[2])), reverse=True)
+            best_type, best_key, best_legs = tier_cands[0]
+            selected.append((best_type, best_key, best_legs, tier_name))
+            used_leg_sets.add(frozenset(l.id for l in best_legs))
+            if best_type == "tribute":
+                tribute_count += 1
+                used_tribute_keys.add(best_key)
 
     # Persist
     created = 0
