@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -12,6 +13,17 @@ from web.routes import activity, auth, public, member, admin
 
 HERE = Path(__file__).parent
 ACTIVITY_DIR = HERE / "activity"
+
+def _static_version() -> str:
+    """Short hash of app.js + style.css content for cache-busting."""
+    h = hashlib.md5()
+    for name in ("static/app.js", "static/style.css"):
+        f = ACTIVITY_DIR / name
+        if f.exists():
+            h.update(f.read_bytes())
+    return h.hexdigest()[:8]
+
+_VERSION = _static_version()
 
 # Discord embeds the Activity in an iframe served from *.discordsays.com and
 # proxies all traffic, so we must permit framing by Discord (and never send
@@ -49,6 +61,7 @@ def _render_activity_index(in_discord: bool) -> HTMLResponse:
         html.replace("%%BASE%%", base)
         .replace("%%PROXY%%", proxy)
         .replace("%%CLIENT_ID%%", config.DISCORD_CLIENT_ID)
+        .replace("%%VERSION%%", _VERSION)
     )
     resp = HTMLResponse(html)
     resp.headers["Content-Security-Policy"] = _ACTIVITY_CSP

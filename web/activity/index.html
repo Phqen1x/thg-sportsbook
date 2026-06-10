@@ -7,7 +7,7 @@
        so every relative asset URL resolves through Discord's proxy. -->
   <base href="%%BASE%%">
   <title>Capitol Sportsbook</title>
-  <link rel="stylesheet" href="static/style.css">
+  <link rel="stylesheet" href="static/style.css?v=%%VERSION%%">
   <script>
     // Runtime config injected by web/app.py. proxy is "/.proxy" inside Discord, "" otherwise.
     window.__ACTIVITY__ = { proxy: "%%PROXY%%", clientId: "%%CLIENT_ID%%" };
@@ -20,6 +20,6 @@
       <div class="loading-text">Entering the Capitol…</div>
     </div>
   </div>
-  <script type="module" src="static/app.js"></script>
+  <script type="module" src="static/app.js?v=%%VERSION%%"></script>
 </body>
 </html>
