@@ -1,5 +1,5 @@
 /* ── Capitol Sportsbook — Dark Gold Theme ─────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Rajdhani:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600;700;800&display=swap');
 
 :root {
   --bg:           #0A0A0A;
@@ -34,7 +34,7 @@ html { font-size: 16px; }
 body {
   background: var(--bg);
   color: var(--text-white);
-  font-family: 'Rajdhani', sans-serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-weight: 500;
   line-height: 1.5;
   min-height: 100vh;
@@ -60,7 +60,7 @@ a:hover { color: var(--header-gold); }
 }
 
 .brand {
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 1rem;
   font-weight: 700;
   color: var(--header-gold);
@@ -130,13 +130,13 @@ a:hover { color: var(--header-gold); }
   font-size: 0.8rem;
   color: var(--text-dim);
   text-align: center;
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   letter-spacing: 0.05em;
 }
 
 /* ── Typography ───────────────────────────────────────────────────────────── */
 h1, h2, h3 {
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-weight: 700;
   color: var(--header-gold);
   letter-spacing: 0.04em;
@@ -169,7 +169,7 @@ h3 { font-size: 1rem; }
 }
 
 .card-label {
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 0.65rem;
   font-weight: 700;
   letter-spacing: 0.12em;
@@ -184,7 +184,7 @@ h3 { font-size: 1rem; }
   justify-content: center;
   padding: 0.4rem 0.9rem;
   border-radius: var(--radius);
-  font-family: 'Rajdhani', sans-serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-weight: 700;
   font-size: 0.9rem;
   letter-spacing: 0.03em;
@@ -221,7 +221,7 @@ h3 { font-size: 1rem; }
   border: 1px solid var(--divider);
   border-radius: var(--radius);
   color: var(--text-white);
-  font-family: 'Rajdhani', sans-serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 0.95rem;
   font-weight: 500;
   padding: 0.45rem 0.75rem;
@@ -250,7 +250,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   font-size: 0.9rem;
 }
 .table th {
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 0.65rem;
   font-weight: 700;
   letter-spacing: 0.1em;
@@ -282,7 +282,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.06em;
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
 }
 .badge-alive    { background: rgba(76,175,80,0.15);  color: var(--alive); }
 .badge-dead     { background: rgba(85,85,85,0.2);    color: var(--dead); }
@@ -301,7 +301,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   display: inline-block;
   background: var(--divider);
   color: var(--text-gold);
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 0.7rem;
   font-weight: 700;
   padding: 0.1rem 0.4rem;
@@ -354,7 +354,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 }
 
 .hero-title {
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 2.2rem;
   font-weight: 700;
   color: var(--header-gold);
@@ -394,19 +394,19 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 .odds-card-header { display: flex; justify-content: space-between; align-items: center; }
 .card-victor { border-color: var(--victor); background: rgba(255,215,0,0.04); }
 
-.tribute-name { font-family: 'Cinzel', serif; font-size: 0.9rem; font-weight: 700; color: var(--text-white); }
+.tribute-name { font-family: 'Barlow Semi Condensed', sans-serif; font-size: 0.9rem; font-weight: 700; color: var(--text-white); }
 .tribute-sub  { font-size: 0.75rem; color: var(--text-dim); }
 
 .odds-display {
   font-size: 1.5rem;
   font-weight: 700;
   margin-top: 0.25rem;
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
 }
 .odds-pos { color: var(--odds-pos); }
 .odds-neg { color: var(--odds-neg); }
 .odds-na  { color: var(--text-dim); }
-.odds-big { font-size: 2.5rem; font-weight: 700; font-family: 'Cinzel', serif; margin: 0.5rem 0; }
+.odds-big { font-size: 2.5rem; font-weight: 700; font-family: 'Barlow Semi Condensed', sans-serif; margin: 0.5rem 0; }
 .odds-locked { font-size: 0.8rem; color: var(--text-dim); margin-top: 0.25rem; }
 
 /* ── Section Header ───────────────────────────────────────────────────────── */
@@ -439,7 +439,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   background: rgba(201,162,39,0.12);
   border: 1px solid var(--card-border);
   color: var(--text-gold);
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.1em;
@@ -458,7 +458,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 @media (max-width: 640px) { .bet-layout { grid-template-columns: 1fr; } }
 
 .market-detail { }
-.market-title { font-family: 'Cinzel', serif; font-size: 1.1rem; font-weight: 700; color: var(--text-white); margin-bottom: 0.5rem; }
+.market-title { font-family: 'Barlow Semi Condensed', sans-serif; font-size: 1.1rem; font-weight: 700; color: var(--text-white); margin-bottom: 0.5rem; }
 .tribute-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; }
 .tribute-tag { background: var(--divider); padding: 0.15rem 0.5rem; border-radius: 2px; font-size: 0.85rem; }
 .market-meta { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.85rem; }
@@ -483,7 +483,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   margin-bottom: -1px;
   padding: 0.5rem 1rem;
   color: var(--text-dim);
-  font-family: 'Rajdhani', sans-serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 0.9rem;
   font-weight: 700;
   cursor: pointer;
@@ -500,14 +500,14 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 .balance-layout { display: grid; grid-template-columns: 1fr 2fr; gap: 1.5rem; align-items: start; }
 @media (max-width: 640px) { .balance-layout { grid-template-columns: 1fr; } }
 .balance-chip-card { text-align: center; }
-.chip-count { font-size: 3rem; font-weight: 700; color: var(--text-gold); font-family: 'Cinzel', serif; }
+.chip-count { font-size: 3rem; font-weight: 700; color: var(--text-gold); font-family: 'Barlow Semi Condensed', sans-serif; }
 .chip-label { font-size: 0.85rem; color: var(--text-dim); letter-spacing: 0.08em; text-transform: uppercase; }
 
 /* ── Tail Board ───────────────────────────────────────────────────────────── */
 .tail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
 .tail-card { }
 .tail-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.25rem; }
-.tail-title { font-family: 'Cinzel', serif; font-size: 1rem; font-weight: 700; color: var(--text-white); }
+.tail-title { font-family: 'Barlow Semi Condensed', sans-serif; font-size: 1rem; font-weight: 700; color: var(--text-white); }
 .tail-desc  { font-size: 0.85rem; margin-bottom: 0.5rem; }
 .tail-form  { }
 
@@ -534,7 +534,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   top: 70px;
 }
 .sidebar-label {
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 0.6rem;
   font-weight: 700;
   letter-spacing: 0.14em;
@@ -587,7 +587,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   max-width: 480px;
   width: 90%;
 }
-.modal-title { font-family: 'Cinzel', serif; font-size: 1.1rem; color: var(--header-gold); margin-bottom: 1rem; }
+.modal-title { font-family: 'Barlow Semi Condensed', sans-serif; font-size: 1.1rem; color: var(--header-gold); margin-bottom: 1rem; }
 
 /* ── Alliance ─────────────────────────────────────────────────────────────── */
 .alliance-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
@@ -604,7 +604,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 
 /* ── Error Page ───────────────────────────────────────────────────────────── */
 .error-page { text-align: center; padding: 4rem 1rem; }
-.error-code { font-family: 'Cinzel', serif; font-size: 5rem; font-weight: 700; color: var(--card-border); }
+.error-code { font-family: 'Barlow Semi Condensed', sans-serif; font-size: 5rem; font-weight: 700; color: var(--card-border); }
 .error-message { font-size: 1.1rem; color: var(--text-dim); margin-top: 0.5rem; }
 
 /* ── Empty State ──────────────────────────────────────────────────────────── */
@@ -638,7 +638,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   border: 1px solid var(--divider);
   border-radius: 999px;
   color: var(--text-white);
-  font-family: 'Rajdhani', sans-serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-size: 0.95rem;
   padding: 0.5rem 1.1rem;
   transition: border-color 0.15s;
@@ -668,7 +668,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   cursor: pointer;
   white-space: nowrap;
   min-width: 64px;
-  font-family: 'Rajdhani', sans-serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   color: var(--text-dim);
   transition: border-color 0.15s, color 0.15s;
 }
@@ -702,7 +702,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 .home-promo-emoji { font-size: 2rem; line-height: 1; flex-shrink: 0; }
 .home-promo-body  { flex: 1; min-width: 0; }
 .home-promo-title {
-  font-family: 'Cinzel', serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-weight: 700;
   color: var(--text-gold);
   font-size: 0.9rem;
@@ -721,7 +721,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 }
 
 /* ── Home: market tiles grid ──────────────────────────────────────────────── */
-.section-count { font-family: 'Rajdhani', sans-serif; font-size: 0.9rem; font-weight: 500; color: var(--text-dim); }
+.section-count { font-family: 'Barlow Semi Condensed', sans-serif; font-size: 0.9rem; font-weight: 500; color: var(--text-dim); }
 .home-market-grid {
   display: flex;
   flex-direction: column;
@@ -765,15 +765,95 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   gap: 0.35rem;
 }
 .home-parlay-head  { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
-.home-parlay-name  { font-family: 'Cinzel', serif; font-weight: 700; font-size: 0.9rem; flex: 1; min-width: 0; }
+.home-parlay-name  { font-family: 'Barlow Semi Condensed', sans-serif; font-weight: 700; font-size: 0.9rem; flex: 1; min-width: 0; }
 .home-parlay-desc  { font-size: 0.8rem; }
 .home-parlay-legs  { list-style: none; display: flex; flex-direction: column; gap: 0.2rem; }
 .home-parlay-legs li { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.82rem; }
 .home-parlay-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 0.25rem; }
-.home-parlay-odds  { font-weight: 700; font-size: 1rem; font-family: 'Cinzel', serif; }
+.home-parlay-odds  { font-weight: 700; font-size: 1rem; font-family: 'Barlow Semi Condensed', sans-serif; }
 
 /* ── Scrollbar ────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg-mid); }
 ::-webkit-scrollbar-thumb { background: var(--divider); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--card-border); }
+
+/* ── Responsive: tablet (≤900px) ─────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .admin-layout { grid-template-columns: 1fr; }
+  .admin-sidebar { position: static; }
+}
+
+/* ── Responsive: mobile (≤640px) ─────────────────────────────────────────── */
+@media (max-width: 640px) {
+  /* Navbar: allow horizontal scroll on small screens */
+  .navbar { padding: 0 0.75rem; height: auto; min-height: 52px; flex-wrap: wrap; gap: 0.25rem; padding-top: 0.4rem; padding-bottom: 0.4rem; }
+  .brand { font-size: 0.85rem; }
+  .nav-links { gap: 0.1rem; overflow-x: auto; scrollbar-width: none; flex-wrap: nowrap; padding-bottom: 0.1rem; }
+  .nav-links::-webkit-scrollbar { display: none; }
+  .nav-links a { font-size: 0.78rem; padding: 0.2rem 0.45rem; white-space: nowrap; }
+  .nav-user { flex-shrink: 0; }
+  .nav-user span { display: none; }
+
+  /* Container */
+  .container { padding: 0.75rem; }
+
+  /* Typography */
+  h1 { font-size: 1.25rem; }
+  h2 { font-size: 1rem; }
+
+  /* Hero */
+  .hero { padding: 1.5rem 1rem; }
+  .hero-title { font-size: 1.5rem; letter-spacing: 0.06em; }
+  .hero-stats { gap: 1.5rem; }
+  .stat-num { font-size: 1.5rem; }
+
+  /* Tables: scroll horizontally */
+  .card:has(.table) { overflow-x: auto; }
+  .table { min-width: 480px; }
+  .table th, .table td { padding: 0.4rem 0.5rem; font-size: 0.82rem; }
+
+  /* Buttons */
+  .btn { font-size: 0.82rem; padding: 0.4rem 0.7rem; min-height: 36px; }
+  .btn-sm { font-size: 0.75rem; padding: 0.3rem 0.5rem; min-height: 32px; }
+  .btn-group { flex-wrap: wrap; }
+
+  /* Filter bar wraps */
+  .filter-bar { flex-wrap: wrap; }
+
+  /* Page header stacks */
+  .page-header { flex-direction: column; align-items: flex-start; }
+  .section-header { flex-wrap: wrap; gap: 0.4rem; }
+
+  /* Forms */
+  .form-row { grid-template-columns: 1fr; }
+  .input-row { flex-wrap: wrap; }
+
+  /* Bet / parlay layouts already have their own media queries at 640px */
+
+  /* Balance */
+  .balance-layout { grid-template-columns: 1fr; }
+  .chip-count { font-size: 2.25rem; }
+
+  /* Tail grid: single column */
+  .tail-grid { grid-template-columns: 1fr; }
+
+  /* Odds grid: 2 columns minimum */
+  .odds-grid { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+
+  /* Home tiles: tighten */
+  .home-market-label { font-size: 0.88rem; }
+  .home-market-odds  { font-size: 0.95rem; }
+  .home-market-actions .btn-sm { font-size: 0.68rem; padding: 0.25rem 0.4rem; }
+  .home-cat-pill { min-width: 52px; padding: 0.4rem 0.55rem; }
+  .home-cat-icon { font-size: 1.2rem; }
+  .home-cat-label { font-size: 0.6rem; }
+}
+
+/* ── Responsive: small mobile (≤400px) ───────────────────────────────────── */
+@media (max-width: 400px) {
+  .hero-title { font-size: 1.2rem; }
+  .brand { font-size: 0.78rem; }
+  .home-market-tile { flex-wrap: wrap; }
+  .home-market-tile-right { width: 100%; flex-direction: row; justify-content: space-between; align-items: center; border-top: 1px solid var(--divider); padding-top: 0.35rem; margin-top: 0.2rem; }
+}

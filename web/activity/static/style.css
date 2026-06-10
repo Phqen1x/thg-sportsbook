@@ -1,5 +1,5 @@
 /* Capitol Sportsbook — Discord Activity (mobile-first dark gold theme) */
-@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Rajdhani:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600;700;800&display=swap');
 
 :root {
   --bg: #0A0A0A;
@@ -28,7 +28,7 @@ html, body { height: 100%; }
 body {
   background: var(--bg);
   color: var(--text-white);
-  font-family: 'Rajdhani', sans-serif;
+  font-family: 'Barlow Semi Condensed', sans-serif;
   font-weight: 500;
   line-height: 1.45;
   overflow: hidden;
@@ -41,7 +41,7 @@ body {
   align-items: center; justify-content: center; gap: .75rem; text-align: center; padding: 2rem;
 }
 .loading-crest { font-size: 3rem; color: var(--header-gold); animation: pulse 1.6s ease-in-out infinite; }
-.loading-text, .fatal p { color: var(--text-dim); font-family: 'Cinzel', serif; }
+.loading-text, .fatal p { color: var(--text-dim); font-family: 'Barlow Semi Condensed', sans-serif; }
 .loading-inline { padding: 2rem; text-align: center; color: var(--text-dim); }
 @keyframes pulse { 0%,100% { opacity: .4; } 50% { opacity: 1; } }
 
@@ -52,7 +52,7 @@ body {
   border-bottom: 1px solid var(--card-border);
   padding: .5rem .75rem; flex-wrap: wrap;
 }
-.brand { font-family: 'Cinzel', serif; font-weight: 700; color: var(--header-gold); letter-spacing: .06em; font-size: .95rem; }
+.brand { font-family: 'Barlow Semi Condensed', sans-serif; font-weight: 700; color: var(--header-gold); letter-spacing: .06em; font-size: .95rem; }
 .tabs { display: flex; gap: .15rem; flex: 1; flex-wrap: wrap; overflow-x: auto; }
 .tabs a {
   color: var(--text-dim); text-decoration: none; font-weight: 600; font-size: .85rem;
@@ -70,7 +70,7 @@ body {
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: .5rem; }
 .empty { padding: 2rem; text-align: center; color: var(--text-dim); }
 .dim { color: var(--text-dim); font-size: .85rem; }
-.section-title { font-family: 'Cinzel', serif; color: var(--header-gold); font-size: 1rem; margin: .75rem 0 .4rem; }
+.section-title { font-family: 'Barlow Semi Condensed', sans-serif; color: var(--header-gold); font-size: 1rem; margin: .75rem 0 .4rem; }
 .phase-banner { background: var(--bg-mid); border-left: 3px solid var(--header-gold); padding: .4rem .6rem; margin-bottom: .6rem; color: var(--text-gold); font-weight: 600; border-radius: var(--radius); }
 
 .card {
@@ -108,14 +108,14 @@ body {
 .status-edge-dead { border-left-color: var(--voided); }
 .status-edge-victor { border-left-color: var(--header-gold); }
 .tribute-head { display: flex; justify-content: space-between; align-items: center; }
-.district { font-family: 'Cinzel', serif; color: var(--header-gold); font-weight: 700; font-size: .8rem; }
+.district { font-family: 'Barlow Semi Condensed', sans-serif; color: var(--header-gold); font-weight: 700; font-size: .8rem; }
 .tribute-name { font-weight: 600; }
 .tribute-stats { font-size: .78rem; }
 .tribute-bet { display: flex; align-items: center; justify-content: space-between; margin-top: .3rem; font-weight: 700; }
 
 /* ── Leaderboard ─────────────────────────────────────────────────────────── */
 .lb-row { display: flex; align-items: center; gap: .6rem; }
-.lb-rank { font-family: 'Cinzel', serif; color: var(--header-gold); font-weight: 700; min-width: 34px; }
+.lb-rank { font-family: 'Barlow Semi Condensed', sans-serif; color: var(--header-gold); font-weight: 700; min-width: 34px; }
 .lb-name { flex: 1; font-weight: 600; }
 .lb-me { border-color: var(--card-border); }
 
@@ -149,7 +149,7 @@ body {
 
 /* ── Buttons / inputs ────────────────────────────────────────────────────── */
 .btn {
-  font-family: 'Rajdhani', sans-serif; font-weight: 700; font-size: .82rem;
+  font-family: 'Barlow Semi Condensed', sans-serif; font-weight: 700; font-size: .82rem;
   border: 1px solid var(--card-border); border-radius: var(--radius);
   padding: .35rem .7rem; cursor: pointer; background: transparent; color: var(--text-gold);
   transition: background .12s, color .12s; white-space: nowrap;
@@ -168,7 +168,7 @@ body {
 .input {
   width: 100%; background: var(--bg-mid); border: 1px solid var(--divider);
   border-radius: var(--radius); color: var(--text-white); padding: .45rem .6rem;
-  font-family: 'Rajdhani', sans-serif; font-size: .9rem;
+  font-family: 'Barlow Semi Condensed', sans-serif; font-size: .9rem;
 }
 .input:focus { outline: none; border-color: var(--card-border); }
 
@@ -182,7 +182,7 @@ body {
   border-radius: var(--radius); padding: 1rem; width: 100%; max-width: 360px;
   display: flex; flex-direction: column; gap: .6rem;
 }
-.modal h3 { font-family: 'Cinzel', serif; color: var(--header-gold); font-size: 1rem; }
+.modal h3 { font-family: 'Barlow Semi Condensed', sans-serif; color: var(--header-gold); font-size: 1rem; }
 .modal-payout { min-height: 1rem; }
 
 /* ── Toast ───────────────────────────────────────────────────────────────── */
@@ -201,7 +201,7 @@ body {
 .home-search-input {
   width: 100%; background: var(--bg-mid); border: 1px solid var(--divider);
   border-radius: 999px; color: var(--text-white); padding: .45rem .9rem;
-  font-family: 'Rajdhani', sans-serif; font-size: .95rem;
+  font-family: 'Barlow Semi Condensed', sans-serif; font-size: .95rem;
 }
 .home-search-input:focus { outline: none; border-color: var(--card-border); }
 .home-search-input::placeholder { color: var(--text-dim); }
@@ -217,7 +217,7 @@ body {
   background: var(--card-bg); border: 1px solid var(--divider);
   border-radius: var(--radius); padding: .45rem .6rem;
   cursor: pointer; white-space: nowrap; min-width: 56px;
-  font-family: 'Rajdhani', sans-serif; color: var(--text-dim);
+  font-family: 'Barlow Semi Condensed', sans-serif; color: var(--text-dim);
   transition: border-color .12s, color .12s;
 }
 .cat-pill:hover { border-color: var(--card-border); color: var(--text-white); }
@@ -239,7 +239,7 @@ body {
 }
 .promo-emoji { font-size: 1.8rem; line-height: 1; flex-shrink: 0; }
 .promo-body { flex: 1; min-width: 0; }
-.promo-title { font-family: 'Cinzel', serif; font-weight: 700; color: var(--text-gold); font-size: .85rem; line-height: 1.2; }
+.promo-title { font-family: 'Barlow Semi Condensed', sans-serif; font-weight: 700; color: var(--text-gold); font-size: .85rem; line-height: 1.2; }
 .promo-sub { color: var(--text-dim); font-size: .72rem; margin-top: .15rem; }
 .promo-cta {
   background: var(--header-gold); color: var(--header-dark);
@@ -263,9 +263,38 @@ body {
 .feat-parlay-footer { display: flex; align-items: center; justify-content: space-between; margin-top: .25rem; }
 .feat-parlay-odds { font-weight: 700; font-size: 1rem; }
 
+/* ── Minimum touch targets ───────────────────────────────────────────────── */
+.btn { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; }
+.btn-sm { min-height: 32px; }
+
+/* ── Market actions: stack on narrow cards ───────────────────────────────── */
+.market-actions { display: flex; flex-direction: column; gap: .3rem; align-items: stretch; }
+.market-actions .btn { text-align: center; }
+
+/* ── Topbar: don't let brand crush tabs ──────────────────────────────────── */
+.brand { flex-shrink: 0; }
+.me { flex-shrink: 0; }
+.tabs { min-width: 0; }
+
+/* ── Wider screens ───────────────────────────────────────────────────────── */
 @media (min-width: 600px) {
   .brand { font-size: 1.1rem; }
   .tabs a { font-size: .9rem; }
   .promo-card { min-width: 260px; }
   .feat-parlay-card { min-width: 260px; }
+  .market-actions { flex-direction: row; align-items: center; }
+}
+
+/* ── Very small screens (≤360px) ─────────────────────────────────────────── */
+@media (max-width: 360px) {
+  .brand { font-size: .78rem; }
+  .tabs a { font-size: .75rem; padding: .2rem .4rem; }
+  .view { padding: .5rem; }
+  .market-odds { font-size: .95rem; min-width: 48px; }
+  .cat-label { font-size: .58rem; }
+  .cat-pill { min-width: 46px; padding: .35rem .45rem; }
+  .cat-icon { font-size: 1.15rem; }
+  .home-search-input { font-size: .85rem; }
+  .promo-card { min-width: 190px; }
+  .feat-parlay-card { min-width: 190px; }
 }

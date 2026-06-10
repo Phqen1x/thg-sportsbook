@@ -88,19 +88,19 @@ def load_font(name: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageF
 
 
 def cinzel(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    return load_font("Cinzel-Bold.ttf", size)
+    return load_font("BarlowSemiCondensed-ExtraBold.ttf", size)
 
 
 def cinzel_regular(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    return load_font("Cinzel-Regular.ttf", size)
+    return load_font("BarlowSemiCondensed-SemiBold.ttf", size)
 
 
 def rajdhani(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    return load_font("Rajdhani-SemiBold.ttf", size)
+    return load_font("BarlowSemiCondensed-Medium.ttf", size)
 
 
 def rajdhani_bold(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    return load_font("Rajdhani-Bold.ttf", size)
+    return load_font("BarlowSemiCondensed-Bold.ttf", size)
 
 
 def hex_to_rgba(h: str) -> tuple[int, int, int, int]:
