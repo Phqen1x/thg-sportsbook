@@ -829,6 +829,51 @@ _ALLIANCE_K_ONE = {
 }
 
 
+def _victor_probability(
+    members: list["Tribute"],
+    all_tributes: list["Tribute"],
+    win_factors: "dict[int, float] | None",
+) -> float:
+    """Probability that the eventual victor comes from ``members``.
+
+    Priced exactly like the single-tribute TRIBUTE_WINS market (see
+    ``default_odds``): each alive member's share of the *compressed* field
+    strength, scaled by their field-relative, tempered win modifier. A
+    district/alliance wins iff one of its members wins, and those victor events
+    are mutually exclusive, so the group probability is the sum of the members'
+    individual win probabilities.
+
+    Compressing the scores and tempering the modifier relative to the field is
+    what keeps these victor lines off the ±9900 cap, the same fix applied to the
+    per-tribute victor market.
+    """
+    raw = _alive_scores(all_tributes)
+    if not raw:
+        return 0.0
+    field_mean = sum(raw) / len(raw)
+    compressed_total = sum(_compressed_scores(all_tributes)) or 1.0
+    if win_factors:
+        alive_ids = [t.id for t in all_tributes if t.status == "ALIVE"]
+        wf_vals = [win_factors.get(i, 1.0) for i in alive_ids]
+        avg_wf = (sum(wf_vals) / len(wf_vals)) if wf_vals else 1.0
+    else:
+        avg_wf = 1.0
+
+    prob = 0.0
+    for t in members:
+        if t.status != "ALIVE":
+            continue
+        cscore = _compress(t.training_score or 6, field_mean)
+        wf = win_factors.get(t.id, 1.0) if win_factors else 1.0
+        # Field-relative + tempered modifier, mirroring the per-tribute path: a
+        # member carrying the field-average boost is left unchanged, and extremes
+        # are pulled toward neutral by MODIFIER_TEMPER.
+        relative = wf / max(avg_wf, 0.01)
+        mfactor = relative ** MODIFIER_TEMPER
+        prob += (cscore / compressed_total) * mfactor
+    return prob
+
+
 def district_default_odds(
     market_type: str,
     district_tributes: list["Tribute"],
@@ -859,7 +904,7 @@ def district_default_odds(
     n = len([t for t in all_tributes if t.status == "ALIVE"]) or 1
 
     if market_type == "DISTRICT_VICTOR":
-        prob = sum((t.training_score or 6) * _wf(t) / total for t in alive)
+        prob = _victor_probability(alive, all_tributes, win_factors)
         return prob_to_american(max(0.01, min(0.99, prob)))
 
     if market_type == "DISTRICT_KILLS_OU":
@@ -975,7 +1020,7 @@ def alliance_default_odds(
     n = len([t for t in all_tributes if t.status == "ALIVE"]) or 1
 
     if market_type == "ALLIANCE_VICTOR":
-        prob = sum((t.training_score or 6) * _wf(t) / total for t in alive)
+        prob = _victor_probability(alive, all_tributes, win_factors)
         return prob_to_american(max(0.01, min(0.99, prob)))
 
     if market_type == "ALLIANCE_KILLS_OU":

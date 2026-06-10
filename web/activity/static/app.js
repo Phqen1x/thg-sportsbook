@@ -114,7 +114,7 @@ function renderShell() {
       <div class="brand">⚔ CAPITOL</div>
       <nav class="tabs" id="tabs">
         ${tabs.map(([id, label]) =>
-          `<a href="#${id}" data-tab="${id}">${label}</a>`).join("")}
+          `<a href="${location.pathname}${location.search}#${id}" data-tab="${id}">${label}</a>`).join("")}
       </nav>
       <div class="me">
         <span id="balance" class="chips">${fmtChips(ME?.chips)} chips</span>

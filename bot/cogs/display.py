@@ -513,12 +513,20 @@ class DisplayCog(commands.Cog):
         dead = [t for t in tributes if t.status == "DEAD"]
         victor = [t for t in tributes if t.status == "VICTOR"]
 
+        def _exp_str(t: Tribute) -> str:
+            if t.times_played == 0:
+                return "**Rookie**"
+            s = f"Played: `{t.times_played}`"
+            if t.highest_placement:
+                s += f" | Best: `#{t.highest_placement}`"
+            return s
+
         if alive:
             alive_lines = []
             for t in alive:
                 gender_icon = "♂" if t.display_gender == "M" else ("♀" if t.display_gender == "F" else "⚧")
                 alive_lines.append(
-                    f"**D{t.district}{t.display_gender} {t.name}** {gender_icon} — Score: `{t.training_score if t.training_score is not None else '?'}` | Kills: `{t.kills}`"
+                    f"**D{t.district}{t.display_gender} {t.name}** {gender_icon} — Score: `{t.training_score if t.training_score is not None else '?'}` | Kills: `{t.kills}` | {_exp_str(t)}"
                 )
             _add_field_chunks(embed, "🟢 ALIVE", alive_lines)
 
@@ -526,7 +534,7 @@ class DisplayCog(commands.Cog):
             for t in victor:
                 embed.add_field(
                     name="👑 VICTOR",
-                    value=f"**D{t.district}{t.display_gender} {t.name}** — Score: `{t.training_score if t.training_score is not None else '?'}` | Kills: `{t.kills}`",
+                    value=f"**D{t.district}{t.display_gender} {t.name}** — Score: `{t.training_score if t.training_score is not None else '?'}` | Kills: `{t.kills}` | {_exp_str(t)}",
                     inline=False,
                 )
 
@@ -535,7 +543,7 @@ class DisplayCog(commands.Cog):
             for t in dead:
                 placement = f"#{t.placement}" if t.placement else "?"
                 cause = t.death_cause or "Unknown"
-                dead_lines.append(f"D{t.district}{t.display_gender} {t.name} — {placement} | {cause}")
+                dead_lines.append(f"D{t.district}{t.display_gender} {t.name} — {placement} | {cause} | {_exp_str(t)}")
             _add_field_chunks(embed, "💀 FALLEN", dead_lines)
 
         embed.set_footer(text=f"Total tributes: {len(tributes)} | Alive: {len(alive)}")

@@ -1,0 +1,12 @@
+#!/bin/sh
+mkdir -p "$SNAP_COMMON/data"
+
+if [ ! -f "$SNAP_COMMON/.env" ]; then
+    echo "ERROR: $SNAP_COMMON/.env not found." >&2
+    echo "Create it with at minimum: BOT_TOKEN=your_discord_bot_token" >&2
+    echo "Then run: sudo snap restart thg-sportsbook.web" >&2
+    exit 1
+fi
+
+cd "$SNAP_COMMON"
+exec "$SNAP/bin/thg-sportsbook-web"

@@ -12,6 +12,15 @@ description: |
     ADMIN_ROLE_ID, ANNOUNCEMENT_CHANNEL_ID, WITHDRAW_CHANNEL_ID,
     DEV_GUILD_ID, DEFAULT_CHIPS, CASHOUT_ALLOWED, CASHOUT_RATE
 
+  Web dashboard settings (required to enable the web service):
+    GUILD_ID, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
+    WEB_SECRET_KEY, WEB_BASE_URL, WEB_HOST, WEB_PORT
+
+  For HTTPS, also set:
+    WEB_SSL_CERTFILE=/path/to/fullchain.pem
+    WEB_SSL_KEYFILE=/path/to/privkey.pem
+    WEB_PORT=443
+
   The database persists in $SNAP_COMMON/data/sportsbook.db across upgrades.
 
 grade: stable
@@ -38,6 +47,10 @@ parts:
     source: snap/local
     organize:
       launcher: bin/launch
+      web-launcher: bin/web-launch
+    override-prime: |
+      craftctl default
+      chmod +x "$CRAFT_PRIME/bin/launch" "$CRAFT_PRIME/bin/web-launch"
 
 apps:
   thg-sportsbook:
@@ -47,6 +60,15 @@ apps:
     restart-delay: 10s
     plugs:
       - network
+
+  web:
+    command: bin/web-launch
+    daemon: simple
+    restart-condition: on-failure
+    restart-delay: 10s
+    plugs:
+      - network
+      - network-bind
 
 environment:
   DB_PATH: $SNAP_COMMON/data/sportsbook.db

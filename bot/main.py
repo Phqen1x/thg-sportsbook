@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import sys
+from typing import Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from bot import config
@@ -17,10 +19,36 @@ logging.basicConfig(
 log = logging.getLogger("capitol")
 
 
+class SportsBookCommandTree(app_commands.CommandTree):
+    async def sync(self, *, guild: Optional[discord.abc.Snowflake] = None):
+        if guild is not None:
+            return await super().sync(guild=guild)
+
+        # Discord forbids bulk-removing the Entry Point command (type 4) that
+        # it auto-creates when the Activity feature is enabled. Fetch existing
+        # global commands, preserve any Entry Points, and inject them into the
+        # payload so the upsert doesn't try to delete them.
+        existing = await self.client.http.get_global_commands(self.client.application_id)
+        entry_points = [c for c in existing if c.get("type") == 4]
+        if not entry_points:
+            return await super().sync()
+
+        commands = self._get_all_commands(guild=None)
+        translator = self.translator
+        if translator:
+            payload = [await cmd.get_translated_payload(self, translator) for cmd in commands]
+        else:
+            payload = [cmd.to_dict(self) for cmd in commands]
+        payload.extend(entry_points)
+
+        data = await self._http.bulk_upsert_global_commands(self.client.application_id, payload=payload)
+        return [app_commands.AppCommand(data=d, state=self._state) for d in data]
+
+
 class SportsBookBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, tree_cls=SportsBookCommandTree)
 
     async def setup_hook(self) -> None:
         log.info("Initializing database...")
@@ -42,11 +70,6 @@ class SportsBookBot(commands.Bot):
         if config.DEV_GUILD_ID:
             guild = discord.Object(id=config.DEV_GUILD_ID)
             self.tree.copy_global_to(guild=guild)
-            # Clear the global scope so previously-published global commands are
-            # deleted on sync; otherwise they show up alongside the guild copies
-            # as duplicates.
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
             await self.tree.sync(guild=guild)
             log.info(f"Slash commands synced to dev guild {config.DEV_GUILD_ID}")
         else:

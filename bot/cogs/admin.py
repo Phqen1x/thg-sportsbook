@@ -3515,7 +3515,7 @@ class AdminCog(commands.Cog):
                         select(Market).where(
                             Market.tribute_a_id == killer.id,
                             Market.type == "KILLS_OU",
-                            Market.status == "OPEN",
+                            Market.status.in_(["OPEN", "CLOSED"]),
                         )
                     )
                     for kou in kou_result.scalars().all():
@@ -3570,7 +3570,8 @@ class AdminCog(commands.Cog):
 
             a_mkts = await session.execute(
                 select(Market).where(
-                    Market.tribute_a_id == dead_id, Market.status == "OPEN"
+                    Market.tribute_a_id == dead_id,
+                    Market.status.in_(["OPEN", "CLOSED"]),
                 )
             )
             for mkt in a_mkts.scalars().all():
@@ -3609,7 +3610,8 @@ class AdminCog(commands.Cog):
 
             b_mkts = await session.execute(
                 select(Market).where(
-                    Market.tribute_b_id == dead_id, Market.status == "OPEN"
+                    Market.tribute_b_id == dead_id,
+                    Market.status.in_(["OPEN", "CLOSED"]),
                 )
             )
             for mkt in b_mkts.scalars().all():

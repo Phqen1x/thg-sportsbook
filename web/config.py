@@ -25,5 +25,7 @@ WEB_SECRET_KEY: str = os.environ.get("WEB_SECRET_KEY", "dev-secret-change-me")
 GUILD_ID: int | None = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
 WEB_HOST: str = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT: int = int(os.environ.get("WEB_PORT", "8000"))
+WEB_SSL_CERTFILE: str | None = os.environ.get("WEB_SSL_CERTFILE") or None
+WEB_SSL_KEYFILE: str | None = os.environ.get("WEB_SSL_KEYFILE") or None
 
 DISCORD_REDIRECT_URI: str = f"{WEB_BASE_URL}/auth/callback"

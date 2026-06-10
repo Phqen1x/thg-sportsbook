@@ -13,10 +13,20 @@ dependencies = [
     "aiohttp==3.12.4",
     "pillow==11.2.1",
     "python-dotenv==1.1.0",
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.1",
+    "httpx==0.28.0",
+    "itsdangerous==2.2.0",
+    "jinja2==3.1.4",
+    "python-multipart==0.0.12",
 ]
 
 [project.scripts]
 thg-sportsbook = "bot.main:main"
+thg-sportsbook-web = "web.main:main"
 
 [tool.setuptools.packages.find]
-include = ["bot*"]
+include = ["bot*", "web*"]
+
+[tool.setuptools.package-data]
+"web" = ["templates/**/*", "static/**/*", "activity/**/*", "activity/static/**/*"]
