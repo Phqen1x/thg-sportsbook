@@ -9,6 +9,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from web import config
 
 _ser = URLSafeTimedSerializer(config.WEB_SECRET_KEY, salt="sb-session-v1")
+_SECURE_COOKIE = bool(config.WEB_SSL_CERTFILE)
 COOKIE = "sb_session"
 MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 
@@ -29,7 +30,7 @@ class SessionUser:
 
 def set_session(response: Response, user: SessionUser) -> None:
     signed = _ser.dumps(json.dumps(asdict(user)))
-    response.set_cookie(COOKIE, signed, max_age=MAX_AGE, httponly=True, samesite="lax")
+    response.set_cookie(COOKIE, signed, max_age=MAX_AGE, httponly=True, samesite="lax", secure=_SECURE_COOKIE)
 
 
 def clear_session(response: Response) -> None:

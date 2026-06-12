@@ -28,11 +28,30 @@ data/
 *.sqlite
 *.sqlite3
 
+# ── SSL / TLS certificates ──────────────────────────────────────────────────
+*.pem
+*.key
+*.crt
+*.csr
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Test coverage ────────────────────────────────────────────────────────────
+.coverage
+htmlcov/
+coverage.xml
+
 # ── Snap build artifacts ─────────────────────────────────────────────────────
 parts/
 prime/
 stage/
 *.snap
+snap/local/
+
+# ── Generated PDFs (rebuilt from source via tools/) ──────────────────────────
+*.pdf
 
 # ── OS / editor cruft ───────────────────────────────────────────────────────
 .DS_Store
@@ -41,3 +60,4 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+*.code-workspace

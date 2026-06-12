@@ -139,7 +139,7 @@ async def phase_activate(phase_id: int, user: SessionUser = Depends(require_admi
         phase = await db.get(BettingPhase, phase_id)
         if not phase:
             return _redirect("/admin/phases", error="Phase+not+found.")
-        await db.execute(text(f"INSERT OR REPLACE INTO game_settings (key, value) VALUES ('active_phase_id', '{phase_id}')"))
+        await db.execute(text("INSERT OR REPLACE INTO game_settings (key, value) VALUES ('active_phase_id', :v)"), {"v": str(phase_id)})
         await db.commit()
     return _redirect("/admin/phases", msg=f"Phase+'{phase.name}'+activated.")
 

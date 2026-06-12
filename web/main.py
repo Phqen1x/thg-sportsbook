@@ -7,6 +7,11 @@ from web.app import app
 
 
 def main() -> None:
+    if config.WEB_SECRET_KEY == "dev-secret-change-me":
+        raise RuntimeError(
+            "WEB_SECRET_KEY is set to the insecure default. "
+            "Set a strong random value in your .env before running in production."
+        )
     uvicorn.run(
         "web.app:app",
         host=config.WEB_HOST,

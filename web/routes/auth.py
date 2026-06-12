@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import time
 
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
@@ -11,7 +12,8 @@ from web.session import SessionUser, clear_session, set_session
 
 router = APIRouter(tags=["auth"])
 
-_pending: set[str] = set()
+_pending: dict[str, float] = {}
+_STATE_TTL = 600  # OAuth state tokens expire after 10 minutes
 
 
 def _oauth_url(state: str) -> str:
@@ -26,16 +28,22 @@ def _oauth_url(state: str) -> str:
 
 @router.get("/auth/login")
 async def login():
+    now = time.monotonic()
+    expired = [k for k, t in _pending.items() if now - t > _STATE_TTL]
+    for k in expired:
+        del _pending[k]
     state = secrets.token_urlsafe(16)
-    _pending.add(state)
+    _pending[state] = now
     return RedirectResponse(_oauth_url(state))
 
 
 @router.get("/auth/callback")
 async def callback(code: str | None = None, state: str | None = None, error: str | None = None):
-    if error or not code or state not in _pending:
+    now = time.monotonic()
+    if error or not code or state not in _pending or now - _pending[state] > _STATE_TTL:
+        _pending.pop(state, None)
         return RedirectResponse("/?error=Login+failed.+Please+try+again.")
-    _pending.discard(state)
+    del _pending[state]
     try:
         tokens = await discord_api.exchange_code(code)
         user_data = await discord_api.get_user(tokens["access_token"])
