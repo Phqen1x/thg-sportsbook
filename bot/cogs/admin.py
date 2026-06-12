@@ -8859,6 +8859,35 @@ class AdminCog(commands.Cog):
         )
 
     @settings.command(
+        name="log_channel",
+        description="Set the channel where admin action audit logs are posted",
+    )
+    @app_commands.describe(
+        channel="Channel for admin audit logs (leave empty to clear)",
+    )
+    @is_admin()
+    async def log_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.database.engine import set_guild_setting
+        if channel is None:
+            await set_guild_setting(interaction.guild_id, "log_channel_id", None)
+            await interaction.followup.send(
+                "Cleared the audit log channel. Admin actions will no longer be logged.",
+                ephemeral=True,
+            )
+            return
+        await set_guild_setting(interaction.guild_id, "log_channel_id", channel.id)
+        await interaction.followup.send(
+            f"Admin actions will now be logged in {channel.mention}.",
+            ephemeral=True,
+        )
+
+    @settings.command(
         name="theme", description="Set the visual theme for sportsbook images"
     )
     @app_commands.describe(name="Theme name (e.g. dark, forest)")

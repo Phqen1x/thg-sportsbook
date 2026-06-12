@@ -76,6 +76,17 @@ class SportsBookBot(commands.Bot):
         await self.tree.sync()
         log.info("Slash commands synced globally")
 
+    async def on_app_command_completion(
+        self,
+        interaction: discord.Interaction,
+        command: app_commands.Command | app_commands.ContextMenu,
+    ) -> None:
+        from bot.cogs.admin import AdminCog
+        from bot.utils.audit import post_audit_log
+        if not isinstance(getattr(command, "binding", None), AdminCog):
+            return
+        await post_audit_log(self, interaction)
+
     async def on_ready(self) -> None:
         assert self.user is not None
         log.info(f"Logged in as {self.user} (ID: {self.user.id})")
