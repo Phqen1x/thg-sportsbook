@@ -22,7 +22,7 @@ from web import config
 from web.session import SessionUser
 
 _ser = URLSafeTimedSerializer(config.WEB_SECRET_KEY, salt="sb-activity-v1")
-MAX_AGE = 60 * 60 * 24  # 24 hours
+MAX_AGE = 60 * 60 * 2  # 2 hours
 
 
 def mint_token(user: SessionUser) -> str:
@@ -55,13 +55,17 @@ def bearer_user(request: Request) -> SessionUser:
     return user
 
 
-def bearer_admin(request: Request) -> SessionUser:
-    """FastAPI dependency: require a valid activity token with admin rights.
+async def bearer_admin(request: Request) -> SessionUser:
+    """FastAPI dependency: require a valid activity token with current admin rights.
 
-    ``is_admin`` was baked into the signed token at mint time after a server-side
-    bot-token role check, so it cannot be forged by the client.
+    ``is_admin`` in the token reflects mint-time status; we re-validate live against
+    Discord (via the same 5-minute cache used by the cookie session path) so that a
+    revoked admin role takes effect within one cache TTL rather than the full token TTL.
     """
     user = bearer_user(request)
     if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    from web.deps import _live_is_admin
+    if not await _live_is_admin(user.discord_id):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
