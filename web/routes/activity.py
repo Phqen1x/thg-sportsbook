@@ -164,7 +164,9 @@ async def token(code: Annotated[str, Body(embed=True)]):
         user_data = await discord_api.get_user(access_token)
         uid = int(user_data["id"])
         member = await discord_api.get_member(uid)
-        is_admin = await discord_api.check_admin(member or {})
+        if member is None:
+            raise HTTPException(status_code=403, detail="You must be a member of the server to use this.")
+        is_admin = await discord_api.check_admin(member)
     except HTTPException:
         raise
     except Exception:

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import io
+import ipaddress
 import logging
 import math
 import random
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, TypeVar
+from urllib.parse import urlparse
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
@@ -213,8 +216,36 @@ async def render_async(sync_fn: Callable[..., T], *args) -> T:
     return await asyncio.get_running_loop().run_in_executor(None, sync_fn, *args)
 
 
+async def _is_safe_image_url(url: str) -> bool:
+    """Return True only if url is HTTPS and resolves exclusively to public IP addresses."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        loop = asyncio.get_running_loop()
+        infos = await loop.run_in_executor(
+            None,
+            lambda: socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM),
+        )
+        if not infos:
+            return False
+        for _, _, _, _, sockaddr in infos:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved or not ip.is_global:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 async def fetch_image_bytes(url: str) -> bytes | None:
     if not url:
+        return None
+    if not await _is_safe_image_url(url):
+        log.warning(f"Blocked face claim fetch to non-HTTPS or private-network URL: {url}")
         return None
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; CapitolSportsbook/1.0)",
@@ -225,7 +256,7 @@ async def fetch_image_bytes(url: str) -> bytes | None:
             async with session.get(
                 url,
                 timeout=aiohttp.ClientTimeout(total=10),
-                allow_redirects=True,
+                allow_redirects=False,
             ) as resp:
                 if resp.status == 200:
                     data = await resp.read()

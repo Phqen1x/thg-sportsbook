@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css?v={{ static_v }}">
+  <meta name="csrf-token" content="{{ csrf_token(request) }}">
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -58,6 +59,17 @@
 </footer>
 
 
+<script>
+(function () {
+  var m = document.querySelector('meta[name="csrf-token"]');
+  if (!m) return;
+  document.querySelectorAll('form[method="post"],form[method="POST"]').forEach(function (f) {
+    var i = document.createElement('input');
+    i.type = 'hidden'; i.name = '_csrf'; i.value = m.content;
+    f.appendChild(i);
+  });
+})();
+</script>
 <script src="/static/app.js?v={{ static_v }}"></script>
 {% block scripts %}{% endblock %}
 </body>

@@ -14,6 +14,7 @@ router = APIRouter(tags=["auth"])
 
 _pending: dict[str, float] = {}
 _STATE_TTL = 600  # OAuth state tokens expire after 10 minutes
+_MAX_PENDING = 500  # cap to prevent unbounded growth under repeated /auth/login spam
 
 
 def _oauth_url(state: str) -> str:
@@ -32,6 +33,10 @@ async def login():
     expired = [k for k, t in _pending.items() if now - t > _STATE_TTL]
     for k in expired:
         del _pending[k]
+    if len(_pending) >= _MAX_PENDING:
+        oldest = sorted(_pending, key=lambda k: _pending[k])
+        for k in oldest[: _MAX_PENDING // 2]:
+            del _pending[k]
     state = secrets.token_urlsafe(16)
     _pending[state] = now
     return RedirectResponse(_oauth_url(state))

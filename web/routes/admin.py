@@ -17,6 +17,8 @@ from web.session import SessionUser
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+_MAX_GIVE_ALL = 100_000
+
 
 def _redirect(url: str, msg: str = "", error: str = "") -> RedirectResponse:
     sep = "&" if "?" in url else "?"
@@ -710,6 +712,8 @@ async def chips_give_all(
 ):
     if amount <= 0:
         return _redirect("/admin/chips", error="Amount+must+be+positive.")
+    if amount > _MAX_GIVE_ALL:
+        return _redirect("/admin/chips", error=f"Amount+exceeds+the+{_MAX_GIVE_ALL:,}+chip+per-grant+cap.")
     async with get_db() as db:
         users = (await db.execute(select(User))).scalars().all()
         for u in users:

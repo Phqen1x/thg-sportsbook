@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import parse_qs
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from web import config
+from web.csrf import make_csrf, verify_csrf
 from web.routes import activity, auth, public, member, admin
+from web.session import COOKIE
 
 HERE = Path(__file__).parent
 ACTIVITY_DIR = HERE / "activity"
@@ -48,6 +52,25 @@ _ACTIVITY_CSP = (
     "script-src 'self' 'unsafe-inline' https://*.discordsays.com"
 )
 
+_DASHBOARD_CSP = (
+    "default-src 'self'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' https://cdn.discordapp.com data:; "
+    "script-src 'self' 'unsafe-inline'; "
+    "frame-ancestors 'none'"
+)
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    if config.WEB_SECRET_KEY == "dev-secret-change-me":
+        raise RuntimeError(
+            "WEB_SECRET_KEY is set to the insecure default. "
+            "Set a strong random value in your .env before running in production."
+        )
+    yield
+
 
 def fmt_odds(n: int) -> str:
     return f"+{n}" if n >= 0 else str(n)
@@ -79,13 +102,14 @@ def _render_activity_index(in_discord: bool) -> HTMLResponse:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Panem Sportsbook", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Panem Sportsbook", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
     templates = Jinja2Templates(directory=str(HERE / "templates"))
     templates.env.filters["fmt_odds"] = fmt_odds
     templates.env.filters["fmt_chips"] = fmt_chips
     templates.env.globals["abs"] = abs
     templates.env.globals["static_v"] = _WEB_VERSION
+    templates.env.globals["csrf_token"] = lambda req: make_csrf(req.cookies.get(COOKIE, ""))
 
     app.state.templates = templates
 
@@ -98,14 +122,40 @@ def create_app() -> FastAPI:
     app.include_router(member.router)
     app.include_router(admin.router)
 
-    # Discord launches the Activity at the iframe root with a ?frame_id=... query.
-    # Intercept that case and serve the SPA instead of the browser dashboard home,
-    # so a single deployment serves both. Direct visits to /activity also work.
+    # Innermost: intercept the Discord Activity iframe launch at the root path.
     @app.middleware("http")
     async def activity_root(request: Request, call_next):
         if request.url.path == "/" and "frame_id" in request.query_params:
             return _render_activity_index(in_discord=True)
         return await call_next(request)
+
+    # Middle: CSRF validation for all form POST requests.
+    # Filters by Content-Type so JSON API calls (/api/*) are naturally excluded.
+    # request.body() caches in request._body so route handlers can still read the form.
+    @app.middleware("http")
+    async def csrf_check(request: Request, call_next):
+        ct = request.headers.get("content-type", "")
+        if request.method == "POST" and "application/x-www-form-urlencoded" in ct:
+            body = await request.body()
+            form = parse_qs(body.decode(errors="replace"), keep_blank_values=True)
+            token = (form.get("_csrf") or [None])[0]
+            session_cookie = request.cookies.get(COOKIE, "")
+            if not verify_csrf(token, session_cookie):
+                return Response("CSRF validation failed", status_code=403)
+        return await call_next(request)
+
+    # Outermost: attach security headers to every response.
+    # Activity responses carry their own CSP (permitting Discord iframe embedding), so
+    # we only add the dashboard CSP + X-Frame-Options when no CSP is already present.
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if "Content-Security-Policy" not in response.headers:
+            response.headers["Content-Security-Policy"] = _DASHBOARD_CSP
+            response.headers["X-Frame-Options"] = "DENY"
+        return response
 
     @app.get("/activity", response_class=HTMLResponse)
     async def activity_index(request: Request):
