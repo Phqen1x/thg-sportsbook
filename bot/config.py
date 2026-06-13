@@ -23,3 +23,9 @@ WEB_BASE_URL: str | None = (os.environ.get("WEB_BASE_URL") or "").rstrip("/") or
 DB_PATH: str = os.environ.get("DB_PATH") or str(BASE_DIR / "data" / "sportsbook.db")
 FONTS_DIR: Path = Path(os.environ.get("FONTS_DIR") or str(BASE_DIR / "assets" / "fonts"))
 LOGO_PATH: Path = Path(os.environ.get("LOGO_PATH") or str(BASE_DIR / "panem.png"))
+
+# Lemonade local-AI server (https://github.com/lemonade-sdk/lemonade)
+LEMONADE_BASE_URL: str = os.environ.get("LEMONADE_BASE_URL", "http://localhost:13305")
+LEMONADE_MODEL: str = os.environ.get("LEMONADE_MODEL", "auto")
+# Context window override passed as num_ctx to llama-server; 0 = use server default.
+LEMONADE_CTX_SIZE: int = int(os.environ.get("LEMONADE_CTX_SIZE", "32768"))

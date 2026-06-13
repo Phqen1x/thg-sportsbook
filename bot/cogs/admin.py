@@ -1448,7 +1448,10 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
     for bet in bets:
         if result is None:
             bet.status = "VOIDED"
-            user = await session.get(User, bet.user_id)
+            _ur = await session.execute(
+                select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id)
+            )
+            user = _ur.scalar_one_or_none()
             if user:
                 user.chips += bet.wager
             if buf is not None and bet.parlay_id is None:
@@ -1463,7 +1466,10 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                 })
         elif result is True and bet.parlay_id is None:
             bet.status = "WON"
-            user = await session.get(User, bet.user_id)
+            _ur = await session.execute(
+                select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id)
+            )
+            user = _ur.scalar_one_or_none()
             if user:
                 user.chips += bet.payout_if_win
                 user.total_won += bet.payout_if_win
@@ -2108,6 +2114,121 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     return created
 
 
+async def _try_generate_ai_parlays(
+    session, phase_id: int | None, count: int = 3
+) -> int:
+    """Attempt AI-powered featured parlay generation via Lemonade.
+
+    Clears existing AUTO templates and writes new ones (source="AUTO") when
+    successful.  Returns the count created, or 0 if Lemonade is unreachable,
+    no lore is stored, or the model returns nothing usable.  All exceptions
+    are logged and swallowed so callers can fall back to the algorithmic path.
+    """
+    lore_raw = await get_setting("lemonade_district_lore")
+    if not lore_raw:
+        return 0
+
+    try:
+        from bot import config as _cfg
+        from bot.lemonade import LemonadeClient, generate_ai_parlays
+
+        client = LemonadeClient(base_url=_cfg.LEMONADE_BASE_URL, model=_cfg.LEMONADE_MODEL)
+        if not await client.health():
+            log.debug("Lemonade not reachable at %s; skipping AI parlays", _cfg.LEMONADE_BASE_URL)
+            return 0
+
+        lore_text: str = json.loads(lore_raw)
+
+        mkt_rows = await session.execute(select(Market).where(Market.status == "OPEN"))
+        open_markets = list(mkt_rows.scalars().all())
+        if len(open_markets) < 3:
+            return 0
+
+        trib_rows = await session.execute(select(Tribute).where(Tribute.status == "ALIVE"))
+        alive_tributes = list(trib_rows.scalars().all())
+
+        districts = {t.district for t in alive_tributes}
+        if districts:
+            dr_rows = await session.execute(
+                select(DistrictRecord).where(DistrictRecord.district.in_(districts))
+            )
+            district_records = list(dr_rows.scalars().all())
+        else:
+            district_records = []
+
+        suggestions = await generate_ai_parlays(
+            client,
+            lore=lore_text,
+            markets=[{"id": m.id, "label": m.label, "odds": m.odds} for m in open_markets],
+            tributes=[
+                {
+                    "district": t.district,
+                    "name": t.name,
+                    "gender": t.display_gender,
+                    "age": t.age,
+                    "kills": t.kills,
+                    "training_score": t.training_score,
+                    "times_played": t.times_played,
+                    "debilitation_level": t.debilitation_level,
+                }
+                for t in alive_tributes
+            ],
+            district_records=[
+                {
+                    "district": dr.district,
+                    "reputation": dr.reputation,
+                    "funding_level": dr.funding_level,
+                    "wins": dr.wins,
+                    "avg_placement": dr.avg_placement,
+                    "avg_placement_last5": dr.avg_placement_last5,
+                    "top8_finishes": dr.top8_finishes,
+                    "top5_finishes": dr.top5_finishes,
+                    "total_kills": dr.total_kills,
+                    "bloodbath_kills": dr.bloodbath_kills,
+                    "kill_record": dr.kill_record,
+                    "avg_training_score": dr.avg_training_score,
+                }
+                for dr in district_records
+            ],
+            count=count,
+            num_ctx=_cfg.LEMONADE_CTX_SIZE,
+        )
+
+        if not suggestions:
+            log.warning("Lemonade returned no valid parlay suggestions")
+            return 0
+
+        old_rows = await session.execute(
+            select(ParlayTemplate).where(ParlayTemplate.source == "AUTO")
+        )
+        for tpl in old_rows.scalars().all():
+            await session.delete(tpl)
+        await session.flush()
+
+        for sug in suggestions:
+            tpl = ParlayTemplate(
+                name=sug["name"],
+                description=sug["description"],
+                source="AUTO",
+                difficulty=sug["tier"],
+                phase_id=phase_id,
+                active=True,
+            )
+            session.add(tpl)
+            await session.flush()
+            for order, mid in enumerate(sug["market_ids"]):
+                session.add(ParlayTemplateLeg(
+                    template_id=tpl.id, market_id=mid, sort_order=order,
+                ))
+
+        log.info("AI generated %d featured parlay(s) via Lemonade", len(suggestions))
+        return len(suggestions)
+
+    except Exception:
+        log.exception("AI parlay generation failed; caller may fall back to algorithmic")
+        return 0
+
+
 async def _check_parlay(session, parlay_id: int) -> dict | None:
     """Check whether a parlay has fully resolved and settle it if so.
 
@@ -2147,7 +2268,10 @@ async def _check_parlay(session, parlay_id: int) -> dict | None:
     active_legs = [l for l in legs if l.status != "VOIDED"]
     if all(l.status == "WON" for l in active_legs):
         parlay.status = "WON"
-        user = await session.get(User, parlay.user_id)
+        _pur = await session.execute(
+            select(User).where(User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id)
+        )
+        user = _pur.scalar_one_or_none()
         if user:
             user.chips += parlay.total_payout
             user.total_won += parlay.total_payout
@@ -2169,7 +2293,10 @@ async def _check_parlay(session, parlay_id: int) -> dict | None:
         }
     elif all(l.status == "VOIDED" for l in legs):
         parlay.status = "WON"
-        user = await session.get(User, parlay.user_id)
+        _pur = await session.execute(
+            select(User).where(User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id)
+        )
+        user = _pur.scalar_one_or_none()
         if user:
             user.chips += parlay.total_wager
         leg_data = []
@@ -2213,7 +2340,13 @@ async def _unresolve_market(
                 reverted_parlays.add(bet.parlay_id)
                 parlay = await session.get(Parlay, bet.parlay_id)
                 if parlay and parlay.status in ("WON", "LOST"):
-                    p_user = await session.get(User, parlay.user_id)
+                    _pur = await session.execute(
+                        select(User).where(
+                            User.guild_id == parlay.guild_id,
+                            User.discord_id == parlay.user_id,
+                        )
+                    )
+                    p_user = _pur.scalar_one_or_none()
                     if parlay.status == "WON":
                         leg_res = await session.execute(
                             select(Bet).where(Bet.parlay_id == bet.parlay_id)
@@ -2229,7 +2362,10 @@ async def _unresolve_market(
                     parlay.status = "PENDING"
             bet.status = "PENDING"
         elif bet.status == "WON":
-            user = await session.get(User, bet.user_id)
+            _ur = await session.execute(
+                select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id)
+            )
+            user = _ur.scalar_one_or_none()
             if user:
                 user.chips -= bet.payout_if_win
                 user.total_won -= bet.payout_if_win
@@ -2238,7 +2374,10 @@ async def _unresolve_market(
         elif bet.status == "LOST":
             bet.status = "PENDING"
         elif bet.status == "VOIDED":
-            user = await session.get(User, bet.user_id)
+            _ur = await session.execute(
+                select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id)
+            )
+            user = _ur.scalar_one_or_none()
             if user:
                 user.chips -= bet.wager
             chips_reclaimed += bet.wager
@@ -5828,7 +5967,10 @@ class AdminCog(commands.Cog):
             await _set_sponsor_state(session, None)
 
             # Seed the tailing board with three featured parlays for this phase.
-            auto_made = await _generate_auto_parlays(session, pre_phase_id)
+            auto_made = (
+                await _try_generate_ai_parlays(session, pre_phase_id)
+                or await _generate_auto_parlays(session, pre_phase_id)
+            )
 
         await set_setting("game_active", True)
         if pre_phase_id is not None:
@@ -6487,7 +6629,10 @@ class AdminCog(commands.Cog):
                     auto_resolved.append("Funding modifiers reduced (sponsors closed)")
 
                 # Refresh the three featured parlays from this phase's open markets.
-                auto_made = await _generate_auto_parlays(session, new_phase_id)
+                auto_made = (
+                    await _try_generate_ai_parlays(session, new_phase_id)
+                    or await _generate_auto_parlays(session, new_phase_id)
+                )
                 if auto_made:
                     auto_resolved.append(f"{auto_made} featured parlay(s) posted for tailing")
 
@@ -7590,7 +7735,10 @@ class AdminCog(commands.Cog):
         phase_raw = await get_setting("current_phase_id")
         phase_id = json.loads(phase_raw) if phase_raw else None
         async with get_session() as session:
-            made = await _generate_auto_parlays(session, phase_id, count=count)
+            made = (
+                await _try_generate_ai_parlays(session, phase_id, count)
+                or await _generate_auto_parlays(session, phase_id, count=count)
+            )
         if made:
             await interaction.followup.send(
                 f"Generated **{made}** featured parlay(s) from the open markets.",
@@ -7599,6 +7747,100 @@ class AdminCog(commands.Cog):
         else:
             await interaction.followup.send(
                 "Not enough open markets to build themed parlays right now.", ephemeral=True
+            )
+
+    @parlay.command(
+        name="ai-lore",
+        description="Upload a PDF of district lore so the AI can generate smarter parlays",
+    )
+    @app_commands.describe(pdf="PDF file with district identity / background descriptions")
+    @is_admin()
+    async def parlay_ai_lore(
+        self,
+        interaction: discord.Interaction,
+        pdf: discord.Attachment,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        if not pdf.filename.lower().endswith(".pdf"):
+            await interaction.followup.send("Please attach a PDF file.", ephemeral=True)
+            return
+
+        import io
+        import pypdf
+
+        async with __import__("httpx").AsyncClient(timeout=30.0) as http:
+            resp = await http.get(pdf.url)
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            lore_text = "\n\n".join(p.strip() for p in pages if p.strip())
+        except Exception as exc:
+            await interaction.followup.send(
+                f"Failed to read the PDF: {exc}", ephemeral=True
+            )
+            return
+
+        if not lore_text:
+            await interaction.followup.send(
+                "The PDF appears to have no extractable text (it may be image-only).",
+                ephemeral=True,
+            )
+            return
+
+        await set_setting("lemonade_district_lore", lore_text)
+        await interaction.followup.send(
+            f"District lore saved ({len(reader.pages)} page(s), "
+            f"{len(lore_text):,} characters). "
+            "Run **/admin parlay ai-generate** to use it.",
+            ephemeral=True,
+        )
+
+    @parlay.command(
+        name="ai-generate",
+        description="Use local AI (Lemonade) to regenerate featured parlays from district lore and stats",
+    )
+    @app_commands.describe(count="How many parlays to generate (default 3, max 10)")
+    @is_admin()
+    async def parlay_ai_generate(
+        self,
+        interaction: discord.Interaction,
+        count: int = 3,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        count = max(1, min(count, 10))
+
+        from bot import config as _cfg
+
+        if not await get_setting("lemonade_district_lore"):
+            await interaction.followup.send(
+                "No district lore loaded yet — upload a PDF first with **/admin parlay ai-lore**.",
+                ephemeral=True,
+            )
+            return
+
+        phase_raw = await get_setting("current_phase_id")
+        phase_id = json.loads(phase_raw) if phase_raw else None
+
+        async with get_session() as session:
+            made = await _try_generate_ai_parlays(session, phase_id, count)
+
+        if made:
+            await interaction.followup.send(
+                f"AI generated **{made}** featured parlay(s) using Lemonade "
+                f"(`{_cfg.LEMONADE_MODEL}`) with district lore and historical stats.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"Lemonade didn't produce any parlays — check that the server is running "
+                f"at `{_cfg.LEMONADE_BASE_URL}` and that a model is loaded. "
+                "Check bot logs for details.",
+                ephemeral=True,
             )
 
     # ── PHASE COMMANDS ────────────────────────────────────────────────────────
@@ -8612,7 +8854,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            u = await _get_or_create_user(session, user)
+            u = await _get_or_create_user(session, user, interaction.guild_id or 0)
             u.chips += amount
             new_bal = u.chips
 
@@ -8641,7 +8883,9 @@ class AdminCog(commands.Cog):
         guild = interaction.guild
         awarded = 0
         async with get_session() as session:
-            result = await session.execute(select(User))
+            result = await session.execute(
+                select(User).where(User.guild_id == (interaction.guild_id or 0))
+            )
             for u in result.scalars().all():
                 if role is not None:
                     member = guild.get_member(u.discord_id) if guild else None
@@ -8668,7 +8912,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            u = await _get_or_create_user(session, user)
+            u = await _get_or_create_user(session, user, interaction.guild_id or 0)
             u.chips = max(0, u.chips - amount)
             new_bal = u.chips
 
@@ -8689,7 +8933,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            u = await _get_or_create_user(session, user)
+            u = await _get_or_create_user(session, user, interaction.guild_id or 0)
             u.chips = amount
 
         await interaction.followup.send(
@@ -8705,7 +8949,9 @@ class AdminCog(commands.Cog):
             return
         default = json.loads(await get_setting("default_chips") or "1000")
         async with get_session() as session:
-            result = await session.execute(select(User))
+            result = await session.execute(
+                select(User).where(User.guild_id == (interaction.guild_id or 0))
+            )
             for u in result.scalars().all():
                 u.chips = default
 
@@ -8997,6 +9243,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
+                    BettingRestriction.guild_id == (interaction.guild_id or 0),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "ALL",
                 )
@@ -9007,9 +9254,11 @@ class AdminCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            session.add(
-                BettingRestriction(discord_user_id=member.id, restriction_type="ALL")
-            )
+            session.add(BettingRestriction(
+                guild_id=interaction.guild_id or 0,
+                discord_user_id=member.id,
+                restriction_type="ALL",
+            ))
         await interaction.followup.send(
             f"**{member.display_name}** has been banned from placing any bets.",
             ephemeral=True,
@@ -9026,6 +9275,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
+                    BettingRestriction.guild_id == (interaction.guild_id or 0),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "ALL",
                 )
@@ -9059,6 +9309,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
+                    BettingRestriction.guild_id == (interaction.guild_id or 0),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "DISTRICT",
                     BettingRestriction.district == district,
@@ -9070,13 +9321,12 @@ class AdminCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            session.add(
-                BettingRestriction(
-                    discord_user_id=member.id,
-                    restriction_type="DISTRICT",
-                    district=district,
-                )
-            )
+            session.add(BettingRestriction(
+                guild_id=interaction.guild_id or 0,
+                discord_user_id=member.id,
+                restriction_type="DISTRICT",
+                district=district,
+            ))
         await interaction.followup.send(
             f"**{member.display_name}** is now blocked from betting on District {district} markets.",
             ephemeral=True,
@@ -9098,6 +9348,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
+                    BettingRestriction.guild_id == (interaction.guild_id or 0),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "DISTRICT",
                     BettingRestriction.district == district,
@@ -9146,6 +9397,7 @@ class AdminCog(commands.Cog):
                 return
             existing = await session.execute(
                 select(BettingRestriction).where(
+                    BettingRestriction.guild_id == (interaction.guild_id or 0),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "TRIBUTE",
                     BettingRestriction.tribute_id == tid,
@@ -9157,13 +9409,12 @@ class AdminCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            session.add(
-                BettingRestriction(
-                    discord_user_id=member.id,
-                    restriction_type="TRIBUTE",
-                    tribute_id=tid,
-                )
-            )
+            session.add(BettingRestriction(
+                guild_id=interaction.guild_id or 0,
+                discord_user_id=member.id,
+                restriction_type="TRIBUTE",
+                tribute_id=tid,
+            ))
             tribute_name = tribute.name
         await interaction.followup.send(
             f"**{member.display_name}** is now blocked from betting on markets involving **{tribute_name}**.",
@@ -9194,6 +9445,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
+                    BettingRestriction.guild_id == (interaction.guild_id or 0),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "TRIBUTE",
                     BettingRestriction.tribute_id == tid,
@@ -9264,13 +9516,17 @@ class AdminCog(commands.Cog):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-async def _get_or_create_user(session, member: discord.Member) -> User:
-    u = await session.get(User, member.id)
+async def _get_or_create_user(session, member: discord.Member, guild_id: int) -> User:
+    result = await session.execute(
+        select(User).where(User.guild_id == guild_id, User.discord_id == member.id)
+    )
+    u = result.scalar_one_or_none()
     if u is None:
         default_raw = await get_setting("default_chips")
         default_chips = json.loads(default_raw) if default_raw else 1000
         u = User(
-            discord_id=member.id, username=member.display_name, chips=default_chips
+            guild_id=guild_id, discord_id=member.id,
+            username=member.display_name, chips=default_chips,
         )
         session.add(u)
         await session.flush()
