@@ -86,14 +86,14 @@
 </div>
 {% endif %}
 
-<div class="card table-scroll">
-  <table class="table" id="markets-table">
+<div class="table-scroll">
+  <table class="table table-wide" id="markets-table">
     <thead>
       <tr>
         <th>Market</th>
-        <th>Type</th>
+        <th class="hide-mobile">Type</th>
         <th>Odds</th>
-        <th>Bets</th>
+        <th class="hide-mobile">Bets</th>
         <th>Status</th>
         {% if user %}<th></th>{% endif %}
       </tr>
@@ -114,7 +114,7 @@
           </div>
           {% endif %}
         </td>
-        <td><span class="type-badge">{{ market.type | replace('_', ' ') }}</span></td>
+        <td class="hide-mobile"><span class="type-badge">{{ market.type | replace('_', ' ') }}</span></td>
         <td>
           {% if market.status == 'OPEN' or market.status == 'CLOSED' %}
             <span class="font-bold {% if market.odds > 0 %}text-pos{% else %}text-neg{% endif %}">
@@ -128,7 +128,7 @@
             <span class="badge badge-voided">VOIDED</span>
           {% endif %}
         </td>
-        <td class="text-dim">{{ bet_counts.get(market.id, 0) }}</td>
+        <td class="text-dim hide-mobile">{{ bet_counts.get(market.id, 0) }}</td>
         <td><span class="badge badge-{{ market.status.lower() }}">{{ market.status }}</span></td>
         {% if user %}
         <td>
