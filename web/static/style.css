@@ -815,7 +815,7 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 ::-webkit-scrollbar-thumb:hover { background: var(--card-border); }
 
 /* ── Table scroll wrapper (used on mobile) ────────────────────────────────── */
-.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
 
 /* ── Responsive: tablet (≤900px) ─────────────────────────────────────────── */
 @media (max-width: 900px) {
@@ -936,12 +936,33 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   .home-cat-pill { min-width: 0; padding: 0.6rem 0.5rem; }
 }
 
-/* ── Responsive: phone landscape (short viewport, landscape) ─────────────── */
-/* Phones in landscape are typically 360–430px tall; tablets are 600px+.      */
-/* Hide the same extra columns as portrait mobile so the table stays narrow.  */
-@media (orientation: landscape) and (max-height: 500px) {
+/* ── Responsive: phone landscape ─────────────────────────────────────────── */
+/* All phones in landscape are ≤932px wide; tablets start at 1024px.          */
+@media (orientation: landscape) and (max-width: 960px) {
+  /* Compact container padding */
+  .container { padding: 0.5rem 0.6rem; }
+
+  /* Hide same extra columns as portrait mobile */
   .hide-mobile { display: none !important; }
   .table th, .table td { padding: 0.35rem 0.45rem; font-size: 0.82rem; }
+
+  /* Stack horizontal scroll rails vertically so they don't overflow */
+  .home-promo-rail { flex-direction: column; overflow-x: visible; }
+  .home-promo-card { min-width: 0; max-width: 100%; }
+  .home-parlay-rail { flex-direction: column; overflow-x: visible; }
+  .home-parlay-card { min-width: 0; max-width: 100%; }
+
+  /* Category pills: 4-column grid (wider than portrait 3-col) */
+  .home-cat-pills {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    overflow: visible;
+    padding-bottom: 0;
+    gap: 0.35rem;
+  }
+  .home-cat-pill { min-width: 0; padding: 0.4rem 0.4rem; }
+  .home-cat-icon { font-size: 1.4rem; }
+  .home-cat-label { font-size: 0.7rem; }
 }
 
 /* ── Responsive: small mobile (≤400px) ───────────────────────────────────── */
