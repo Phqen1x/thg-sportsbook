@@ -113,7 +113,9 @@ class LemonadeClient:
                 resp.raise_for_status()
                 break
 
-        return resp.json()["choices"][0]["message"]["content"]
+        content = resp.json()["choices"][0]["message"]["content"] or ""
+        log.debug("Lemonade raw response: %s", content[:500])
+        return content
 
     async def list_models(self) -> list[str]:
         """Return model IDs available on this Lemonade instance."""
@@ -237,12 +239,16 @@ def _build_district_record_lines(records: list[dict[str, Any]]) -> str:
 
 
 def _extract_json(raw: str) -> Any:
-    """Parse JSON from a model response, tolerating markdown code fences."""
+    """Parse JSON from a model response, tolerating markdown fences and thinking tags."""
     text = raw.strip()
+    # Strip <think>...</think> blocks emitted by reasoning models (Gemma-4, Qwen3, etc.)
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
     # Strip ```json ... ``` or ``` ... ``` fences
     fenced = re.match(r"^```(?:json)?\s*([\s\S]*?)```$", text, re.IGNORECASE)
     if fenced:
         text = fenced.group(1).strip()
+    if not text:
+        raise ValueError("model returned empty content after stripping thinking tags")
     return json.loads(text)
 
 
@@ -288,7 +294,7 @@ async def generate_ai_parlays(
             {"role": "user", "content": user_msg},
         ],
         temperature=0.8,
-        max_tokens=1024,
+        max_tokens=2048,
         num_ctx=num_ctx,
         timeout=timeout,
     )
