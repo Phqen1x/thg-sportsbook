@@ -6,17 +6,17 @@
   <h1>Tribute Roster</h1>
 </div>
 
-<div class="card table-scroll">
-  <table class="table">
+<div class="table-scroll">
+  <table class="table table-wide">
     <thead>
       <tr>
         <th>District</th>
         <th>Tribute</th>
-        <th>Gender</th>
-        <th>Age</th>
-        <th>Score</th>
-        <th>Kills</th>
-        <th>Alliance</th>
+        <th class="hide-mobile">Gender</th>
+        <th class="hide-mobile">Age</th>
+        <th class="hide-mobile">Score</th>
+        <th class="hide-mobile">Kills</th>
+        <th class="hide-mobile">Alliance</th>
         <th>Status</th>
         <th>Win Odds</th>
         {% if user %}<th></th>{% endif %}
@@ -28,11 +28,11 @@
       <tr class="{% if tribute.status == 'DEAD' %}row-dead{% elif tribute.status == 'VICTOR' %}row-victor{% endif %}">
         <td><span class="district-badge">D{{ tribute.district }}</span></td>
         <td class="font-bold">{{ tribute.name }}</td>
-        <td class="text-dim">{{ tribute.display_gender }}</td>
-        <td class="text-dim">{{ tribute.age or '—' }}</td>
-        <td>{% if tribute.training_score %}<span class="score-badge">{{ tribute.training_score }}</span>{% else %}—{% endif %}</td>
-        <td>{{ tribute.kills }}</td>
-        <td class="text-dim">{{ alliances.get(tribute.alliance_id, '—') }}</td>
+        <td class="text-dim hide-mobile">{{ tribute.display_gender }}</td>
+        <td class="text-dim hide-mobile">{{ tribute.age or '—' }}</td>
+        <td class="hide-mobile">{% if tribute.training_score %}<span class="score-badge">{{ tribute.training_score }}</span>{% else %}—{% endif %}</td>
+        <td class="hide-mobile">{{ tribute.kills }}</td>
+        <td class="text-dim hide-mobile">{{ alliances.get(tribute.alliance_id, '—') }}</td>
         <td>
           {% if tribute.status == 'ALIVE' %}
             <span class="badge badge-alive">ALIVE</span>

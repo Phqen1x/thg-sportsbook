@@ -26,15 +26,17 @@
       {% if user.is_admin %}
         <a href="/admin" class="nav-admin {% if request.url.path.startswith('/admin') %}active{% endif %}">Admin</a>
       {% endif %}
-      <div class="nav-user">
-        <img src="{{ user.avatar_url }}" alt="" class="avatar">
-        <span>{{ user.username }}</span>
-        <a href="/auth/logout" class="btn btn-sm btn-outline">Logout</a>
-      </div>
-    {% else %}
-      <a href="/auth/login" class="btn btn-primary">Login with Discord</a>
     {% endif %}
   </div>
+  {% if user %}
+  <div class="nav-user">
+    <img src="{{ user.avatar_url }}" alt="" class="avatar">
+    <span class="nav-username">{{ user.username }}</span>
+    <a href="/auth/logout" class="btn btn-sm btn-outline">Logout</a>
+  </div>
+  {% else %}
+  <a href="/auth/login" class="btn btn-sm btn-primary nav-login-btn">Login</a>
+  {% endif %}
 </nav>
 
 {% if request.query_params.get('error') %}
@@ -51,6 +53,44 @@
 <footer class="footer">
   <span>Panem Sportsbook &mdash; May the odds be ever in your favor.</span>
 </footer>
+
+<nav class="mobile-nav" aria-label="Mobile navigation">
+  <a href="/" class="mobile-nav-item {% if request.url.path == '/' %}active{% endif %}">
+    <span class="mobile-nav-icon">🏠</span>
+    <span class="mobile-nav-label">Home</span>
+  </a>
+  <a href="/markets" class="mobile-nav-item {% if request.url.path == '/markets' or request.url.path.startswith('/bet') %}active{% endif %}">
+    <span class="mobile-nav-icon">⚔️</span>
+    <span class="mobile-nav-label">Markets</span>
+  </a>
+  {% if user %}
+  <a href="/my-bets" class="mobile-nav-item {% if request.url.path == '/my-bets' %}active{% endif %}">
+    <span class="mobile-nav-icon">🎲</span>
+    <span class="mobile-nav-label">My Bets</span>
+  </a>
+  <a href="/parlay" class="mobile-nav-item {% if request.url.path == '/parlay' %}active{% endif %}">
+    <span class="mobile-nav-icon">🎯</span>
+    <span class="mobile-nav-label">Parlay</span>
+  </a>
+  <a href="/balance" class="mobile-nav-item {% if request.url.path == '/balance' %}active{% endif %}">
+    <span class="mobile-nav-icon">💰</span>
+    <span class="mobile-nav-label">Balance</span>
+  </a>
+  {% else %}
+  <a href="/leaderboard" class="mobile-nav-item {% if request.url.path == '/leaderboard' %}active{% endif %}">
+    <span class="mobile-nav-icon">🏆</span>
+    <span class="mobile-nav-label">Leaders</span>
+  </a>
+  <a href="/tributes" class="mobile-nav-item {% if request.url.path == '/tributes' %}active{% endif %}">
+    <span class="mobile-nav-icon">🗡️</span>
+    <span class="mobile-nav-label">Tributes</span>
+  </a>
+  <a href="/auth/login" class="mobile-nav-item">
+    <span class="mobile-nav-icon">🔑</span>
+    <span class="mobile-nav-label">Login</span>
+  </a>
+  {% endif %}
+</nav>
 
 <script src="/static/app.js?v={{ static_v }}"></script>
 {% block scripts %}{% endblock %}

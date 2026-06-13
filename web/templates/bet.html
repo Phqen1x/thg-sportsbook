@@ -65,13 +65,9 @@
     </form>
     {% endif %}
 
-    <div class="mt-2">
-      <a href="/parlay/add/{{ market.id }}" class="btn btn-outline btn-full">
-        <form method="post" action="/parlay/add/{{ market.id }}">
-          <button type="submit" class="btn btn-outline btn-full">+ Add to Parlay Slip</button>
-        </form>
-      </a>
-    </div>
+    <form method="post" action="/parlay/add/{{ market.id }}" class="mt-2">
+      <button type="submit" class="btn btn-outline btn-full">+ Add to Parlay Slip</button>
+    </form>
   </div>
 </div>
 {% endblock %}
