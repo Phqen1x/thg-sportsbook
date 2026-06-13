@@ -2192,6 +2192,7 @@ async def _try_generate_ai_parlays(
             ],
             count=count,
             num_ctx=_cfg.LEMONADE_CTX_SIZE,
+            timeout=_cfg.LEMONADE_TIMEOUT,
         )
 
         if not suggestions:

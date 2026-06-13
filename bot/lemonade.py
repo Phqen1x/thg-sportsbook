@@ -71,7 +71,7 @@ class LemonadeClient:
         max_tokens: int = 4096,
         num_ctx: int = 0,
         json_mode: bool = False,
-        timeout: float = 180.0,
+        timeout: float = 600.0,
         _retries: int = 2,
     ) -> str:
         """Send a chat completion request; return the assistant's reply text.
@@ -256,6 +256,7 @@ async def generate_ai_parlays(
     count: int = 3,
     tiers: list[str] | None = None,
     num_ctx: int = 0,
+    timeout: float = 600.0,
 ) -> list[dict[str, Any]]:
     """Ask Lemonade to generate ``count`` themed parlay suggestions.
 
@@ -289,6 +290,7 @@ async def generate_ai_parlays(
         temperature=0.8,
         max_tokens=1024,
         num_ctx=num_ctx,
+        timeout=timeout,
     )
 
     try:

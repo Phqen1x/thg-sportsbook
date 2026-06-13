@@ -29,3 +29,5 @@ LEMONADE_BASE_URL: str = os.environ.get("LEMONADE_BASE_URL", "http://localhost:1
 LEMONADE_MODEL: str = os.environ.get("LEMONADE_MODEL", "auto")
 # Context window override passed as num_ctx to llama-server; 0 = use server default.
 LEMONADE_CTX_SIZE: int = int(os.environ.get("LEMONADE_CTX_SIZE", "32768"))
+# HTTP timeout (seconds) for a single Lemonade inference call.
+LEMONADE_TIMEOUT: float = float(os.environ.get("LEMONADE_TIMEOUT", "600"))
