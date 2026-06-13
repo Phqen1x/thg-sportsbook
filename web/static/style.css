@@ -29,7 +29,7 @@
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-html { font-size: 16px; }
+html { font-size: 16px; overflow-x: hidden; }
 
 body {
   background: var(--bg);
@@ -40,6 +40,7 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  overflow-x: hidden;
 }
 
 a { color: var(--text-gold); text-decoration: none; }
@@ -105,6 +106,33 @@ a:hover { color: var(--header-gold); }
 }
 .nav-username { white-space: nowrap; }
 .nav-login-btn { flex-shrink: 0; }
+
+/* ── Hamburger Button ─────────────────────────────────────────────────────── */
+.hamburger-btn {
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 5px;
+  width: 36px;
+  height: 36px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  flex-shrink: 0;
+}
+.hamburger-btn span {
+  display: block;
+  width: 22px;
+  height: 2px;
+  background: var(--text-dim);
+  border-radius: 2px;
+  transition: transform 0.2s, opacity 0.2s;
+}
+.hamburger-btn.open span:nth-child(1) { transform: translateY(7px) rotate(45deg); }
+.hamburger-btn.open span:nth-child(2) { opacity: 0; }
+.hamburger-btn.open span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }
 
 .avatar {
   width: 28px;
@@ -808,19 +836,22 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
     gap: 0;
   }
   .brand { font-size: 0.88rem; padding: 0.3rem 0; flex: 1; }
+  .hamburger-btn { display: flex; }
   .nav-links {
+    display: none;
     order: 3;
     width: 100%;
     flex: none;
-    overflow-x: auto;
-    scrollbar-width: none;
+    flex-direction: column;
     flex-wrap: nowrap;
+    overflow: visible;
     gap: 0;
-    padding: 0.2rem 0 0.3rem;
+    padding: 0.25rem 0;
+    border-top: 1px solid var(--divider);
   }
-  .nav-links::-webkit-scrollbar { display: none; }
-  .nav-links > a { font-size: 0.8rem; padding: 0.25rem 0.5rem; white-space: nowrap; }
-  .nav-user { margin-left: auto; gap: 0.35rem; }
+  .navbar.nav-open .nav-links { display: flex; }
+  .nav-links > a { font-size: 0.95rem; padding: 0.65rem 1rem; white-space: normal; border-radius: 0; width: 100%; }
+  .nav-user { gap: 0.35rem; }
   .nav-username { display: none; }
   .nav-user .btn { font-size: 0.75rem; padding: 0.2rem 0.45rem; }
   .nav-login-btn { font-size: 0.78rem; padding: 0.25rem 0.55rem; }
@@ -841,8 +872,6 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
 
   /* Cards / tables */
   .card { padding: 0.6rem 0.7rem; }
-  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  .table-wide { min-width: 520px; }
   .table th, .table td { padding: 0.35rem 0.45rem; font-size: 0.82rem; }
 
   /* Column visibility */
@@ -890,11 +919,29 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   .home-market-odds { font-size: 0.95rem; }
   .home-market-actions { flex-direction: column; gap: 0.25rem; }
   .home-market-actions .btn-sm { width: 100%; justify-content: center; }
-  .home-promo-card { min-width: 200px; }
-  .home-parlay-card { min-width: 200px; }
+  /* Promo + parlay rails: stack vertically instead of horizontal scroll */
+  .home-promo-rail { flex-direction: column; overflow-x: visible; }
+  .home-promo-card { min-width: 0; max-width: 100%; }
+  .home-parlay-rail { flex-direction: column; overflow-x: visible; }
+  .home-parlay-card { min-width: 0; max-width: 100%; }
 
-  /* Body padding for fixed mobile nav */
-  body { padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
+  /* Category pills: 3-column grid instead of horizontal scroll */
+  .home-cat-pills {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    overflow: visible;
+    padding-bottom: 0;
+    gap: 0.4rem;
+  }
+  .home-cat-pill { min-width: 0; padding: 0.6rem 0.5rem; }
+}
+
+/* ── Responsive: phone landscape (short viewport, landscape) ─────────────── */
+/* Phones in landscape are typically 360–430px tall; tablets are 600px+.      */
+/* Hide the same extra columns as portrait mobile so the table stays narrow.  */
+@media (orientation: landscape) and (max-height: 500px) {
+  .hide-mobile { display: none !important; }
+  .table th, .table td { padding: 0.35rem 0.45rem; font-size: 0.82rem; }
 }
 
 /* ── Responsive: small mobile (≤400px) ───────────────────────────────────── */
@@ -914,42 +961,3 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   .home-market-actions .btn-sm { width: auto; }
 }
 
-/* ── Mobile Bottom Navigation ─────────────────────────────────────────────── */
-.mobile-nav { display: none; }
-
-@media (max-width: 640px) {
-  .mobile-nav {
-    display: flex;
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    background: var(--header-dark);
-    border-top: 1px solid var(--card-border);
-    z-index: 100;
-    padding-bottom: env(safe-area-inset-bottom, 0px);
-  }
-  .mobile-nav-item {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 0.5rem 0.2rem;
-    color: var(--text-dim);
-    text-decoration: none;
-    font-size: 0.6rem;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    gap: 0.15rem;
-    min-height: 56px;
-    transition: color 0.15s;
-    border: none;
-    background: none;
-  }
-  .mobile-nav-item.active { color: var(--header-gold); }
-  .mobile-nav-item:hover { color: var(--text-white); }
-  .mobile-nav-icon { font-size: 1.2rem; line-height: 1; display: block; }
-  .mobile-nav-label { line-height: 1.2; display: block; }
-}

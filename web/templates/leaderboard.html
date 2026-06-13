@@ -9,7 +9,7 @@
 <div class="card table-scroll">
   <table class="table">
     <thead>
-      <tr><th>#</th><th>Player</th><th>Chips</th><th>Wagered</th><th>Won</th></tr>
+      <tr><th>#</th><th>Player</th><th>Chips</th><th class="hide-mobile">Wagered</th><th class="hide-mobile">Won</th></tr>
     </thead>
     <tbody>
       {% for u in users %}
@@ -19,8 +19,8 @@
         </td>
         <td class="font-bold">{{ u.username }}</td>
         <td class="text-gold font-bold">{{ u.chips | fmt_chips }}</td>
-        <td class="text-dim">{{ u.total_wagered | fmt_chips }}</td>
-        <td class="text-pos">{{ u.total_won | fmt_chips }}</td>
+        <td class="text-dim hide-mobile">{{ u.total_wagered | fmt_chips }}</td>
+        <td class="text-pos hide-mobile">{{ u.total_won | fmt_chips }}</td>
       </tr>
       {% else %}
       <tr><td colspan="5" class="text-dim text-center">No players yet.</td></tr>

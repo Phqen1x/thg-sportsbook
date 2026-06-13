@@ -13,9 +13,9 @@
 
 <div id="tab-straight" class="tab-panel">
   <div class="table-scroll">
-    <table class="table table-wide">
+    <table class="table">
       <thead>
-        <tr><th>Market</th><th>Wager</th><th class="hide-mobile">Odds</th><th>Payout</th><th>Status</th><th></th></tr>
+        <tr><th>Market</th><th>Wager</th><th class="hide-mobile">Odds</th><th class="hide-mobile">Payout</th><th>Status</th><th></th></tr>
       </thead>
       <tbody>
         {% for bet in straight_bets %}
@@ -27,7 +27,7 @@
           </td>
           <td>{{ bet.wager | fmt_chips }}</td>
           <td class="hide-mobile {% if bet.odds_at_placement > 0 %}text-pos{% else %}text-neg{% endif %}">{{ bet.odds_at_placement | fmt_odds }}</td>
-          <td class="text-gold">
+          <td class="text-gold hide-mobile">
             {% if bet.status == 'WON' %}{{ bet.payout_if_win | fmt_chips }}
             {% elif bet.status == 'CASHED_OUT' %}{{ bet.cashout_amount | fmt_chips }}
             {% elif bet.status == 'VOIDED' %}{{ bet.wager | fmt_chips }} (refunded)

@@ -87,7 +87,7 @@
 {% endif %}
 
 <div class="table-scroll">
-  <table class="table table-wide" id="markets-table">
+  <table class="table" id="markets-table">
     <thead>
       <tr>
         <th>Market</th>
@@ -135,7 +135,7 @@
           {% if market.status == 'OPEN' %}
             <div class="btn-group">
               <a href="/bet/{{ market.id }}" class="btn btn-primary btn-sm">Bet</a>
-              <form method="post" action="/parlay/add/{{ market.id }}" style="display:inline">
+              <form method="post" action="/parlay/add/{{ market.id }}" style="display:inline" class="hide-mobile">
                 <button class="btn btn-outline btn-sm" title="Add to parlay">+Parlay</button>
               </form>
             </div>
