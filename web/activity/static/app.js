@@ -562,12 +562,13 @@ async function viewBalance(view) {
 
 async function viewAdmin(view) {
   const sub = (location.hash.split("/")[1]) || "markets";
+  const base = location.pathname + location.search;
   view.innerHTML = `
     <div class="subtabs">
-      <a href="#admin/markets"  class="${sub === "markets"  ? "active" : ""}">Markets</a>
-      <a href="#admin/chips"    class="${sub === "chips"    ? "active" : ""}">Chips</a>
-      <a href="#admin/tributes" class="${sub === "tributes" ? "active" : ""}">Tributes</a>
-      <a href="#admin/banners"  class="${sub === "banners"  ? "active" : ""}">Banners</a>
+      <a href="${base}#admin/markets"  class="${sub === "markets"  ? "active" : ""}">Markets</a>
+      <a href="${base}#admin/chips"    class="${sub === "chips"    ? "active" : ""}">Chips</a>
+      <a href="${base}#admin/tributes" class="${sub === "tributes" ? "active" : ""}">Tributes</a>
+      <a href="${base}#admin/banners"  class="${sub === "banners"  ? "active" : ""}">Banners</a>
     </div>
     <div id="admin-body"><div class="loading-inline">Loading…</div></div>`;
   const body = $("#admin-body", view);
