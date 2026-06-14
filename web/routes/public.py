@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Form, Request
+from fastapi.responses import RedirectResponse
+from typing import Annotated
 from sqlalchemy import func, select, text
 
 from bot.odds.calculator import combined_american
 
 from bot.database.models import Alliance, Bet, BettingPhase, DistrictRecord, Market, ParlayTemplate, ParlayTemplateLeg, Tribute, User
-from web.database import get_db
+from web import discord_api as _discord_api
+from web.database import available_guilds, get_db, get_request_guild
 from web.deps import optional_user
-from web.session import SessionUser
-
+from web.session import SessionUser, set_session
 router = APIRouter(tags=["public"])
 
 
@@ -212,10 +214,13 @@ def _parlay_flavor(
 
 
 async def _phase_name(db) -> str | None:
-    row = (await db.execute(text("SELECT value FROM game_settings WHERE key='active_phase_id'"))).fetchone()
+    row = (await db.execute(text("SELECT value FROM game_settings WHERE key='current_phase_id'"))).fetchone()
     if not row:
         return None
-    phase = await db.get(BettingPhase, int(row[0]))
+    phase_id = json.loads(row[0]) if row[0] else None
+    if phase_id is None:
+        return None
+    phase = await db.get(BettingPhase, phase_id)
     return phase.name if phase else None
 
 
@@ -250,7 +255,10 @@ async def home(request: Request, user: SessionUser | None = Depends(optional_use
             tributes_map = {t.id: t for t in t_rows}
 
         leaderboard = (await db.execute(
-            select(User).order_by(User.chips.desc()).limit(10)
+            select(User)
+            .where(User.guild_id == get_request_guild())
+            .order_by(User.chips.desc())
+            .limit(10)
         )).scalars().all()
 
         open_count = len(open_markets)
@@ -486,7 +494,10 @@ async def markets(
 async def leaderboard(request: Request, user: SessionUser | None = Depends(optional_user)):
     async with get_db() as db:
         users = (await db.execute(
-            select(User).order_by(User.chips.desc()).limit(100)
+            select(User)
+            .where(User.guild_id == get_request_guild())
+            .order_by(User.chips.desc())
+            .limit(100)
         )).scalars().all()
 
     return request.app.state.templates.TemplateResponse("leaderboard.html", {
@@ -494,3 +505,41 @@ async def leaderboard(request: Request, user: SessionUser | None = Depends(optio
         "user": user,
         "users": users,
     })
+
+
+@router.get("/select-server")
+async def select_server(request: Request, user: SessionUser | None = Depends(optional_user)):
+    if user is None:
+        return RedirectResponse("/auth/login")
+    guild_ids = available_guilds()
+    if len(guild_ids) == 1:
+        # Only one guild — auto-select and redirect.
+        user.guild_id = guild_ids[0]
+        resp = RedirectResponse("/")
+        set_session(resp, user)
+        return resp
+    # Fetch guild names in parallel.
+    import asyncio
+    names = await asyncio.gather(*[_discord_api.get_guild_name(gid) for gid in guild_ids])
+    guilds = [{"id": gid, "name": name or str(gid)} for gid, name in zip(guild_ids, names)]
+    return request.app.state.templates.TemplateResponse("select_server.html", {
+        "request": request,
+        "user": user,
+        "guilds": guilds,
+    })
+
+
+@router.post("/select-server")
+async def select_server_post(
+    request: Request,
+    guild_id: Annotated[int, Form()],
+    user: SessionUser | None = Depends(optional_user),
+):
+    if user is None:
+        return RedirectResponse("/auth/login")
+    if guild_id not in available_guilds():
+        return RedirectResponse("/select-server?error=Invalid+server+selection.", status_code=303)
+    user.guild_id = guild_id
+    resp = RedirectResponse("/", status_code=303)
+    set_session(resp, user)
+    return resp

@@ -53,32 +53,34 @@ async def get_user(access_token: str) -> dict:
         return r.json()
 
 
-async def get_member(user_id: int) -> dict | None:
-    """Return the guild member dict, or None if not a member. Returns {} when no GUILD_ID is set."""
-    if not config.GUILD_ID:
+async def get_member(user_id: int, *, guild_id: int | None = None) -> dict | None:
+    """Return the guild member dict, or None if not a member. Returns {} when no guild is known."""
+    gid = guild_id or config.GUILD_ID
+    if not gid:
         return {}
     async with httpx.AsyncClient() as c:
         r = await c.get(
-            f"{DISCORD_API}/guilds/{config.GUILD_ID}/members/{user_id}",
+            f"{DISCORD_API}/guilds/{gid}/members/{user_id}",
             headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
         )
         return r.json() if r.status_code == 200 else None
 
 
-async def check_admin(member: dict) -> bool:
+async def check_admin(member: dict, *, guild_id: int | None = None) -> bool:
     """Check admin status from a pre-fetched member dict (see get_member).
 
     Uses ADMIN_ROLE_ID if configured; otherwise falls back to the server
     Administrator permission bit — one extra API call in that case.
     """
-    if not config.GUILD_ID:
+    gid = guild_id or config.GUILD_ID
+    if not gid:
         return False
     member_role_ids = {int(x) for x in member.get("roles", [])}
     if config.ADMIN_ROLE_ID:
         return config.ADMIN_ROLE_ID in member_role_ids
     async with httpx.AsyncClient() as c:
         roles_r = await c.get(
-            f"{DISCORD_API}/guilds/{config.GUILD_ID}/roles",
+            f"{DISCORD_API}/guilds/{gid}/roles",
             headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
         )
         if roles_r.status_code != 200:
@@ -89,3 +91,13 @@ async def check_admin(member: dict) -> bool:
                 if int(role["permissions"]) & ADMINISTRATOR:
                     return True
         return False
+
+
+async def get_guild_name(guild_id: int) -> str | None:
+    """Return the guild's name, or None on error."""
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{DISCORD_API}/guilds/{guild_id}",
+            headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
+        )
+        return r.json().get("name") if r.status_code == 200 else None

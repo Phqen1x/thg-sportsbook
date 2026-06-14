@@ -11,22 +11,30 @@ from bot.cogs.betting import _parlay_conflict, PARLAY_PAYOUT_CAP, MAX_PARLAY_LEG
 from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
 from web.routes.public import _parlay_flavor
 from bot.odds.calculator import straight_payout, parlay_payout, combined_american, cashout_value
-from web.database import get_db
+from web.database import get_db, get_request_guild
 from web.deps import optional_user, require_user
 from web.session import SessionUser
+from web import config as _web_config
 
 router = APIRouter(tags=["member"])
 
+_GUILD_ID = get_request_guild
+
 
 async def _get_or_create_user(db, session_user: SessionUser) -> User:
-    u = await db.get(User, session_user.discord_id)
+    result = await db.execute(
+        select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == session_user.discord_id)
+    )
+    u = result.scalar_one_or_none()
     if u is None:
-        from web import config
         default_raw = (await db.execute(
             __import__("sqlalchemy").text("SELECT value FROM game_settings WHERE key='default_chips'")
         )).fetchone()
-        default = json.loads(default_raw[0]) if default_raw else config.DEFAULT_CHIPS
-        u = User(discord_id=session_user.discord_id, username=session_user.username, chips=default)
+        default = json.loads(default_raw[0]) if default_raw else _web_config.DEFAULT_CHIPS
+        u = User(
+            guild_id=_GUILD_ID(), discord_id=session_user.discord_id,
+            username=session_user.username, chips=default,
+        )
         db.add(u)
         await db.flush()
     return u
@@ -56,10 +64,10 @@ async def balance(
 
         # Stats
         bets = (await db.execute(
-            select(Bet).where(Bet.user_id == user.discord_id, Bet.parlay_id.is_(None))
+            select(Bet).where(Bet.guild_id == _GUILD_ID(), Bet.user_id == user.discord_id, Bet.parlay_id.is_(None))
         )).scalars().all()
         parlays = (await db.execute(
-            select(Parlay).where(Parlay.user_id == user.discord_id)
+            select(Parlay).where(Parlay.guild_id == _GUILD_ID(), Parlay.user_id == user.discord_id)
         )).scalars().all()
 
         won = sum(b.payout_if_win for b in bets if b.status == "WON")
@@ -91,13 +99,13 @@ async def my_bets(
     async with get_db() as db:
         straight_bets = (await db.execute(
             select(Bet)
-            .where(Bet.user_id == user.discord_id, Bet.parlay_id.is_(None))
+            .where(Bet.guild_id == _GUILD_ID(), Bet.user_id == user.discord_id, Bet.parlay_id.is_(None))
             .order_by(Bet.placed_at.desc())
         )).scalars().all()
 
         parlays = (await db.execute(
             select(Parlay)
-            .where(Parlay.user_id == user.discord_id)
+            .where(Parlay.guild_id == _GUILD_ID(), Parlay.user_id == user.discord_id)
             .order_by(Parlay.placed_at.desc())
         )).scalars().all()
 
@@ -160,6 +168,7 @@ async def bet_form(
 
         existing = (await db.execute(
             select(Bet).where(
+                Bet.guild_id == _GUILD_ID(),
                 Bet.user_id == user.discord_id,
                 Bet.market_id == market_id,
                 Bet.status == "PENDING",
@@ -201,6 +210,7 @@ async def place_bet(
 
         existing = (await db.execute(
             select(Bet).where(
+                Bet.guild_id == _GUILD_ID(),
                 Bet.user_id == user.discord_id,
                 Bet.market_id == market_id,
                 Bet.status == "PENDING",
@@ -212,6 +222,7 @@ async def place_bet(
 
         payout = straight_payout(wager, market.odds)
         bet = Bet(
+            guild_id=_GUILD_ID(),
             user_id=user.discord_id,
             market_id=market_id,
             wager=wager,
@@ -233,7 +244,7 @@ async def place_bet(
 async def cashout_bet(request: Request, bet_id: int, user: SessionUser = Depends(require_user)):
     async with get_db() as db:
         bet = await db.get(Bet, bet_id)
-        if not bet or bet.user_id != user.discord_id or bet.status != "PENDING":
+        if not bet or bet.user_id != user.discord_id or bet.guild_id != _GUILD_ID() or bet.status != "PENDING":
             return _redirect("/my-bets", error="Bet+not+found+or+not+cashout-eligible.")
 
         market = await db.get(Market, bet.market_id)
@@ -253,7 +264,7 @@ async def cashout_bet(request: Request, bet_id: int, user: SessionUser = Depends
                 return _redirect("/my-bets", error="Cashout+is+not+currently+allowed.")
 
         amount = cashout_value(bet.wager, bet.payout_if_win, rate)
-        db_user = await db.get(User, user.discord_id)
+        db_user = (await db.execute(select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == user.discord_id))).scalar_one_or_none()
         if db_user:
             db_user.chips += amount
         bet.status = "CASHED_OUT"
@@ -267,7 +278,7 @@ async def cashout_bet(request: Request, bet_id: int, user: SessionUser = Depends
 async def cashout_parlay(request: Request, parlay_id: int, user: SessionUser = Depends(require_user)):
     async with get_db() as db:
         parlay = await db.get(Parlay, parlay_id)
-        if not parlay or parlay.user_id != user.discord_id or parlay.status != "PENDING":
+        if not parlay or parlay.user_id != user.discord_id or parlay.guild_id != _GUILD_ID() or parlay.status != "PENDING":
             return _redirect("/my-bets", error="Parlay+not+found+or+not+cashout-eligible.")
 
         allowed_row = (await db.execute(
@@ -282,7 +293,7 @@ async def cashout_parlay(request: Request, parlay_id: int, user: SessionUser = D
         rate = float(row[0]) if row else 0.65
 
         amount = cashout_value(parlay.total_wager, parlay.total_payout, rate)
-        db_user = await db.get(User, user.discord_id)
+        db_user = (await db.execute(select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == user.discord_id))).scalar_one_or_none()
         if db_user:
             db_user.chips += amount
         parlay.status = "CASHED_OUT"
@@ -315,7 +326,7 @@ async def parlay_view(
 
         legs = (await db.execute(
             select(PendingParlayLeg)
-            .where(PendingParlayLeg.user_id == user.discord_id)
+            .where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
             .order_by(PendingParlayLeg.added_at)
         )).scalars().all()
 
@@ -353,7 +364,7 @@ async def parlay_add(market_id: int, user: SessionUser = Depends(require_user)):
             return _redirect("/parlay", error="Market+is+not+open.")
 
         existing_legs = (await db.execute(
-            select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+            select(PendingParlayLeg).where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
         )).scalars().all()
 
         if len(existing_legs) >= MAX_PARLAY_LEGS:
@@ -372,7 +383,7 @@ async def parlay_add(market_id: int, user: SessionUser = Depends(require_user)):
         if conflict:
             return _redirect(f"/parlay", error=conflict.replace(" ", "+"))
 
-        leg = PendingParlayLeg(user_id=user.discord_id, market_id=market_id)
+        leg = PendingParlayLeg(guild_id=_GUILD_ID(), user_id=user.discord_id, market_id=market_id)
         db.add(leg)
         await db.commit()
 
@@ -383,7 +394,7 @@ async def parlay_add(market_id: int, user: SessionUser = Depends(require_user)):
 async def parlay_remove(leg_id: int, user: SessionUser = Depends(require_user)):
     async with get_db() as db:
         leg = await db.get(PendingParlayLeg, leg_id)
-        if leg and leg.user_id == user.discord_id:
+        if leg and leg.user_id == user.discord_id and leg.guild_id == _GUILD_ID():
             await db.delete(leg)
             await db.commit()
     return _redirect("/parlay")
@@ -393,7 +404,7 @@ async def parlay_remove(leg_id: int, user: SessionUser = Depends(require_user)):
 async def parlay_clear(user: SessionUser = Depends(require_user)):
     async with get_db() as db:
         legs = (await db.execute(
-            select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+            select(PendingParlayLeg).where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
         )).scalars().all()
         for leg in legs:
             await db.delete(leg)
@@ -415,7 +426,7 @@ async def parlay_submit(
 
         legs_raw = (await db.execute(
             select(PendingParlayLeg)
-            .where(PendingParlayLeg.user_id == user.discord_id)
+            .where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
             .order_by(PendingParlayLeg.added_at)
         )).scalars().all()
 
@@ -437,6 +448,7 @@ async def parlay_submit(
 
         public = is_public == "on"
         p = Parlay(
+            guild_id=_GUILD_ID(),
             user_id=user.discord_id,
             total_wager=wager,
             total_payout=total_payout,
@@ -448,6 +460,7 @@ async def parlay_submit(
 
         for mkt in leg_markets:
             bet = Bet(
+                guild_id=_GUILD_ID(),
                 user_id=user.discord_id,
                 parlay_id=p.id,
                 market_id=mkt.id,
@@ -540,6 +553,42 @@ async def tail_board(
             )
             tpl_flavor[tpl.id] = {"name": name, "description": desc}
 
+        # Member public parlays
+        mp_rows = (await db.execute(
+            select(Parlay)
+            .where(Parlay.guild_id == _GUILD_ID(), Parlay.status == "PENDING", Parlay.is_public == True)  # noqa: E712
+            .order_by(Parlay.placed_at.desc())
+            .limit(20)
+        )).scalars().all()
+
+        member_parlays: list[Parlay] = []
+        member_parlay_legs: dict[int, list[Bet]] = {}
+        member_parlay_markets: dict[int, Market] = {}
+        member_parlay_owners: dict[int, str] = {}
+
+        for mp in mp_rows:
+            legs = (await db.execute(
+                select(Bet).where(Bet.parlay_id == mp.id).order_by(Bet.id)
+            )).scalars().all()
+            mkts: list[Market] = []
+            ok = True
+            for b in legs:
+                mkt = await db.get(Market, b.market_id)
+                if not mkt or mkt.status != "OPEN":
+                    ok = False
+                    break
+                mkts.append(mkt)
+            if not ok or len(mkts) < 2:
+                continue
+            member_parlays.append(mp)
+            member_parlay_legs[mp.id] = list(legs)
+            for mkt in mkts:
+                member_parlay_markets[mkt.id] = mkt
+            owner = (await db.execute(
+                select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == mp.user_id)
+            )).scalar_one_or_none()
+            member_parlay_owners[mp.id] = owner.username if owner else "Member"
+
     return request.app.state.templates.TemplateResponse("tail.html", {
         "request": request,
         "user": user,
@@ -548,6 +597,10 @@ async def tail_board(
         "tpl_legs": tpl_legs,
         "tpl_markets": tpl_markets,
         "tpl_flavor": tpl_flavor,
+        "member_parlays": member_parlays,
+        "member_parlay_legs": member_parlay_legs,
+        "member_parlay_markets": member_parlay_markets,
+        "member_parlay_owners": member_parlay_owners,
         "success": success,
         "error": error,
     })
@@ -592,6 +645,7 @@ async def tail_parlay(
         total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
 
         p = Parlay(
+            guild_id=_GUILD_ID(),
             user_id=user.discord_id,
             total_wager=wager,
             total_payout=total_payout,
@@ -603,6 +657,74 @@ async def tail_parlay(
 
         for mkt in leg_markets:
             bet = Bet(
+                guild_id=_GUILD_ID(),
+                user_id=user.discord_id,
+                parlay_id=p.id,
+                market_id=mkt.id,
+                wager=wager,
+                odds_at_placement=mkt.odds,
+                payout_if_win=0,
+                status="PENDING",
+            )
+            db.add(bet)
+
+        db_user.chips -= wager
+        db_user.total_wagered += wager
+        await db.commit()
+
+    return _redirect("/my-bets", msg=f"Parlay+tailed!+Potential+payout:+{total_payout:,}+chips.")
+
+
+@router.post("/tail/parlay/{parlay_id}")
+async def tail_member_parlay(
+    parlay_id: int,
+    user: SessionUser = Depends(require_user),
+    wager: Annotated[int, Form()] = 0,
+):
+    if wager < 1:
+        return _redirect("/tail", error="Wager+must+be+at+least+1+chip.")
+
+    async with get_db() as db:
+        source = await db.get(Parlay, parlay_id)
+        if not source or not source.is_public or source.status != "PENDING":
+            return _redirect("/tail", error="Parlay+not+found+or+no+longer+available.")
+
+        db_user = await _get_or_create_user(db, user)
+
+        legs = (await db.execute(
+            select(Bet).where(Bet.parlay_id == parlay_id).order_by(Bet.id)
+        )).scalars().all()
+
+        leg_markets = []
+        for b in legs:
+            mkt = await db.get(Market, b.market_id)
+            if not mkt or mkt.status != "OPEN":
+                return _redirect("/tail", error="One+or+more+markets+in+this+parlay+are+no+longer+open.")
+            leg_markets.append(mkt)
+
+        if len(leg_markets) < 2:
+            return _redirect("/tail", error="Parlay+has+insufficient+open+markets.")
+
+        if db_user.chips < wager:
+            return _redirect("/tail", error="Insufficient+chips.")
+
+        odds_list = [m.odds for m in leg_markets]
+        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+
+        p = Parlay(
+            guild_id=_GUILD_ID(),
+            user_id=user.discord_id,
+            total_wager=wager,
+            total_payout=total_payout,
+            status="PENDING",
+            is_public=False,
+        )
+        db.add(p)
+        await db.flush()
+
+        for mkt in leg_markets:
+            bet = Bet(
+                guild_id=_GUILD_ID(),
                 user_id=user.discord_id,
                 parlay_id=p.id,
                 market_id=mkt.id,

@@ -19,6 +19,7 @@ dependencies = [
     "itsdangerous==2.2.0",
     "jinja2==3.1.4",
     "python-multipart==0.0.12",
+    "pypdf>=4.0.0",
 ]
 
 [project.scripts]

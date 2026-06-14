@@ -8,5 +8,14 @@ if [ ! -f "$SNAP_COMMON/.env" ]; then
     exit 1
 fi
 
+if [ -z "$DB_PATH" ]; then
+    GUILD_ID=$(grep '^GUILD_ID=' "$SNAP_COMMON/.env" | cut -d= -f2- | tr -d '[:space:]')
+    if [ -n "$GUILD_ID" ]; then
+        export DB_PATH="$SNAP_COMMON/data/sportsbook_${GUILD_ID}.db"
+    else
+        export DB_PATH="$SNAP_COMMON/data/sportsbook.db"
+    fi
+fi
+
 cd "$SNAP_COMMON"
 exec "$SNAP/bin/thg-sportsbook"

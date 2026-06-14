@@ -71,6 +71,9 @@ async function authenticate() {
 
   SDK = new DiscordSDK(CFG.clientId);
   await SDK.ready();
+  // Keep as string — Discord snowflakes exceed Number.MAX_SAFE_INTEGER and
+  // would silently lose precision if converted to a JS number.
+  const guildId = SDK.guildId || null;
   const { code } = await SDK.commands.authorize({
     client_id: CFG.clientId,
     response_type: "code",
@@ -78,7 +81,7 @@ async function authenticate() {
     prompt: "none",
     scope: ["identify"],
   });
-  const result = await api("/token", { method: "POST", body: { code } });
+  const result = await api("/token", { method: "POST", body: { code, guild_id: guildId } });
   TOKEN = result.token;
   await SDK.commands.authenticate({ access_token: result.access_token });
   ME = { ...result.user, chips: 0 };

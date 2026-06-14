@@ -107,12 +107,15 @@ async def _tribute_autocomplete(
     return choices[:25]
 
 
-async def _get_or_create_user(session, member: discord.Member) -> User:
-    u = await session.get(User, member.id)
+async def _get_or_create_user(session, member: discord.Member, guild_id: int) -> User:
+    result = await session.execute(
+        select(User).where(User.guild_id == guild_id, User.discord_id == member.id)
+    )
+    u = result.scalar_one_or_none()
     if u is None:
         default_raw = await get_setting("default_chips")
         default = json.loads(default_raw) if default_raw else 1000
-        u = User(discord_id=member.id, username=member.display_name, chips=default)
+        u = User(guild_id=guild_id, discord_id=member.id, username=member.display_name, chips=default)
         session.add(u)
         await session.flush()
     else:
@@ -369,7 +372,7 @@ class DisplayCog(commands.Cog):
                 )
                 return
             async with get_session() as session:
-                user = await _get_or_create_user(session, interaction.user)
+                user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
                 user_chips = user.chips
 
                 t = await session.get(Tribute, tribute_id)
@@ -426,7 +429,7 @@ class DisplayCog(commands.Cog):
 
         # ── Full board view (District / Alliance / Tribute toggle) ────────────
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             user_chips = user.chips
 
             trib_result = await session.execute(
@@ -584,7 +587,7 @@ class DisplayCog(commands.Cog):
     async def balance(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             chips = user.chips
             wagered = user.total_wagered
             won = user.total_won
@@ -610,7 +613,10 @@ class DisplayCog(commands.Cog):
             return
         async with get_session() as session:
             result = await session.execute(
-                select(User).order_by(User.chips.desc()).limit(10)
+                select(User)
+                .where(User.guild_id == (interaction.guild_id or 0))
+                .order_by(User.chips.desc())
+                .limit(10)
             )
             users = result.scalars().all()
 

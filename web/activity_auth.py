@@ -52,6 +52,8 @@ def bearer_user(request: Request) -> SessionUser:
     user = verify_token(raw) if raw else None
     if user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
+    from web.database import set_request_guild
+    set_request_guild(user.guild_id or 0)
     return user
 
 

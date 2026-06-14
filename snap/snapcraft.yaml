@@ -71,6 +71,5 @@ apps:
       - network-bind
 
 environment:
-  DB_PATH: $SNAP_COMMON/data/sportsbook.db
   FONTS_DIR: $SNAP/assets/fonts
   DOTENV_PATH: $SNAP_COMMON/.env

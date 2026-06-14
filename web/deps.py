@@ -4,6 +4,7 @@ import time
 
 from fastapi import HTTPException, Request
 
+from web.database import set_request_guild
 from web.session import SessionUser, read_session
 
 _admin_cache: dict[int, tuple[bool, float]] = {}
@@ -25,14 +26,18 @@ async def _live_is_admin(discord_id: int) -> bool:
     return admin
 
 
-def optional_user(request: Request) -> SessionUser | None:
-    return read_session(request)
+async def optional_user(request: Request) -> SessionUser | None:
+    u = read_session(request)
+    if u:
+        set_request_guild(u.guild_id or 0)
+    return u
 
 
-def require_user(request: Request) -> SessionUser:
+async def require_user(request: Request) -> SessionUser:
     u = read_session(request)
     if u is None:
         raise HTTPException(status_code=401, detail="Login required")
+    set_request_guild(u.guild_id or 0)
     return u
 
 
@@ -40,6 +45,7 @@ async def require_admin(request: Request) -> SessionUser:
     u = read_session(request)
     if u is None:
         raise HTTPException(status_code=401, detail="Login required")
+    set_request_guild(u.guild_id or 0)
     if not await _live_is_admin(u.discord_id):
         raise HTTPException(status_code=403, detail="Admin access required")
     return u

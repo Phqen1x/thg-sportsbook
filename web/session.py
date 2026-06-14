@@ -20,6 +20,7 @@ class SessionUser:
     username: str
     avatar: str | None
     is_admin: bool
+    guild_id: int | None = None
 
     @property
     def avatar_url(self) -> str:

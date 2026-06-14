@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot import config
-from bot.database.engine import get_setting, init_db
+from bot.database.engine import get_setting, init_db, set_guild_context
 from bot.imaging.base import get_theme_by_name, set_active_theme
 
 logging.basicConfig(
@@ -20,6 +20,10 @@ log = logging.getLogger("capitol")
 
 
 class SportsBookCommandTree(app_commands.CommandTree):
+    async def call(self, interaction: discord.Interaction) -> None:
+        set_guild_context(interaction.guild_id or 0)
+        await super().call(interaction)
+
     async def sync(self, *, guild: Optional[discord.abc.Snowflake] = None):
         if guild is not None:
             return await super().sync(guild=guild)
@@ -51,16 +55,6 @@ class SportsBookBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents, tree_cls=SportsBookCommandTree)
 
     async def setup_hook(self) -> None:
-        log.info("Initializing database...")
-        await init_db()
-
-        saved_theme = await get_setting("image_theme")
-        if saved_theme:
-            theme = get_theme_by_name(saved_theme)
-            if theme:
-                set_active_theme(theme)
-                log.info(f"Loaded image theme: {theme.name}")
-
         log.info("Loading cogs...")
         await self.load_extension("bot.cogs.admin")
         await self.load_extension("bot.cogs.betting")
@@ -87,9 +81,25 @@ class SportsBookBot(commands.Bot):
             return
         await post_audit_log(self, interaction)
 
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        log.info(f"Joined guild {guild.id} ({guild.name}), initialising database…")
+        await init_db(guild.id)
+
     async def on_ready(self) -> None:
         assert self.user is not None
         log.info(f"Logged in as {self.user} (ID: {self.user.id})")
+        for guild in self.guilds:
+            await init_db(guild.id)
+
+        if self.guilds:
+            set_guild_context(self.guilds[0].id)
+            saved_theme = await get_setting("image_theme")
+            if saved_theme:
+                theme = get_theme_by_name(saved_theme)
+                if theme:
+                    set_active_theme(theme)
+                    log.info(f"Loaded image theme: {theme.name}")
+
         log.info("Panem Sportsbook is open for business.")
         await self.change_presence(
             activity=discord.Activity(

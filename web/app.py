@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -14,6 +16,8 @@ from web import config
 from web.csrf import make_csrf, verify_csrf
 from web.routes import activity, auth, public, member, admin
 from web.session import COOKIE
+
+log = logging.getLogger(__name__)
 
 HERE = Path(__file__).parent
 ACTIVITY_DIR = HERE / "activity"
@@ -69,6 +73,10 @@ async def _lifespan(app: FastAPI):
             "WEB_SECRET_KEY is set to the insecure default. "
             "Set a strong random value in your .env before running in production."
         )
+    from bot.database.engine import init_db
+    from web.database import available_guilds
+    for gid in available_guilds():
+        await init_db(gid)
     yield
 
 
@@ -187,6 +195,21 @@ def create_app() -> FastAPI:
             "error.html",
             {"request": request, "user": None, "code": 404, "message": "Page not found."},
             status_code=404,
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception(request: Request, exc: Exception):
+        log.error(
+            "Unhandled exception on %s %s\n%s",
+            request.method, request.url.path,
+            traceback.format_exc(),
+        )
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"detail": "Internal server error"}, status_code=500)
+        return templates.TemplateResponse(
+            "error.html",
+            {"request": request, "user": None, "code": 500, "message": "An unexpected error occurred. Please try again."},
+            status_code=500,
         )
 
     return app

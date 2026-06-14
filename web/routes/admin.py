@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -11,9 +13,13 @@ from bot.database.models import (
     Parlay, ParlayTemplate, ParlayTemplateLeg, Tribute, User,
 )
 from bot.odds.calculator import parlay_payout
-from web.database import get_db
+from web import config as _web_config
+from web.audit import post_admin_action
+from web.database import get_db, get_request_guild
 from web.deps import require_admin
 from web.session import SessionUser
+
+_GUILD_ID = get_request_guild
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -89,10 +95,10 @@ async def dashboard(request: Request, user: SessionUser = Depends(require_admin)
         open_mkts = (await db.execute(select(func.count(Market.id)).where(Market.status == "OPEN"))).scalar() or 0
         total_bets = (await db.execute(select(func.count(Bet.id)))).scalar() or 0
         pending_bets = (await db.execute(select(func.count(Bet.id)).where(Bet.status == "PENDING", Bet.parlay_id.is_(None)))).scalar() or 0
-        total_users = (await db.execute(select(func.count(User.discord_id)))).scalar() or 0
+        total_users = (await db.execute(select(func.count(User.discord_id)).where(User.guild_id == _GUILD_ID()))).scalar() or 0
         phases = (await db.execute(select(BettingPhase).order_by(BettingPhase.sort_order))).scalars().all()
-        phase_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='active_phase_id'"))).fetchone()
-        active_phase_id = int(phase_row[0]) if phase_row else None
+        phase_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='current_phase_id'"))).fetchone()
+        active_phase_id = json.loads(phase_row[0]) if phase_row else None
 
     return request.app.state.templates.TemplateResponse("admin/index.html", {
         "request": request, "user": user,
@@ -109,8 +115,8 @@ async def dashboard(request: Request, user: SessionUser = Depends(require_admin)
 async def phases(request: Request, user: SessionUser = Depends(require_admin), success: str = "", error: str = ""):
     async with get_db() as db:
         phases_list = (await db.execute(select(BettingPhase).order_by(BettingPhase.sort_order))).scalars().all()
-        phase_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='active_phase_id'"))).fetchone()
-        active_phase_id = int(phase_row[0]) if phase_row else None
+        phase_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='current_phase_id'"))).fetchone()
+        active_phase_id = json.loads(phase_row[0]) if phase_row else None
 
     return request.app.state.templates.TemplateResponse("admin/phases.html", {
         "request": request, "user": user,
@@ -132,6 +138,7 @@ async def phase_create(
         phase = BettingPhase(name=name.strip(), description=description.strip() or None, sort_order=sort_order)
         db.add(phase)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Phase created", {"name": name.strip(), "sort_order": str(sort_order)}))
     return _redirect("/admin/phases", msg="Phase+created.")
 
 
@@ -141,8 +148,9 @@ async def phase_activate(phase_id: int, user: SessionUser = Depends(require_admi
         phase = await db.get(BettingPhase, phase_id)
         if not phase:
             return _redirect("/admin/phases", error="Phase+not+found.")
-        await db.execute(text("INSERT OR REPLACE INTO game_settings (key, value) VALUES ('active_phase_id', :v)"), {"v": str(phase_id)})
+        await db.execute(text("INSERT OR REPLACE INTO game_settings (key, value) VALUES ('current_phase_id', :v)"), {"v": str(phase_id)})
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Phase activated", {"phase": phase.name}))
     return _redirect("/admin/phases", msg=f"Phase+'{phase.name}'+activated.")
 
 
@@ -154,6 +162,7 @@ async def phase_delete(phase_id: int, user: SessionUser = Depends(require_admin)
             return _redirect("/admin/phases", error="Phase+not+found.")
         await db.delete(phase)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Phase deleted", {"phase": phase.name}))
     return _redirect("/admin/phases", msg="Phase+deleted.")
 
 
@@ -223,6 +232,7 @@ async def tribute_create(
         )
         db.add(t)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Tribute created", {"name": name.strip(), "district": str(district)}))
     return _redirect("/admin/tributes", msg="Tribute+created.")
 
 
@@ -275,6 +285,7 @@ async def tribute_edit(
         t.sade_participant = sade_participant == "on"
         t.sade_champion = sade_champion == "on"
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Tribute updated", {"tribute": t.name, "district": str(t.district)}))
     return _redirect("/admin/tributes", msg="Tribute+updated.")
 
 
@@ -300,6 +311,7 @@ async def tribute_kill(
             if killer:
                 killer.kills = (killer.kills or 0) + 1
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Tribute eliminated", {"tribute": t.name, "cause": death_cause, "placement": str(placement) if placement > 0 else "auto"}))
     return _redirect("/admin/tributes", msg=f"{t.name}+has+been+eliminated.")
 
 
@@ -318,6 +330,7 @@ async def tribute_unkill(tribute_id: int, user: SessionUser = Depends(require_ad
         t.placement = None
         t.killed_by_id = None
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Tribute revived", {"tribute": t.name}))
     return _redirect("/admin/tributes", msg=f"{t.name}+revived.")
 
 
@@ -330,6 +343,7 @@ async def tribute_victor(tribute_id: int, user: SessionUser = Depends(require_ad
         t.status = "VICTOR"
         t.placement = 1
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Victor crowned", {"tribute": t.name}))
     return _redirect("/admin/tributes", msg=f"{t.name}+crowned+Victor!")
 
 
@@ -425,6 +439,7 @@ async def market_create(
         )
         db.add(m)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Market created", {"label": label.strip(), "type": market_type, "status": "OPEN" if open_immediately == "on" else "CLOSED"}))
     return _redirect("/admin/markets", msg="Market+created.")
 
 
@@ -434,6 +449,7 @@ async def market_recalc(user: SessionUser = Depends(require_admin)):
     async with get_db() as db:
         await _recalculate_markets(db)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Odds recalculated"))
     return _redirect("/admin/markets", msg="Odds+recalculated.")
 
 
@@ -445,6 +461,7 @@ async def market_bulk_close(user: SessionUser = Depends(require_admin)):
             m.status = "CLOSED"
         await db.commit()
         count = len(markets)
+    asyncio.create_task(post_admin_action(user, "Bulk market close", {"markets closed": str(count)}))
     return _redirect("/admin/markets", msg=f"Closed+{count}+open+markets.")
 
 
@@ -456,6 +473,7 @@ async def market_open(market_id: int, user: SessionUser = Depends(require_admin)
             return _redirect("/admin/markets", error="Market+not+found.")
         m.status = "OPEN"
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Market opened", {"market": m.label}))
     return _redirect("/admin/markets", msg="Market+opened.")
 
 
@@ -467,6 +485,7 @@ async def market_close(market_id: int, user: SessionUser = Depends(require_admin
             return _redirect("/admin/markets", error="Market+not+found.")
         m.status = "CLOSED"
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Market closed", {"market": m.label}))
     return _redirect("/admin/markets", msg="Market+closed.")
 
 
@@ -479,6 +498,7 @@ async def market_reopen(market_id: int, user: SessionUser = Depends(require_admi
         m.status = "CLOSED"
         m.result = None
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Market reopened", {"market": m.label}))
     return _redirect("/admin/markets", msg="Market+reopened+as+Closed.")
 
 
@@ -495,6 +515,7 @@ async def market_set_odds(
         m.odds = odds
         m.odds_override = True
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Market odds set", {"market": m.label, "odds": f"{odds:+d}"}))
     return _redirect("/admin/markets", msg=f"Odds+set+to+{odds:+d}.")
 
 
@@ -508,6 +529,7 @@ async def market_clear_override(market_id: int, user: SessionUser = Depends(requ
         m.odds_override = False
         await _recalculate_markets(db)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Market override cleared", {"market": m.label}))
     return _redirect("/admin/markets", msg="Override+cleared+and+odds+recalculated.")
 
 
@@ -535,12 +557,12 @@ async def market_resolve(
         for bet in bets:
             if bool_result is None:
                 bet.status = "VOIDED"
-                db_user = await db.get(User, bet.user_id)
+                db_user = (await db.execute(select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id))).scalar_one_or_none()
                 if db_user:
                     db_user.chips += bet.wager
             elif bool_result and bet.parlay_id is None:
                 bet.status = "WON"
-                db_user = await db.get(User, bet.user_id)
+                db_user = (await db.execute(select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id))).scalar_one_or_none()
                 if db_user:
                     db_user.chips += bet.payout_if_win
                     db_user.total_won += bet.payout_if_win
@@ -553,6 +575,7 @@ async def market_resolve(
         await db.commit()
 
     label = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
+    asyncio.create_task(post_admin_action(user, "Market resolved", {"market": m.label, "result": label, "bets settled": str(len(bets))}))
     return _redirect("/admin/markets", msg=f"Market+resolved+as+{label}.+{len(bets)}+bets+settled.")
 
 
@@ -568,13 +591,13 @@ async def _settle_parlay(db, parlay_id: int) -> None:
         active = [l for l in legs if l.status != "VOIDED"]
         if all(l.status == "WON" for l in active) and active:
             parlay.status = "WON"
-            db_user = await db.get(User, parlay.user_id)
+            db_user = (await db.execute(select(User).where(User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id))).scalar_one_or_none()
             if db_user:
                 db_user.chips += parlay.total_payout
                 db_user.total_won += parlay.total_payout
         elif all(l.status == "VOIDED" for l in legs):
             parlay.status = "WON"
-            db_user = await db.get(User, parlay.user_id)
+            db_user = (await db.execute(select(User).where(User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id))).scalar_one_or_none()
             if db_user:
                 db_user.chips += parlay.total_wager
 
@@ -608,6 +631,7 @@ async def alliance_create(
         a = Alliance(name=name.strip())
         db.add(a)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Alliance created", {"name": name.strip()}))
     return _redirect("/admin/alliances", msg="Alliance+created.")
 
 
@@ -623,6 +647,7 @@ async def alliance_add_member(
             return _redirect("/admin/alliances", error="Tribute+not+found.")
         t.alliance_id = alliance_id
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Alliance member added", {"tribute": t.name}))
     return _redirect("/admin/alliances", msg="Member+added.")
 
 
@@ -637,6 +662,7 @@ async def alliance_remove_member(
         if t and t.alliance_id == alliance_id:
             t.alliance_id = None
             await db.commit()
+    asyncio.create_task(post_admin_action(user, "Alliance member removed", {"tribute": t.name if t else str(tribute_id)}))
     return _redirect("/admin/alliances", msg="Member+removed.")
 
 
@@ -647,6 +673,7 @@ async def alliance_delete(alliance_id: int, user: SessionUser = Depends(require_
         if a:
             await db.delete(a)
             await db.commit()
+    asyncio.create_task(post_admin_action(user, "Alliance deleted", {"alliance": a.name if a else str(alliance_id)}))
     return _redirect("/admin/alliances", msg="Alliance+deleted.")
 
 
@@ -655,7 +682,7 @@ async def alliance_delete(alliance_id: int, user: SessionUser = Depends(require_
 @router.get("/chips")
 async def chips(request: Request, user: SessionUser = Depends(require_admin), success: str = "", error: str = ""):
     async with get_db() as db:
-        users = (await db.execute(select(User).order_by(User.chips.desc()))).scalars().all()
+        users = (await db.execute(select(User).where(User.guild_id == _GUILD_ID()).order_by(User.chips.desc()))).scalars().all()
     return request.app.state.templates.TemplateResponse("admin/chips.html", {
         "request": request, "user": user, "users": users,
         "success": success, "error": error,
@@ -676,11 +703,12 @@ async def chips_give(
             uid = int(discord_id.strip())
         except ValueError:
             return _redirect("/admin/chips", error="Invalid+Discord+ID.")
-        db_user = await db.get(User, uid)
+        db_user = (await db.execute(select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == uid))).scalar_one_or_none()
         if not db_user:
             return _redirect("/admin/chips", error="User+not+found+in+database.")
         db_user.chips += amount
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Chips given", {"user": db_user.username, "amount": f"{amount:,}", "reason": reason or "none"}))
     return _redirect("/admin/chips", msg=f"Gave+{amount:,}+chips+to+{db_user.username}.")
 
 
@@ -697,11 +725,12 @@ async def chips_take(
             uid = int(discord_id.strip())
         except ValueError:
             return _redirect("/admin/chips", error="Invalid+Discord+ID.")
-        db_user = await db.get(User, uid)
+        db_user = (await db.execute(select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == uid))).scalar_one_or_none()
         if not db_user:
             return _redirect("/admin/chips", error="User+not+found.")
         db_user.chips = max(0, db_user.chips - amount)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Chips taken", {"user": db_user.username, "amount": f"{amount:,}"}))
     return _redirect("/admin/chips", msg=f"Took+{amount:,}+chips+from+{db_user.username}.")
 
 
@@ -715,11 +744,12 @@ async def chips_give_all(
     if amount > _MAX_GIVE_ALL:
         return _redirect("/admin/chips", error=f"Amount+exceeds+the+{_MAX_GIVE_ALL:,}+chip+per-grant+cap.")
     async with get_db() as db:
-        users = (await db.execute(select(User))).scalars().all()
+        users = (await db.execute(select(User).where(User.guild_id == _GUILD_ID()))).scalars().all()
         for u in users:
             u.chips += amount
         await db.commit()
         count = len(users)
+    asyncio.create_task(post_admin_action(user, "Chips given to all", {"amount": f"{amount:,}", "players": str(count)}))
     return _redirect("/admin/chips", msg=f"Gave+{amount:,}+chips+to+{count}+players.")
 
 
@@ -736,11 +766,12 @@ async def chips_set(
             uid = int(discord_id.strip())
         except ValueError:
             return _redirect("/admin/chips", error="Invalid+Discord+ID.")
-        db_user = await db.get(User, uid)
+        db_user = (await db.execute(select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == uid))).scalar_one_or_none()
         if not db_user:
             return _redirect("/admin/chips", error="User+not+found.")
         db_user.chips = amount
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Chips set", {"user": db_user.username, "amount": f"{amount:,}"}))
     return _redirect("/admin/chips", msg=f"Set+{db_user.username}+balance+to+{amount:,}.")
 
 
@@ -789,6 +820,7 @@ async def settings_save(
             import json
             await upsert("capitol_announcement", json.dumps(capitol_announcement))
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Settings saved", {"theme": active_theme, "cashout": "on" if cashout_allowed == "on" else "off"}))
     return _redirect("/admin/settings", msg="Settings+saved.")
 
 
@@ -845,6 +877,7 @@ async def parlay_template_create(
         )
         db.add(tpl)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Parlay template created", {"name": name.strip()}))
     return _redirect("/admin/parlays", msg="Template+created.")
 
 
@@ -861,6 +894,7 @@ async def parlay_template_add_leg(
         leg = ParlayTemplateLeg(template_id=tpl_id, market_id=market_id, sort_order=0)
         db.add(leg)
         await db.commit()
+    asyncio.create_task(post_admin_action(user, "Parlay template leg added", {"template": tpl.name, "market_id": str(market_id)}))
     return _redirect("/admin/parlays", msg="Leg+added.")
 
 
@@ -871,6 +905,7 @@ async def parlay_template_toggle(tpl_id: int, user: SessionUser = Depends(requir
         if tpl:
             tpl.active = not tpl.active
             await db.commit()
+    asyncio.create_task(post_admin_action(user, "Parlay template toggled", {"template": tpl.name if tpl else str(tpl_id), "active": str(tpl.active) if tpl else "unknown"}))
     return _redirect("/admin/parlays")
 
 
@@ -881,4 +916,5 @@ async def parlay_template_delete(tpl_id: int, user: SessionUser = Depends(requir
         if tpl:
             await db.delete(tpl)
             await db.commit()
+    asyncio.create_task(post_admin_action(user, "Parlay template deleted", {"template": tpl.name if tpl else str(tpl_id)}))
     return _redirect("/admin/parlays", msg="Template+deleted.")

@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, ForeignKey,
-    Integer, String, func
+    Integer, PrimaryKeyConstraint, String, func
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -109,24 +109,23 @@ class Market(Base):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (PrimaryKeyConstraint("guild_id", "discord_id"),)
 
-    discord_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     username: Mapped[str] = mapped_column(String(100), nullable=False)
     chips: Mapped[int] = mapped_column(Integer, default=1000, nullable=False)
     total_wagered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_won: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    bets: Mapped[list["Bet"]] = relationship("Bet", back_populates="user")
-    parlays: Mapped[list["Parlay"]] = relationship("Parlay", back_populates="user")
-    pending_legs: Mapped[list["PendingParlayLeg"]] = relationship("PendingParlayLeg", back_populates="user")
-
 
 class Parlay(Base):
     __tablename__ = "parlays"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.discord_id"), nullable=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     total_wager: Mapped[int] = mapped_column(Integer, nullable=False)
     total_payout: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(10), default="PENDING", nullable=False)
@@ -136,7 +135,6 @@ class Parlay(Base):
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    user: Mapped["User"] = relationship("User", back_populates="parlays")
     legs: Mapped[list["Bet"]] = relationship("Bet", back_populates="parlay")
 
 
@@ -144,7 +142,8 @@ class Bet(Base):
     __tablename__ = "bets"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.discord_id"), nullable=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     parlay_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("parlays.id"), nullable=True)
     market_id: Mapped[int] = mapped_column(Integer, ForeignKey("markets.id"), nullable=False)
     wager: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -154,7 +153,6 @@ class Bet(Base):
     cashout_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    user: Mapped["User"] = relationship("User", back_populates="bets")
     parlay: Mapped["Parlay | None"] = relationship("Parlay", back_populates="legs")
     market: Mapped["Market"] = relationship("Market", back_populates="bets")
 
@@ -163,11 +161,11 @@ class PendingParlayLeg(Base):
     __tablename__ = "pending_parlay_legs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.discord_id"), nullable=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     market_id: Mapped[int] = mapped_column(Integer, ForeignKey("markets.id"), nullable=False)
     added_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    user: Mapped["User"] = relationship("User", back_populates="pending_legs")
     market: Mapped["Market"] = relationship("Market")
 
 
@@ -306,6 +304,7 @@ class BettingRestriction(Base):
     __tablename__ = "betting_restrictions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     restriction_type: Mapped[str] = mapped_column(String(10), nullable=False)
     district: Mapped[int | None] = mapped_column(Integer, nullable=True)

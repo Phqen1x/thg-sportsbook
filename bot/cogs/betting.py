@@ -531,12 +531,15 @@ def _parlay_conflict(existing_markets: list[Market], new_mkt: Market) -> str | N
     )
 
 
-async def _get_or_create_user(session, member: discord.Member) -> User:
-    u = await session.get(User, member.id)
+async def _get_or_create_user(session, member: discord.Member, guild_id: int) -> User:
+    result = await session.execute(
+        select(User).where(User.guild_id == guild_id, User.discord_id == member.id)
+    )
+    u = result.scalar_one_or_none()
     if u is None:
         default_raw = await get_setting("default_chips")
         default = json.loads(default_raw) if default_raw else 1000
-        u = User(discord_id=member.id, username=member.display_name, chips=default)
+        u = User(guild_id=guild_id, discord_id=member.id, username=member.display_name, chips=default)
         session.add(u)
         await session.flush()
     else:
@@ -566,13 +569,17 @@ async def parlay_market_autocomplete(
     parlay slip. Markets already on the slip — or that would conflict with a leg
     already there (e.g. the opposing side of a bet already taken) — are hidden."""
     uid = interaction.user.id
+    gid = interaction.guild_id or 0
     async with get_session() as session:
         result = await session.execute(
             select(Market).where(Market.status == "OPEN").order_by(Market.id)
         )
         markets = list(result.scalars().all())
         legs_result = await session.execute(
-            select(PendingParlayLeg).where(PendingParlayLeg.user_id == uid)
+            select(PendingParlayLeg).where(
+                PendingParlayLeg.guild_id == gid,
+                PendingParlayLeg.user_id == uid,
+            )
         )
         leg_market_ids = {leg.market_id for leg in legs_result.scalars().all()}
         existing_mkts = []
@@ -600,9 +607,13 @@ async def user_bet_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     uid = interaction.user.id
+    gid = interaction.guild_id or 0
     async with get_session() as session:
         result = await session.execute(
-            select(Bet).where(Bet.user_id == uid, Bet.status == "PENDING", Bet.parlay_id == None)
+            select(Bet).where(
+                Bet.guild_id == gid, Bet.user_id == uid,
+                Bet.status == "PENDING", Bet.parlay_id == None,
+            )
         )
         bets = result.scalars().all()
     choices = []
@@ -636,12 +647,16 @@ async def cashout_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     uid = interaction.user.id
+    gid = interaction.guild_id or 0
     cashout_type = getattr(interaction.namespace, "cashout_type", "BET")
 
     if cashout_type == "PARLAY":
         async with get_session() as session:
             result = await session.execute(
-                select(Parlay).where(Parlay.user_id == uid, Parlay.status == "PENDING")
+                select(Parlay).where(
+                    Parlay.guild_id == gid, Parlay.user_id == uid,
+                    Parlay.status == "PENDING",
+                )
             )
             parlays = result.scalars().all()
         choices = []
@@ -655,7 +670,10 @@ async def cashout_autocomplete(
         result = await session.execute(
             select(Bet, Market)
             .join(Market, Bet.market_id == Market.id)
-            .where(Bet.user_id == uid, Bet.status == "PENDING", Bet.parlay_id == None)
+            .where(
+                Bet.guild_id == gid, Bet.user_id == uid,
+                Bet.status == "PENDING", Bet.parlay_id == None,
+            )
         )
         rows = result.all()
     choices = []
@@ -665,10 +683,13 @@ async def cashout_autocomplete(
     return choices[:25]
 
 
-async def _get_restriction_msg(session, user_id: int, mkt: Market) -> str | None:
+async def _get_restriction_msg(session, user_id: int, mkt: Market, guild_id: int = 0) -> str | None:
     """Return an error string if the user is restricted from betting on this market."""
     result = await session.execute(
-        select(BettingRestriction).where(BettingRestriction.discord_user_id == user_id)
+        select(BettingRestriction).where(
+            BettingRestriction.guild_id == guild_id,
+            BettingRestriction.discord_user_id == user_id,
+        )
     )
     restrictions = result.scalars().all()
     if not restrictions:
@@ -715,7 +736,7 @@ async def _get_restriction_msg(session, user_id: int, mkt: Market) -> str | None
 # odds from when the template/parlay was first built.
 
 
-async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
+async def _gather_tailable(session, guild_id: int) -> tuple[list[dict], list[dict]]:
     """Return ``(featured, member)`` lists of tailable-parlay entries.
 
     Each entry is a dict with ``key``, ``name``, ``sub``, ``tag``,
@@ -763,7 +784,11 @@ async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
 
     p_result = await session.execute(
         select(Parlay)
-        .where(Parlay.status == "PENDING", Parlay.is_public == True)  # noqa: E712
+        .where(
+            Parlay.guild_id == guild_id,
+            Parlay.status == "PENDING",
+            Parlay.is_public == True,  # noqa: E712
+        )
         .order_by(Parlay.placed_at.desc())
     )
     for parlay in p_result.scalars().all():
@@ -778,7 +803,10 @@ async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
             mkts.append(m)
         if not ok or len(mkts) < 2:
             continue
-        owner = await session.get(User, parlay.user_id)
+        owner_result = await session.execute(
+            select(User).where(User.guild_id == guild_id, User.discord_id == parlay.user_id)
+        )
+        owner = owner_result.scalar_one_or_none()
         member.append({
             "key": f"P{parlay.id}",
             "name": f"{owner.username if owner else 'Member'}'s Parlay #{parlay.id}",
@@ -794,7 +822,7 @@ async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
     return featured, member
 
 
-async def _validate_tail_markets(session, user_id: int, market_ids: list[int]) -> tuple[str | None, list[Market]]:
+async def _validate_tail_markets(session, user_id: int, market_ids: list[int], guild_id: int = 0) -> tuple[str | None, list[Market]]:
     """Load and validate the legs of a parlay the user is about to tail."""
     markets: list[Market] = []
     for mid in market_ids:
@@ -808,7 +836,7 @@ async def _validate_tail_markets(session, user_id: int, market_ids: list[int]) -
         conflict = _parlay_conflict(markets[:i], mkt)
         if conflict:
             return conflict, []
-        restriction = await _get_restriction_msg(session, user_id, mkt)
+        restriction = await _get_restriction_msg(session, user_id, mkt, guild_id)
         if restriction:
             return restriction, []
     return None, markets
@@ -816,16 +844,21 @@ async def _validate_tail_markets(session, user_id: int, market_ids: list[int]) -
 
 async def _tail_load_slip(session, user: User, market_ids: list[int]) -> tuple[str | None, int]:
     """Replace the user's pending slip with the tailed parlay's legs."""
-    err, markets = await _validate_tail_markets(session, user.discord_id, market_ids)
+    err, markets = await _validate_tail_markets(session, user.discord_id, market_ids, user.guild_id)
     if err:
         return err, 0
     existing = await session.execute(
-        select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+        select(PendingParlayLeg).where(
+            PendingParlayLeg.guild_id == user.guild_id,
+            PendingParlayLeg.user_id == user.discord_id,
+        )
     )
     for leg in existing.scalars().all():
         await session.delete(leg)
     for mkt in markets:
-        session.add(PendingParlayLeg(user_id=user.discord_id, market_id=mkt.id))
+        session.add(PendingParlayLeg(
+            guild_id=user.guild_id, user_id=user.discord_id, market_id=mkt.id,
+        ))
     return None, len(markets)
 
 
@@ -833,7 +866,7 @@ async def _tail_submit(session, user: User, market_ids: list[int], wager: int) -
     """Build and commit a parlay from ``market_ids`` at current odds."""
     if user.chips < wager:
         return f"Insufficient chips. You have **{fmt_chips(user.chips)}**.", None
-    err, markets = await _validate_tail_markets(session, user.discord_id, market_ids)
+    err, markets = await _validate_tail_markets(session, user.discord_id, market_ids, user.guild_id)
     if err:
         return err, None
 
@@ -851,6 +884,7 @@ async def _tail_submit(session, user: User, market_ids: list[int], wager: int) -
 
     # Tailed copies are private by default so the board isn't flooded with clones.
     parlay = Parlay(
+        guild_id=user.guild_id,
         user_id=user.discord_id,
         total_wager=wager,
         total_payout=total_payout,
@@ -862,6 +896,7 @@ async def _tail_submit(session, user: User, market_ids: list[int], wager: int) -
     leg_data: list[ParlayLegData] = []
     for i, mkt in enumerate(markets, 1):
         session.add(Bet(
+            guild_id=user.guild_id,
             user_id=user.discord_id,
             parlay_id=parlay.id,
             market_id=mkt.id,
@@ -909,7 +944,7 @@ class TailWagerModal(discord.ui.Modal, title="Tail this parlay"):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             err, res = await _tail_submit(session, user, self.entry["market_ids"], wager)
             if err:
                 await interaction.followup.send(err, ephemeral=True)
@@ -999,7 +1034,7 @@ class TailView(discord.ui.View):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             err, n = await _tail_load_slip(session, user, entry["market_ids"])
         if err:
             await interaction.followup.send(err, ephemeral=True)
@@ -1076,12 +1111,12 @@ class BettingCog(commands.Cog):
                 await interaction.followup.send("That market is not open for betting.", ephemeral=True)
                 return
 
-            restriction = await _get_restriction_msg(session, interaction.user.id, mkt)
+            restriction = await _get_restriction_msg(session, interaction.user.id, mkt, interaction.guild_id or 0)
             if restriction:
                 await interaction.followup.send(restriction, ephemeral=True)
                 return
 
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             if user.chips < amount:
                 await interaction.followup.send(
                     f"Insufficient chips. You have **{fmt_chips(user.chips)}** but need **{fmt_chips(amount)}**.",
@@ -1094,6 +1129,7 @@ class BettingCog(commands.Cog):
             user.total_wagered += amount
 
             b = Bet(
+                guild_id=user.guild_id,
                 user_id=user.discord_id,
                 market_id=mkt.id,
                 wager=amount,
@@ -1140,15 +1176,16 @@ class BettingCog(commands.Cog):
                 await interaction.followup.send("That market is not open.", ephemeral=True)
                 return
 
-            restriction = await _get_restriction_msg(session, interaction.user.id, mkt)
+            restriction = await _get_restriction_msg(session, interaction.user.id, mkt, interaction.guild_id or 0)
             if restriction:
                 await interaction.followup.send(restriction, ephemeral=True)
                 return
 
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
 
             dup = await session.execute(
                 select(PendingParlayLeg).where(
+                    PendingParlayLeg.guild_id == user.guild_id,
                     PendingParlayLeg.user_id == user.discord_id,
                     PendingParlayLeg.market_id == mkt.id,
                 )
@@ -1158,7 +1195,10 @@ class BettingCog(commands.Cog):
                 return
 
             existing_legs_result = await session.execute(
-                select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+                select(PendingParlayLeg).where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
             )
             existing_legs = existing_legs_result.scalars().all()
             if len(existing_legs) >= MAX_PARLAY_LEGS:
@@ -1178,7 +1218,9 @@ class BettingCog(commands.Cog):
                 await interaction.followup.send(conflict, ephemeral=True)
                 return
 
-            session.add(PendingParlayLeg(user_id=user.discord_id, market_id=mkt.id))
+            session.add(PendingParlayLeg(
+                guild_id=user.guild_id, user_id=user.discord_id, market_id=mkt.id,
+            ))
             mkt_label = mkt.label
             mkt_odds = mkt.odds
 
@@ -1194,10 +1236,13 @@ class BettingCog(commands.Cog):
             return
 
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             legs_result = await session.execute(
                 select(PendingParlayLeg)
-                .where(PendingParlayLeg.user_id == user.discord_id)
+                .where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
                 .order_by(PendingParlayLeg.added_at)
             )
             legs = legs_result.scalars().all()
@@ -1251,7 +1296,7 @@ class BettingCog(commands.Cog):
             return
 
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             if user.chips < wager:
                 await interaction.followup.send(
                     f"Insufficient chips. You have **{fmt_chips(user.chips)}**.", ephemeral=True
@@ -1260,7 +1305,10 @@ class BettingCog(commands.Cog):
 
             legs_result = await session.execute(
                 select(PendingParlayLeg)
-                .where(PendingParlayLeg.user_id == user.discord_id)
+                .where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
                 .order_by(PendingParlayLeg.added_at)
             )
             legs = legs_result.scalars().all()
@@ -1302,6 +1350,7 @@ class BettingCog(commands.Cog):
             user.total_wagered += wager
 
             parlay = Parlay(
+                guild_id=user.guild_id,
                 user_id=user.discord_id,
                 total_wager=wager,
                 total_payout=total_payout,
@@ -1313,6 +1362,7 @@ class BettingCog(commands.Cog):
             leg_data: list[ParlayLegData] = []
             for i, (leg, mkt) in enumerate(zip(legs, markets), 1):
                 b = Bet(
+                    guild_id=user.guild_id,
                     user_id=user.discord_id,
                     parlay_id=parlay.id,
                     market_id=mkt.id,
@@ -1350,10 +1400,13 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             legs_result = await session.execute(
                 select(PendingParlayLeg)
-                .where(PendingParlayLeg.user_id == user.discord_id)
+                .where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
                 .order_by(PendingParlayLeg.added_at)
             )
             legs = legs_result.scalars().all()
@@ -1378,9 +1431,12 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
             legs_result = await session.execute(
-                select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+                select(PendingParlayLeg).where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
             )
             for leg in legs_result.scalars().all():
                 await session.delete(leg)
@@ -1395,7 +1451,7 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            featured, member = await _gather_tailable(session)
+            featured, member = await _gather_tailable(session, interaction.guild_id or 0)
 
         if not featured and not member:
             await interaction.followup.send(
@@ -1449,11 +1505,11 @@ class BettingCog(commands.Cog):
         global_rate = json.loads(global_rate_raw) if global_rate_raw else 0.65
 
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
 
             if cashout_type.value == "BET":
                 b = await session.get(Bet, cid)
-                if not b or b.user_id != user.discord_id:
+                if not b or b.user_id != user.discord_id or b.guild_id != user.guild_id:
                     await interaction.followup.send("Bet not found.", ephemeral=True)
                     return
                 if b.status != "PENDING" or b.parlay_id is not None:
@@ -1478,7 +1534,7 @@ class BettingCog(commands.Cog):
 
             else:  # PARLAY
                 p = await session.get(Parlay, cid)
-                if not p or p.user_id != user.discord_id:
+                if not p or p.user_id != user.discord_id or p.guild_id != user.guild_id:
                     await interaction.followup.send("Parlay not found.", ephemeral=True)
                     return
                 if p.status != "PENDING":
@@ -1559,7 +1615,7 @@ class BettingCog(commands.Cog):
 
         member = interaction.user
         async with get_session() as session:
-            user = await _get_or_create_user(session, member)
+            user = await _get_or_create_user(session, member, interaction.guild_id or 0)
             if user.chips < amount:
                 await interaction.followup.send(
                     f"Insufficient chips. You have **{fmt_chips(user.chips)}** but "
@@ -1649,10 +1705,14 @@ class BettingCog(commands.Cog):
         filter_val = filter_by.value if filter_by else "ALL"
 
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
 
-            straight_q = select(Bet).where(Bet.user_id == user.discord_id, Bet.parlay_id == None)
-            parlay_q = select(Parlay).where(Parlay.user_id == user.discord_id)
+            straight_q = select(Bet).where(
+                Bet.guild_id == user.guild_id, Bet.user_id == user.discord_id, Bet.parlay_id == None,
+            )
+            parlay_q = select(Parlay).where(
+                Parlay.guild_id == user.guild_id, Parlay.user_id == user.discord_id,
+            )
             if filter_val != "ALL":
                 straight_q = straight_q.where(Bet.status == filter_val)
                 parlay_q = parlay_q.where(Parlay.status == filter_val)

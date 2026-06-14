@@ -1,8 +1,11 @@
+import contextvars
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -12,22 +15,40 @@ from sqlalchemy import select, func, text
 from bot import config
 from bot.database.models import Base, BettingPhase, DistrictRecord, GameSetting, MarketTemplate
 
-engine = create_async_engine(
-    f"sqlite+aiosqlite:///{config.DB_PATH}",
-    echo=False,
-)
+_guild_id_ctx: contextvars.ContextVar[int] = contextvars.ContextVar("guild_id", default=0)
 
-AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autoflush=False,
-)
+_engines: dict[int, AsyncEngine] = {}
+_factories: dict[int, async_sessionmaker[AsyncSession]] = {}
+
+
+def _db_path_for_guild(guild_id: int) -> Path:
+    return Path(config.DB_PATH).parent / f"sportsbook_{guild_id}.db"
+
+
+def _ensure_engine(guild_id: int) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
+    if guild_id not in _engines:
+        db_path = _db_path_for_guild(guild_id)
+        eng = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
+        factory = async_sessionmaker(
+            eng,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autoflush=False,
+        )
+        _engines[guild_id] = eng
+        _factories[guild_id] = factory
+    return _engines[guild_id], _factories[guild_id]
+
+
+def set_guild_context(guild_id: int) -> None:
+    """Set the guild_id for the current async task context."""
+    _guild_id_ctx.set(guild_id)
 
 
 @asynccontextmanager
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
+    _, factory = _ensure_engine(_guild_id_ctx.get())
+    async with factory() as session:
         async with session.begin():
             yield session
 
@@ -35,19 +56,26 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 @asynccontextmanager
 async def get_read_session() -> AsyncGenerator[AsyncSession, None]:
     """Lightweight session for read-only queries — no explicit transaction begin/commit."""
-    async with AsyncSessionLocal() as session:
+    _, factory = _ensure_engine(_guild_id_ctx.get())
+    async with factory() as session:
         yield session
 
 
-async def init_db() -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    await _migrate_schema()
-    await _seed_defaults()
+async def init_db(guild_id: int = 0) -> None:
+    token = _guild_id_ctx.set(guild_id)
+    try:
+        eng, _ = _ensure_engine(guild_id)
+        async with eng.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await _migrate_schema()
+        await _seed_defaults()
+    finally:
+        _guild_id_ctx.reset(token)
 
 
 async def _migrate_schema() -> None:
-    async with engine.begin() as conn:
+    eng, _ = _ensure_engine(_guild_id_ctx.get())
+    async with eng.begin() as conn:
         rows = await conn.execute(text("PRAGMA table_info(market_templates)"))
         existing = {row[1] for row in rows.fetchall()}
         if "type_key" not in existing:
@@ -132,7 +160,7 @@ async def _migrate_schema() -> None:
         if kb_marker.fetchone() is None:
             await conn.execute(text("UPDATE tributes SET kill_boost = 0.0"))
             await conn.execute(text(
-                "INSERT INTO game_settings (key, value) "
+                "INSERT OR IGNORE INTO game_settings (key, value) "
                 "VALUES ('kill_boost_format', '\"v2\"')"
             ))
         if "debilitation_level" not in trib_cols:
@@ -321,6 +349,124 @@ async def _migrate_schema() -> None:
             await conn.execute(text(
                 "ALTER TABLE parlays ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT 1"
             ))
+
+        # ── Multi-server isolation: add guild_id to all user-scoped tables ────────
+        # When migrating a guild-specific DB (created by copying sportsbook.db),
+        # stamp all existing rows with the real guild_id so they remain visible
+        # to guild-scoped queries.  The legacy/fallback DB (guild_id=0) keeps 0.
+        _gid = _guild_id_ctx.get()
+
+        # users: recreate with composite PK (guild_id, discord_id).
+        rows = await conn.execute(text("PRAGMA table_info(users)"))
+        user_cols = {row[1] for row in rows.fetchall()}
+        if "guild_id" not in user_cols:
+            await conn.execute(text("PRAGMA foreign_keys = OFF"))
+            await conn.execute(text("DROP TABLE IF EXISTS users_new"))
+            await conn.execute(text("""
+                CREATE TABLE users_new (
+                    guild_id BIGINT NOT NULL DEFAULT 0,
+                    discord_id BIGINT NOT NULL,
+                    username VARCHAR(100) NOT NULL,
+                    chips INTEGER NOT NULL DEFAULT 1000,
+                    total_wagered INTEGER NOT NULL DEFAULT 0,
+                    total_won INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, discord_id)
+                )
+            """))
+            await conn.execute(
+                text("""
+                    INSERT INTO users_new
+                    SELECT :gid, discord_id, username, chips,
+                           IFNULL(total_wagered, 0), IFNULL(total_won, 0),
+                           IFNULL(created_at, CURRENT_TIMESTAMP)
+                    FROM users
+                """),
+                {"gid": _gid},
+            )
+            await conn.execute(text("DROP TABLE users"))
+            await conn.execute(text("ALTER TABLE users_new RENAME TO users"))
+            await conn.execute(text("PRAGMA foreign_keys = ON"))
+
+        # bets / parlays / pending_parlay_legs / betting_restrictions: add guild_id
+        rows = await conn.execute(text("PRAGMA table_info(bets)"))
+        if "guild_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE bets ADD COLUMN guild_id BIGINT NOT NULL DEFAULT 0"
+            ))
+            if _gid:
+                await conn.execute(
+                    text("UPDATE bets SET guild_id = :gid WHERE guild_id = 0"),
+                    {"gid": _gid},
+                )
+
+        rows = await conn.execute(text("PRAGMA table_info(parlays)"))
+        if "guild_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN guild_id BIGINT NOT NULL DEFAULT 0"
+            ))
+            if _gid:
+                await conn.execute(
+                    text("UPDATE parlays SET guild_id = :gid WHERE guild_id = 0"),
+                    {"gid": _gid},
+                )
+
+        rows = await conn.execute(text("PRAGMA table_info(pending_parlay_legs)"))
+        if "guild_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE pending_parlay_legs ADD COLUMN guild_id BIGINT NOT NULL DEFAULT 0"
+            ))
+            if _gid:
+                await conn.execute(
+                    text("UPDATE pending_parlay_legs SET guild_id = :gid WHERE guild_id = 0"),
+                    {"gid": _gid},
+                )
+
+        rows = await conn.execute(text("PRAGMA table_info(betting_restrictions)"))
+        if "guild_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE betting_restrictions ADD COLUMN guild_id BIGINT NOT NULL DEFAULT 0"
+            ))
+            if _gid:
+                await conn.execute(
+                    text("UPDATE betting_restrictions SET guild_id = :gid WHERE guild_id = 0"),
+                    {"gid": _gid},
+                )
+
+        # Rename game_settings key: active_phase_id → current_phase_id (key renamed in lemonade)
+        old_phase_row = (await conn.execute(
+            text("SELECT value FROM game_settings WHERE key='active_phase_id'")
+        )).fetchone()
+        if old_phase_row:
+            await conn.execute(text(
+                "INSERT OR REPLACE INTO game_settings (key, value) VALUES ('current_phase_id', :v)"
+            ), {"v": old_phase_row[0]})
+            await conn.execute(text("DELETE FROM game_settings WHERE key='active_phase_id'"))
+
+        # Backfill any guild_id=0 rows left by an earlier migration run (e.g. if
+        # the bot was updated after the guild DB was first created with old code).
+        if _gid:
+            # users has a composite PK (guild_id, discord_id) so promote only rows
+            # that have no existing guild-specific counterpart, then drop duplicates.
+            await conn.execute(
+                text("""
+                    UPDATE users SET guild_id = :gid
+                    WHERE guild_id = 0
+                    AND discord_id NOT IN (
+                        SELECT discord_id FROM users WHERE guild_id = :gid
+                    )
+                """),
+                {"gid": _gid},
+            )
+            await conn.execute(
+                text("DELETE FROM users WHERE guild_id = 0"),
+            )
+            # Simple tables: just reassign the 0 rows.
+            for _table in ("bets", "parlays", "pending_parlay_legs", "betting_restrictions"):
+                await conn.execute(
+                    text(f"UPDATE {_table} SET guild_id = :gid WHERE guild_id = 0"),  # noqa: S608
+                    {"gid": _gid},
+                )
 
 
 _BUILTIN_MARKET_TYPES = [
