@@ -705,12 +705,15 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
             act_district_records = {dr.district: dr for dr in dr_rows}
 
         for entry in out:
-            name, desc = _parlay_flavor(
-                tpl_leg_markets[entry["id"]], act_tributes_map, act_alliance_names,
-                act_district_records, entry["name"], entry["description"],
-            )
-            entry["name"] = name
-            entry["description"] = desc
+            if entry["source"] == "AI" and entry["description"]:
+                pass  # preserve the AI-generated name and description as-is
+            else:
+                name, desc = _parlay_flavor(
+                    tpl_leg_markets[entry["id"]], act_tributes_map, act_alliance_names,
+                    act_district_records, entry["name"], entry["description"],
+                )
+                entry["name"] = name
+                entry["description"] = desc
 
     return {"chips": db_user.chips, "templates": out}
 

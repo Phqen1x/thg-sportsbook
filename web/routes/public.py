@@ -129,7 +129,7 @@ def _parlay_flavor(
         wins_clause = f" {dr.wins} all-time {'victory' if dr.wins == 1 else 'victories'} and" if dr and dr.wins else ""
         return (
             f"District {d} Double Down",
-            f"District {d} has{wins_clause} something to prove. Back both tributes and let the district carry you.",
+            f"District {d} has{wins_clause} something to prove. Every leg in this parlay rides on District {d} — trust the district.",
         )
 
     if len(killers) == len(tributes) and killers:

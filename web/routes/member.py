@@ -546,12 +546,15 @@ async def tail_board(
 
         tpl_flavor: dict[int, dict] = {}
         for tpl in templates_raw:
-            leg_mkts = [tpl_markets[leg.market_id] for leg in tpl_legs.get(tpl.id, []) if leg.market_id in tpl_markets]
-            name, desc = _parlay_flavor(
-                leg_mkts, tail_tributes_map, tail_alliance_names,
-                tail_district_records, tpl.name, tpl.description,
-            )
-            tpl_flavor[tpl.id] = {"name": name, "description": desc}
+            if tpl.source == "AI" and tpl.description:
+                tpl_flavor[tpl.id] = {"name": tpl.name, "description": tpl.description}
+            else:
+                leg_mkts = [tpl_markets[leg.market_id] for leg in tpl_legs.get(tpl.id, []) if leg.market_id in tpl_markets]
+                name, desc = _parlay_flavor(
+                    leg_mkts, tail_tributes_map, tail_alliance_names,
+                    tail_district_records, tpl.name, tpl.description,
+                )
+                tpl_flavor[tpl.id] = {"name": name, "description": desc}
 
         # Combined odds per template, for live payout preview
         tpl_combined: dict[int, int] = {}

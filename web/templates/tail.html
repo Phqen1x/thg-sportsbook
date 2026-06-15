@@ -46,13 +46,21 @@
       </tbody>
     </table>
 
+    {% set combo = tpl_combined.get(tpl.id) %}
+    {% if combo is not none %}
+    <div class="tail-combined-row">
+      <span class="text-dim">Combined odds</span>
+      <span class="{% if combo >= 0 %}text-pos{% else %}text-neg{% endif %} font-bold">{{ combo | fmt_odds }}</span>
+    </div>
+    {% endif %}
+
     {% if user and db_user %}
     <form method="post" action="/tail/{{ tpl.id }}" class="tail-form mt-1">
       <div class="form-group">
         <label class="form-label">Wager (chips)</label>
         <div class="input-row">
           <input type="number" name="wager" class="form-control tail-wager" min="1" max="{{ db_user.chips }}" value="100" required
-                 data-odds="{{ tpl_combined.get(tpl.id) if tpl_combined.get(tpl.id) is not none else 0 }}" oninput="updateTailPayout(this)">
+                 data-odds="{{ combo if combo is not none else 0 }}" oninput="updateTailPayout(this)">
           <button type="submit" class="btn btn-primary">Tail</button>
         </div>
         <div class="payout-preview">

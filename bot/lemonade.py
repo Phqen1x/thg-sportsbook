@@ -400,7 +400,7 @@ async def generate_ai_parlays(
         if tier not in {"SAFE", "BALANCED", "LONGSHOT"}:
             tier = "BALANCED"
         mids = [int(mid) for mid in item.get("market_ids", []) if int(mid) in valid_ids]
-        if len(mids) < 2:
+        if len(mids) < 3:
             log.warning("Lemonade parlay '%s' has too few valid legs (%d); skipping", item.get("name"), len(mids))
             continue
         results.append({
