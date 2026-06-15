@@ -190,29 +190,33 @@ American odds (legs multiply together, so combined odds grow fast):
 Choose legs so each parlay's combined odds land in its tier's range.
 
 STRICT THEME RULE — follow these steps for EVERY parlay, in order:
-  1. Choose a single subject: one district, one tribute, or one named alliance.
-     IMPORTANT: treat D#M and D#F as the same district as D# — e.g. D6, D6M,
-     and D6F all refer to District 6. If any parlay in this batch already uses
-     District 6 (in any form), you MUST choose a different district for this
-     parlay. Each parlay in the batch must focus on a DISTINCT district or
-     tribute; no two parlays may share the same district number.
-  2. Scan the OPEN MARKETS list and collect ONLY the market IDs whose label
-     explicitly mentions that district, tribute, or alliance. Do NOT include
-     markets about any other district or tribute, even indirectly.
-  3. From those filtered IDs, pick 3–6 legs that hit your target tier.
-  4. For EACH chosen leg, write out in plain English who you are betting FOR and
+  1. Before choosing any subject, scan the OPEN MARKETS list and tally how many
+     market IDs exist for each district/tribute. Only consider subjects that
+     have AT LEAST 3 matching market IDs. If a district or tribute has fewer
+     than 3 open markets, skip it — you cannot build a valid parlay from it.
+  2. From the eligible subjects (3+ markets), choose one: one district, one
+     tribute, or one named alliance. IMPORTANT: treat D#M and D#F as the same
+     district as D# — e.g. D6, D6M, and D6F all refer to District 6. If any
+     parlay in this batch already uses District 6 (in any form), you MUST
+     choose a different district. Each parlay must focus on a DISTINCT district
+     or tribute; no two parlays may share the same district number.
+  3. Collect ONLY the market IDs whose label explicitly mentions that district,
+     tribute, or alliance. Do NOT include markets about any other district or
+     tribute, even indirectly.
+  4. From those filtered IDs, pick 3–6 legs that hit your target tier.
+  5. For EACH chosen leg, write out in plain English who you are betting FOR and
      who (if anyone) you are betting AGAINST. Example: "D4F places higher than
      D4M" means you are FOR D4F and AGAINST D4M — you are NOT backing both D4
      tributes. A leg like "D4F top-8 finish" means you are FOR D4F only.
-  5. Write the name and description using ONLY the directions you identified in
-     step 4. The description must not claim you are "backing" a tribute or
+  6. Write the name and description using ONLY the directions you identified in
+     step 5. The description must not claim you are "backing" a tribute or
      district unless every leg in the parlay actually bets in their favour.
      If the legs pit two tributes against each other, say so explicitly —
      e.g. "ride D4F over her district partner". Never say "back both tributes"
      if any leg has one tribute beating the other.
-  6. Before finalising: re-read each market_id label and confirm it matches
+  7. Before finalising: re-read each market_id label and confirm it matches
      the subject in your name/description. Remove any leg that does not match.
-  7. Confirm no other parlay in the batch uses the same district number. If
+  8. Confirm no other parlay in the batch uses the same district number. If
      there is a conflict, change this parlay's subject to a different district.
 A parlay that mixes subjects, duplicates a district, or has a description that
 contradicts the direction of its legs is invalid — reject it and start over.
