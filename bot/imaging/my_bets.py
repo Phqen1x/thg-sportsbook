@@ -349,7 +349,7 @@ def render_tail_board(
 
         pf = rajdhani_bold(14)
         draw.text((PAD + 10, y_leg + 10), f"100 CHIPS", font=pf, fill=c["text_white"])
-        combo_str = f"ODDS: {fmt_odds_with_mult(p.combined_odds)}"
+        combo_str = f"TOTAL ODDS: {fmt_odds_with_mult(p.combined_odds)}"
         oc = odds_color(p.combined_odds, c)
         draw_text_centered(draw, combo_str, pf, oc, WIDTH // 2, y_leg + 10)
         draw_text_right(draw, f"PAYS {fmt_chips(p.total_payout)}", pf, c["header_gold"], WIDTH - PAD - 10, y_leg + 10)
@@ -444,7 +444,7 @@ def render_tail_detail(
     
     pf = rajdhani_bold(16)
     draw.text((PAD + 14, cur_y + 14), "100 CHIPS", font=pf, fill=c["text_white"])
-    combo_str = f"ODDS: {fmt_odds_with_mult(combined)}"
+    combo_str = f"TOTAL ODDS: {fmt_odds_with_mult(combined)}"
     oc = odds_color(combined, c)
     draw_text_centered(draw, combo_str, pf, oc, WIDTH // 2, cur_y + 14)
     draw_text_right(draw, f"PAYS {fmt_chips(payout)}", pf, c["header_gold"], WIDTH - PAD - 14, cur_y + 14)

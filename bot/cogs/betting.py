@@ -643,6 +643,29 @@ async def user_parlay_autocomplete(
     return choices[:25]
 
 
+async def user_public_parlay_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    uid = interaction.user.id
+    gid = current_guild_id()
+    async with get_session() as session:
+        result = await session.execute(
+            select(Parlay).where(
+                Parlay.guild_id == gid,
+                Parlay.user_id == uid,
+                Parlay.status == "PENDING",
+                Parlay.is_public == True,  # noqa: E712
+            ).order_by(Parlay.placed_at.desc())
+        )
+        parlays = result.scalars().all()
+    choices = []
+    for p in parlays:
+        label = f"Parlay #{p.id} — {fmt_chips(p.total_wager)} wager"
+        if not current or current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=str(p.id)))
+    return choices[:25]
+
+
 async def cashout_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
@@ -1041,7 +1064,8 @@ class TailView(discord.ui.View):
             return
         await interaction.followup.send(
             f"Loaded **{n}** legs from **{entry['name']}** onto your slip (previous slip cleared).\n"
-            "Use `/parlay view` to preview or `/parlay submit` to lock in at live odds.",
+            "Use `/parlay view` to preview or `/parlay submit` to lock in at live odds.\n"
+            "💡 To keep your parlay private (off the tail board), use `/parlay submit public:False`.",
             ephemeral=True,
         )
 
@@ -1469,6 +1493,39 @@ class BettingCog(commands.Cog):
             file=f, view=view, ephemeral=True
         )
         view.message = msg
+
+    @parlay_group.command(
+        name="unlist",
+        description="Remove your parlay from the public tail board",
+    )
+    @app_commands.describe(parlay_id="Your listed parlay to remove from the tail board")
+    @app_commands.autocomplete(parlay_id=user_public_parlay_autocomplete)
+    async def parlay_unlist(self, interaction: discord.Interaction, parlay_id: str) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        pid = _parse_id(parlay_id)
+        if pid is None:
+            await interaction.followup.send(
+                "Invalid selection. Please pick a parlay from the autocomplete list.",
+                ephemeral=True,
+            )
+            return
+        async with get_session() as session:
+            parlay = await session.get(Parlay, pid)
+            if parlay is None or parlay.user_id != interaction.user.id or parlay.guild_id != current_guild_id():
+                await interaction.followup.send("Parlay not found.", ephemeral=True)
+                return
+            if not parlay.is_public:
+                await interaction.followup.send(
+                    f"Parlay #{pid} is already private — it's not listed on the tail board.",
+                    ephemeral=True,
+                )
+                return
+            parlay.is_public = False
+        await interaction.followup.send(
+            f"🔒 Parlay #{pid} removed from the tail board. Others can no longer copy it.",
+            ephemeral=True,
+        )
 
     # ── /cashout ──────────────────────────────────────────────────────────────
 
