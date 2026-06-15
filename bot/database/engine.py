@@ -59,13 +59,18 @@ def set_guild_context(guild_id: int) -> None:
 def current_guild_id() -> int:
     """The effective guild id for the current context — the single source of
     truth for guild_id row stamps, query filters, and settings-key prefixes.
-    Always reflects the GUILD_ID pin because set_guild_context normalises it."""
-    return _guild_id_ctx.get()
+
+    The GUILD_ID pin is applied at *read* time, not just when set_guild_context
+    runs: some DB access happens in tasks that never set the context (e.g.
+    on_app_command_completion → post_audit_log dispatches in a separate task, so
+    the command's contextvar does not propagate). Without read-time pinning
+    those fall back to the contextvar default 0 and spawn sportsbook_0.db."""
+    return _effective_guild_id(_guild_id_ctx.get())
 
 
 @asynccontextmanager
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    _, factory = _ensure_engine(_guild_id_ctx.get())
+    _, factory = _ensure_engine(current_guild_id())
     async with factory() as session:
         async with session.begin():
             yield session
@@ -74,7 +79,7 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 @asynccontextmanager
 async def get_read_session() -> AsyncGenerator[AsyncSession, None]:
     """Lightweight session for read-only queries — no explicit transaction begin/commit."""
-    _, factory = _ensure_engine(_guild_id_ctx.get())
+    _, factory = _ensure_engine(current_guild_id())
     async with factory() as session:
         yield session
 
@@ -111,7 +116,7 @@ async def init_db(guild_id: int) -> None:
 
 
 async def _migrate_schema() -> None:
-    eng, _ = _ensure_engine(_guild_id_ctx.get())
+    eng, _ = _ensure_engine(current_guild_id())
     async with eng.begin() as conn:
         rows = await conn.execute(text("PRAGMA table_info(market_templates)"))
         existing = {row[1] for row in rows.fetchall()}
@@ -391,7 +396,7 @@ async def _migrate_schema() -> None:
         # When migrating a guild-specific DB (created by copying sportsbook.db),
         # stamp all existing rows with the real guild_id so they remain visible
         # to guild-scoped queries.  The legacy/fallback DB (guild_id=0) keeps 0.
-        _gid = _guild_id_ctx.get()
+        _gid = current_guild_id()
 
         # users: recreate with composite PK (guild_id, discord_id).
         rows = await conn.execute(text("PRAGMA table_info(users)"))
