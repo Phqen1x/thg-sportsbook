@@ -1,8 +1,9 @@
 import contextvars
+import fcntl
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Iterator
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -61,14 +62,32 @@ async def get_read_session() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
-async def init_db(guild_id: int = 0) -> None:
+@contextmanager
+def _init_lock(guild_id: int) -> Iterator[None]:
+    """Cross-process exclusive lock so the bot and web services never run
+    create_all/migrate/seed against the same per-guild DB concurrently (which
+    races on CREATE TABLE / duplicate-key INSERTs). The loser blocks until the
+    winner finishes, then finds the schema already present and skips it."""
+    db_path = _db_path_for_guild(guild_id)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = db_path.parent / f".init-{guild_id}.lock"
+    with open(lock_path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+async def init_db(guild_id: int) -> None:
     token = _guild_id_ctx.set(guild_id)
     try:
-        eng, _ = _ensure_engine(guild_id)
-        async with eng.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        await _migrate_schema()
-        await _seed_defaults()
+        with _init_lock(guild_id):
+            eng, _ = _ensure_engine(guild_id)
+            async with eng.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            await _migrate_schema()
+            await _seed_defaults()
     finally:
         _guild_id_ctx.reset(token)
 
