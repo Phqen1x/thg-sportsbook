@@ -19,6 +19,27 @@ logging.basicConfig(
 log = logging.getLogger("capitol")
 
 
+def _install_component_guild_context() -> None:
+    """discord.py routes component (button/select) and modal-submit interactions
+    through View/Modal._scheduled_task — NOT through CommandTree.call — so the
+    per-guild DB context set in the tree never fires for them and they fall back
+    to the contextvar default 0 (sportsbook_0.db). Wrap those task entry points
+    to stamp the guild context in the same task that runs the callback."""
+    _orig_view_task = discord.ui.View._scheduled_task
+    _orig_modal_task = discord.ui.Modal._scheduled_task
+
+    async def _view_task(self, item, interaction):
+        set_guild_context(interaction.guild_id or 0)
+        return await _orig_view_task(self, item, interaction)
+
+    async def _modal_task(self, interaction, *args, **kwargs):
+        set_guild_context(interaction.guild_id or 0)
+        return await _orig_modal_task(self, interaction, *args, **kwargs)
+
+    discord.ui.View._scheduled_task = _view_task
+    discord.ui.Modal._scheduled_task = _modal_task
+
+
 class SportsBookCommandTree(app_commands.CommandTree):
     async def call(self, interaction: discord.Interaction) -> None:
         set_guild_context(interaction.guild_id or 0)
@@ -53,6 +74,7 @@ class SportsBookBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents, tree_cls=SportsBookCommandTree)
+        _install_component_guild_context()
 
     async def setup_hook(self) -> None:
         log.info("Loading cogs...")
