@@ -140,9 +140,17 @@ class LemonadeClient:
 
 _PARLAY_SYSTEM = """\
 You are a Panem Sportsbook analyst for the Hunger Games universe.
-You receive district lore and current betting-market data, then suggest
-thematic parlay bets that tell a coherent narrative story grounded in each
-district's identity, history, and current standing.
+You receive district lore, historical performance stats, and live tribute data,
+then suggest thematic parlay bets that tell a coherent narrative story grounded
+in each district's identity, proven track record, and current momentum.
+
+For each parlay, the description must be a compelling 2–3 sentence pitch that
+convinces a bettor WHY this parlay is worth tailing. Cite specific lore
+(district identity, past victories, cultural traits) AND historical stats
+(wins, kill records, avg placement) AND current tribute performance (kills,
+training score, veteran status). Make it feel like insider analysis, not a
+generic blurb.
+
 Always respond with valid JSON only — no markdown fences, no prose outside the JSON.
 """
 
@@ -172,19 +180,26 @@ American odds (legs multiply together, so combined odds grow fast):
   - LONGSHOT : combined odds above +3000 (take risks grounded in underdog lore or
                surging kill leaders; longer-priced legs)
 Choose legs so each parlay's combined odds land in its tier's range.
-Every leg in a single parlay must follow the same logical theme, and the name
-must match that theme. If a parlay is built around a district, alliance, or
-specific tribute, EVERY leg must involve that same subject — e.g. a parlay named
-"District 7 Double Down" may only contain markets about District 7 tributes; do
-not slip in unrelated districts or tributes. Pick a coherent angle first, name
-the parlay after it, then select only the legs that fit that angle.
-Each parlay must include 3–8 legs drawn from the market IDs above.
+
+STRICT THEME RULE — follow these steps for EVERY parlay, in order:
+  1. Choose a single subject: one district, one tribute, or one named alliance.
+  2. Scan the OPEN MARKETS list and collect ONLY the market IDs whose label
+     explicitly mentions that district, tribute, or alliance. Do NOT include
+     markets about any other district or tribute, even indirectly.
+  3. From those filtered IDs, pick 3–8 legs that hit your target tier.
+  4. Write the name and description based solely on that subject — if the name
+     or description mentions "District 1", every market_id must be about
+     District 1 tributes; if it mentions a tribute by name, every market_id
+     must involve that tribute.
+  5. Before finalising: re-read each market_id label and confirm it matches
+     the subject in your name/description. Remove any leg that does not match.
+A parlay that mixes subjects is invalid — reject it and pick a purer angle.
 
 Respond as a JSON array (no other text):
 [
   {{
-    "name": "short evocative title (max 80 chars)",
-    "description": "1–2 sentence narrative justifying the picks using lore and stats",
+    "name": "short evocative title (max 60 chars)",
+    "description": "2–3 sentence narrative pitch (max 280 chars). WHY should someone tail this? Cite district lore, historical win/kill record, and current tribute stats. Be specific and persuasive — this is the analyst's sell.",
     "tier": "SAFE" | "BALANCED" | "LONGSHOT",
     "market_ids": [<integer IDs only, from the list above>]
   }}
@@ -193,6 +208,7 @@ Respond as a JSON array (no other text):
 
 
 _MAX_MARKETS = 35
+_MAX_LORE_CHARS = 2000
 
 
 def _select_markets(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -249,6 +265,20 @@ def _build_district_record_lines(records: list[dict[str, Any]]) -> str:
     return "\n".join(lines) or "(no district records)"
 
 
+def _repair_truncated_array(text: str) -> Any:
+    """Try to salvage complete JSON objects from a truncated array.
+
+    When the model hits max_tokens mid-output the JSON array is left open.
+    We find the last complete object boundary ('}') and close the array there
+    so we can return whatever parlays were fully generated.
+    """
+    last_close = text.rfind("}")
+    if last_close == -1:
+        raise ValueError("no complete JSON objects in truncated output")
+    repaired = text[: last_close + 1].rstrip().rstrip(",") + "\n]"
+    return json.loads(repaired)
+
+
 def _extract_json(raw: str) -> Any:
     """Parse JSON from a model response, tolerating markdown fences and thinking tags."""
     text = raw.strip()
@@ -260,7 +290,15 @@ def _extract_json(raw: str) -> Any:
         text = fenced.group(1).strip()
     if not text:
         raise ValueError("model returned empty content after stripping thinking tags")
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Output may be a truncated array (model hit max_tokens mid-generation).
+        # Attempt recovery before giving up.
+        if text.lstrip().startswith("["):
+            log.warning("JSON parse failed; attempting truncation recovery")
+            return _repair_truncated_array(text)
+        raise
 
 
 async def generate_ai_parlays(
@@ -290,8 +328,11 @@ async def generate_ai_parlays(
         tiers = ["SAFE", "BALANCED", "LONGSHOT"]
 
     selected_markets = _select_markets(markets)
+    truncated_lore = lore[:_MAX_LORE_CHARS]
+    if len(lore) > _MAX_LORE_CHARS:
+        truncated_lore = truncated_lore.rsplit(" ", 1)[0] + " [...]"
     user_msg = _PARLAY_USER_TMPL.format(
-        lore=lore,
+        lore=truncated_lore,
         district_records=_build_district_record_lines(district_records or []),
         markets=_build_market_lines(selected_markets),
         tributes=_build_tribute_lines(tributes),
@@ -305,7 +346,7 @@ async def generate_ai_parlays(
             {"role": "user", "content": user_msg},
         ],
         temperature=0.8,
-        max_tokens=2048,
+        max_tokens=8192,
         num_ctx=num_ctx,
         timeout=timeout,
     )

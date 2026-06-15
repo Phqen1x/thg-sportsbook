@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import math
+import textwrap
 from dataclasses import dataclass, field
 
 from PIL import Image, ImageDraw
@@ -278,9 +279,12 @@ def render_tail_board(
         )
         parlay_data.append(p_data)
 
+    SUB_ROW_H = 26
+
     h = HEADER_H + SECTION_LABEL_H + PAD
-    for p in parlay_data:
-        h += PARLAY_HEADER_H + 2 + len(p.legs) * LEG_ROW_H + PARLAY_FOOTER_H + PAD
+    for idx, p in enumerate(parlay_data):
+        sub = all_entries[idx]["sub"]
+        h += PARLAY_HEADER_H + 2 + (SUB_ROW_H if sub else 0) + len(p.legs) * LEG_ROW_H + PARLAY_FOOTER_H + PAD
     h += FOOTER_H + PAD
 
     img = Image.new("RGBA", (WIDTH, h), c["bg"])
@@ -302,9 +306,11 @@ def render_tail_board(
     _draw_section_label(draw, cur_y, "FEATURED & MEMBER SLIPS", colors=c)
     cur_y += SECTION_LABEL_H + PAD
 
-    for p in parlay_data:
+    for idx, p in enumerate(parlay_data):
         sc = status_color("WON", c) if p.status in ("SAFE", "BALANCED", "LONGSHOT") else c["text_gold"]
-        
+        display_name = all_entries[idx]["name"]
+        sub = all_entries[idx]["sub"]
+
         draw_rounded_rect(draw, (PAD, cur_y, WIDTH - PAD, cur_y + PARLAY_HEADER_H), 8,
                           fill=c["header_dark"],
                           outline=c["card_border"],
@@ -312,13 +318,21 @@ def render_tail_board(
 
         hf = rajdhani_bold(15)
         sf = rajdhani_bold(13)
-        display_name = all_entries[p.parlay_id-1]["name"]
         draw.text((PAD + 10, cur_y + 10), display_name.upper(), font=hf, fill=c["header_gold"])
-        
+
         tag_label = p.status
         draw_text_centered(draw, tag_label, sf, c["text_dim"], WIDTH // 2, cur_y + 12)
-        
+
+        # Combined odds visible in header right side
+        draw_text_right(draw, fmt_odds_with_mult(p.combined_odds), sf,
+                        odds_color(p.combined_odds, c), WIDTH - PAD - 10, cur_y + 12)
+
         y_leg = cur_y + PARLAY_HEADER_H + 2
+
+        if sub:
+            draw.rectangle((PAD, y_leg, WIDTH - PAD, y_leg + SUB_ROW_H - 1), fill=c["bg_mid"])
+            draw.text((PAD + 14, y_leg + 5), sub[:110], font=rajdhani(13), fill=c["text_dim"])
+            y_leg += SUB_ROW_H
         leg_font = rajdhani(14)
         odds_font = rajdhani_bold(14)
         for i, leg in enumerate(p.legs):
@@ -371,10 +385,14 @@ def render_tail_detail(
     name = entry["name"]
     sub = entry["sub"]
 
+    sub_lines = textwrap.wrap(sub, width=88) if sub else []
+    SUB_LINE_H = 20
+    SUB_PAD = 14
+
     n_legs = len(odds_list)
     h = HEADER_H + 20 + n_legs * LEG_ROW_H + PARLAY_FOOTER_H + FOOTER_H + 40
-    if sub:
-        h += 30
+    if sub_lines:
+        h += len(sub_lines) * SUB_LINE_H + SUB_PAD
 
     img = Image.new("RGBA", (WIDTH, h), c["bg"])
     theme.draw_bg(img, WIDTH, h)
@@ -404,10 +422,12 @@ def render_tail_detail(
     
     cur_y += PARLAY_HEADER_H + 2
     
-    if sub:
-        draw.rectangle((PAD, cur_y, WIDTH - PAD, cur_y + 28), fill=c["bg_mid"])
-        draw.text((PAD + 24, cur_y + 6), sub, font=rajdhani(14), fill=c["text_white"])
-        cur_y += 30
+    if sub_lines:
+        sub_block_h = len(sub_lines) * SUB_LINE_H + SUB_PAD
+        draw.rectangle((PAD, cur_y, WIDTH - PAD, cur_y + sub_block_h), fill=c["bg_mid"])
+        for li, line in enumerate(sub_lines):
+            draw.text((PAD + 24, cur_y + 7 + li * SUB_LINE_H), line, font=rajdhani(14), fill=c["text_white"])
+        cur_y += sub_block_h + 2
 
     leg_font = rajdhani(16)
     odds_font = rajdhani_bold(16)
