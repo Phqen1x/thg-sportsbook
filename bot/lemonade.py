@@ -144,12 +144,20 @@ You receive district lore, historical performance stats, and live tribute data,
 then suggest thematic parlay bets that tell a coherent narrative story grounded
 in each district's identity, proven track record, and current momentum.
 
-For each parlay, the description must be a compelling 2–3 sentence pitch that
-convinces a bettor WHY this parlay is worth tailing. Cite specific lore
-(district identity, past victories, cultural traits) AND historical stats
-(wins, kill records, avg placement) AND current tribute performance (kills,
-training score, veteran status). Make it feel like insider analysis, not a
-generic blurb.
+For each parlay, write a 2–3 sentence pitch that makes a bettor WANT to tail
+it. Use lore, historical stats, and tribute data as EVIDENCE for a persuasive
+argument — do not just list the data. The structure should be: hook (why this
+angle is compelling right now) → evidence (one or two specific facts that
+support it) → closer (the punchy reason to pull the trigger). Write like a
+sharp analyst selling a pick, not a Wikipedia summary. Vary your sentence
+rhythm; avoid starting consecutive sentences with "District X has...".
+
+CRITICAL — description accuracy: the description must only claim you are
+"backing" or "riding" a tribute/district if every leg in the parlay bets IN
+THEIR FAVOUR. If any leg pits two tributes against each other (e.g. "D4F
+places higher than D4M"), the description must reflect that — you are backing
+one tribute OVER the other, not both. Never write a description that
+contradicts the actual direction of the legs.
 
 Always respond with valid JSON only — no markdown fences, no prose outside the JSON.
 """
@@ -183,23 +191,37 @@ Choose legs so each parlay's combined odds land in its tier's range.
 
 STRICT THEME RULE — follow these steps for EVERY parlay, in order:
   1. Choose a single subject: one district, one tribute, or one named alliance.
+     IMPORTANT: treat D#M and D#F as the same district as D# — e.g. D6, D6M,
+     and D6F all refer to District 6. If any parlay in this batch already uses
+     District 6 (in any form), you MUST choose a different district for this
+     parlay. Each parlay in the batch must focus on a DISTINCT district or
+     tribute; no two parlays may share the same district number.
   2. Scan the OPEN MARKETS list and collect ONLY the market IDs whose label
      explicitly mentions that district, tribute, or alliance. Do NOT include
      markets about any other district or tribute, even indirectly.
-  3. From those filtered IDs, pick 3–8 legs that hit your target tier.
-  4. Write the name and description based solely on that subject — if the name
-     or description mentions "District 1", every market_id must be about
-     District 1 tributes; if it mentions a tribute by name, every market_id
-     must involve that tribute.
-  5. Before finalising: re-read each market_id label and confirm it matches
+  3. From those filtered IDs, pick 3–6 legs that hit your target tier.
+  4. For EACH chosen leg, write out in plain English who you are betting FOR and
+     who (if anyone) you are betting AGAINST. Example: "D4F places higher than
+     D4M" means you are FOR D4F and AGAINST D4M — you are NOT backing both D4
+     tributes. A leg like "D4F top-8 finish" means you are FOR D4F only.
+  5. Write the name and description using ONLY the directions you identified in
+     step 4. The description must not claim you are "backing" a tribute or
+     district unless every leg in the parlay actually bets in their favour.
+     If the legs pit two tributes against each other, say so explicitly —
+     e.g. "ride D4F over her district partner". Never say "back both tributes"
+     if any leg has one tribute beating the other.
+  6. Before finalising: re-read each market_id label and confirm it matches
      the subject in your name/description. Remove any leg that does not match.
-A parlay that mixes subjects is invalid — reject it and pick a purer angle.
+  7. Confirm no other parlay in the batch uses the same district number. If
+     there is a conflict, change this parlay's subject to a different district.
+A parlay that mixes subjects, duplicates a district, or has a description that
+contradicts the direction of its legs is invalid — reject it and start over.
 
 Respond as a JSON array (no other text):
 [
   {{
     "name": "short evocative title (max 60 chars)",
-    "description": "2–3 sentence narrative pitch (max 280 chars). WHY should someone tail this? Cite district lore, historical win/kill record, and current tribute stats. Be specific and persuasive — this is the analyst's sell.",
+    "description": "2–3 sentences, max 280 chars. Lead with a hook that frames the narrative angle, use one or two specific stats or lore facts as EVIDENCE, and close with the punchy reason to bet it. Do NOT just recite data — argue from it. The reader should feel convinced, not informed.",
     "tier": "SAFE" | "BALANCED" | "LONGSHOT",
     "market_ids": [<integer IDs only, from the list above>]
   }}
