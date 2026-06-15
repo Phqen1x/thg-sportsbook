@@ -232,6 +232,11 @@ h3 { font-size: 1rem; }
 }
 .btn:hover { opacity: 0.85; }
 .btn-primary { background: var(--header-gold); color: var(--header-dark); }
+/* Buttons are sometimes <a> elements; keep their text color on hover so the
+   global a:hover gold rule doesn't make solid-background labels unreadable. */
+.btn-primary:hover { color: var(--header-dark); }
+.btn-danger:hover  { color: #fff; }
+.btn-gold:hover    { color: var(--text-white); }
 .btn-outline { background: transparent; border: 1px solid var(--card-border); color: var(--text-dim); }
 .btn-outline:hover { border-color: var(--header-gold); color: var(--text-white); }
 .btn-danger  { background: var(--danger); color: #fff; }
