@@ -13,7 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import func, or_, select
 
-from bot.database.engine import get_session, get_read_session, set_setting, get_setting
+from bot.database.engine import get_session, get_read_session, set_setting, get_setting, current_guild_id
 from bot.database.models import (
     Alliance,
     Bet,
@@ -8855,7 +8855,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            u = await _get_or_create_user(session, user, interaction.guild_id or 0)
+            u = await _get_or_create_user(session, user, current_guild_id())
             u.chips += amount
             new_bal = u.chips
 
@@ -8885,7 +8885,7 @@ class AdminCog(commands.Cog):
         awarded = 0
         async with get_session() as session:
             result = await session.execute(
-                select(User).where(User.guild_id == (interaction.guild_id or 0))
+                select(User).where(User.guild_id == (current_guild_id()))
             )
             for u in result.scalars().all():
                 if role is not None:
@@ -8913,7 +8913,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            u = await _get_or_create_user(session, user, interaction.guild_id or 0)
+            u = await _get_or_create_user(session, user, current_guild_id())
             u.chips = max(0, u.chips - amount)
             new_bal = u.chips
 
@@ -8934,7 +8934,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            u = await _get_or_create_user(session, user, interaction.guild_id or 0)
+            u = await _get_or_create_user(session, user, current_guild_id())
             u.chips = amount
 
         await interaction.followup.send(
@@ -8951,7 +8951,7 @@ class AdminCog(commands.Cog):
         default = json.loads(await get_setting("default_chips") or "1000")
         async with get_session() as session:
             result = await session.execute(
-                select(User).where(User.guild_id == (interaction.guild_id or 0))
+                select(User).where(User.guild_id == (current_guild_id()))
             )
             for u in result.scalars().all():
                 u.chips = default
@@ -9000,7 +9000,7 @@ class AdminCog(commands.Cog):
 
         channel_id = None
         if interaction.guild_id:
-            raw = await get_guild_setting(interaction.guild_id, "announcement_channel_id")
+            raw = await get_guild_setting(current_guild_id(), "announcement_channel_id")
             if raw:
                 channel_id = json.loads(raw)
         if channel_id is None:
@@ -9032,14 +9032,14 @@ class AdminCog(commands.Cog):
             return
         from bot.database.engine import set_guild_setting
         if channel is None:
-            await set_guild_setting(interaction.guild_id, "announcement_channel_id", None)
+            await set_guild_setting(current_guild_id(), "announcement_channel_id", None)
             await interaction.followup.send(
                 "Cleared the announcement channel. Announcements will now send as "
                 "an ephemeral reply unless ANNOUNCEMENT_CHANNEL_ID is set in the env.",
                 ephemeral=True,
             )
             return
-        await set_guild_setting(interaction.guild_id, "announcement_channel_id", channel.id)
+        await set_guild_setting(current_guild_id(), "announcement_channel_id", channel.id)
         await interaction.followup.send(
             f"Capitol announcements will now be posted in {channel.mention}.",
             ephemeral=True,
@@ -9062,14 +9062,14 @@ class AdminCog(commands.Cog):
             return
         from bot.database.engine import set_guild_setting
         if role is None:
-            await set_guild_setting(interaction.guild_id, "admin_role_id", None)
+            await set_guild_setting(current_guild_id(), "admin_role_id", None)
             await interaction.followup.send(
                 "Cleared the admin role. Only users with the server Administrator "
                 "permission can use admin commands (or ADMIN_ROLE_ID env var if set).",
                 ephemeral=True,
             )
             return
-        await set_guild_setting(interaction.guild_id, "admin_role_id", role.id)
+        await set_guild_setting(current_guild_id(), "admin_role_id", role.id)
         await interaction.followup.send(
             f"Admin commands are now accessible to members with the {role.mention} role.",
             ephemeral=True,
@@ -9092,14 +9092,14 @@ class AdminCog(commands.Cog):
             return
         from bot.database.engine import set_guild_setting
         if channel is None:
-            await set_guild_setting(interaction.guild_id, "withdraw_channel_id", None)
+            await set_guild_setting(current_guild_id(), "withdraw_channel_id", None)
             await interaction.followup.send(
                 "Cleared the withdraw/deposit channel. Requests now fall back to "
                 "the WITHDRAW_CHANNEL_ID env var (if set).",
                 ephemeral=True,
             )
             return
-        await set_guild_setting(interaction.guild_id, "withdraw_channel_id", channel.id)
+        await set_guild_setting(current_guild_id(), "withdraw_channel_id", channel.id)
         await interaction.followup.send(
             f"Withdraw/deposit requests will now be posted in {channel.mention}.",
             ephemeral=True,
@@ -9122,13 +9122,13 @@ class AdminCog(commands.Cog):
             return
         from bot.database.engine import set_guild_setting
         if channel is None:
-            await set_guild_setting(interaction.guild_id, "log_channel_id", None)
+            await set_guild_setting(current_guild_id(), "log_channel_id", None)
             await interaction.followup.send(
                 "Cleared the audit log channel. Admin actions will no longer be logged.",
                 ephemeral=True,
             )
             return
-        await set_guild_setting(interaction.guild_id, "log_channel_id", channel.id)
+        await set_guild_setting(current_guild_id(), "log_channel_id", channel.id)
         await interaction.followup.send(
             f"Admin actions will now be logged in {channel.mention}.",
             ephemeral=True,
@@ -9244,7 +9244,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
-                    BettingRestriction.guild_id == (interaction.guild_id or 0),
+                    BettingRestriction.guild_id == (current_guild_id()),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "ALL",
                 )
@@ -9256,7 +9256,7 @@ class AdminCog(commands.Cog):
                 )
                 return
             session.add(BettingRestriction(
-                guild_id=interaction.guild_id or 0,
+                guild_id=current_guild_id(),
                 discord_user_id=member.id,
                 restriction_type="ALL",
             ))
@@ -9276,7 +9276,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
-                    BettingRestriction.guild_id == (interaction.guild_id or 0),
+                    BettingRestriction.guild_id == (current_guild_id()),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "ALL",
                 )
@@ -9310,7 +9310,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
-                    BettingRestriction.guild_id == (interaction.guild_id or 0),
+                    BettingRestriction.guild_id == (current_guild_id()),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "DISTRICT",
                     BettingRestriction.district == district,
@@ -9323,7 +9323,7 @@ class AdminCog(commands.Cog):
                 )
                 return
             session.add(BettingRestriction(
-                guild_id=interaction.guild_id or 0,
+                guild_id=current_guild_id(),
                 discord_user_id=member.id,
                 restriction_type="DISTRICT",
                 district=district,
@@ -9349,7 +9349,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
-                    BettingRestriction.guild_id == (interaction.guild_id or 0),
+                    BettingRestriction.guild_id == (current_guild_id()),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "DISTRICT",
                     BettingRestriction.district == district,
@@ -9398,7 +9398,7 @@ class AdminCog(commands.Cog):
                 return
             existing = await session.execute(
                 select(BettingRestriction).where(
-                    BettingRestriction.guild_id == (interaction.guild_id or 0),
+                    BettingRestriction.guild_id == (current_guild_id()),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "TRIBUTE",
                     BettingRestriction.tribute_id == tid,
@@ -9411,7 +9411,7 @@ class AdminCog(commands.Cog):
                 )
                 return
             session.add(BettingRestriction(
-                guild_id=interaction.guild_id or 0,
+                guild_id=current_guild_id(),
                 discord_user_id=member.id,
                 restriction_type="TRIBUTE",
                 tribute_id=tid,
@@ -9446,7 +9446,7 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             existing = await session.execute(
                 select(BettingRestriction).where(
-                    BettingRestriction.guild_id == (interaction.guild_id or 0),
+                    BettingRestriction.guild_id == (current_guild_id()),
                     BettingRestriction.discord_user_id == member.id,
                     BettingRestriction.restriction_type == "TRIBUTE",
                     BettingRestriction.tribute_id == tid,

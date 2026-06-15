@@ -41,9 +41,26 @@ def _ensure_engine(guild_id: int) -> tuple[AsyncEngine, async_sessionmaker[Async
     return _engines[guild_id], _factories[guild_id]
 
 
+def _effective_guild_id(guild_id: int) -> int:
+    """Collapse the live Discord snowflake to the configured single-guild pin.
+
+    When GUILD_ID is set this deployment serves exactly one guild, so every live
+    interaction (whatever server it physically came from) must resolve to that
+    guild's DB / rows / settings — matching the web app. When unset, the live id
+    is used unchanged (true multi-guild behaviour)."""
+    return config.GUILD_ID or guild_id
+
+
 def set_guild_context(guild_id: int) -> None:
     """Set the guild_id for the current async task context."""
-    _guild_id_ctx.set(guild_id)
+    _guild_id_ctx.set(_effective_guild_id(guild_id))
+
+
+def current_guild_id() -> int:
+    """The effective guild id for the current context — the single source of
+    truth for guild_id row stamps, query filters, and settings-key prefixes.
+    Always reflects the GUILD_ID pin because set_guild_context normalises it."""
+    return _guild_id_ctx.get()
 
 
 @asynccontextmanager
@@ -80,6 +97,7 @@ def _init_lock(guild_id: int) -> Iterator[None]:
 
 
 async def init_db(guild_id: int) -> None:
+    guild_id = _effective_guild_id(guild_id)
     token = _guild_id_ctx.set(guild_id)
     try:
         with _init_lock(guild_id):

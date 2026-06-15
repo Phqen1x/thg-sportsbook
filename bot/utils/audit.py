@@ -65,11 +65,11 @@ async def post_audit_log(
     interaction: discord.Interaction,
     target: discord.Member | discord.User | None = None,
 ) -> None:
-    from bot.database.engine import get_guild_setting
+    from bot.database.engine import get_guild_setting, current_guild_id
 
     if not interaction.guild_id:
         return
-    raw = await get_guild_setting(interaction.guild_id, "log_channel_id")
+    raw = await get_guild_setting(current_guild_id(), "log_channel_id")
     if not raw:
         return
     channel = bot.get_channel(int(raw))

@@ -14,8 +14,8 @@ def is_admin():
             return True
         # Per-guild admin role takes precedence over the global env var.
         if interaction.guild_id:
-            from bot.database.engine import get_guild_setting
-            raw = await get_guild_setting(interaction.guild_id, "admin_role_id")
+            from bot.database.engine import get_guild_setting, current_guild_id
+            raw = await get_guild_setting(current_guild_id(), "admin_role_id")
             if raw:
                 role_id = json.loads(raw)
                 if any(r.id == role_id for r in member.roles):

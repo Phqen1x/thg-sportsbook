@@ -24,6 +24,13 @@ WITHDRAW_CHANNEL_ID: int | None = (
 DEV_GUILD_ID: int | None = (
     int(os.environ["DEV_GUILD_ID"]) if os.environ.get("DEV_GUILD_ID") else None
 )
+# Single-guild pin. When set, the bot serves exactly this guild's database
+# regardless of which server an interaction physically originates from — the
+# same pin the web app uses (web/config.GUILD_ID). The launcher derives DB_PATH
+# from this, so all three (bot DB file, row guild_id, settings keys) agree.
+GUILD_ID: int | None = (
+    int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
+)
 
 DEFAULT_CHIPS: int = int(os.environ.get("DEFAULT_CHIPS", "1000"))
 CASHOUT_ALLOWED: bool = os.environ.get("CASHOUT_ALLOWED", "false").lower() == "true"

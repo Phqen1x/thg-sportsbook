@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select, func, or_
 
-from bot.database.engine import get_session, get_read_session, get_setting
+from bot.database.engine import get_session, get_read_session, get_setting, current_guild_id
 from bot.database.models import Alliance, Bet, BettingPhase, Market, MarketTemplate, Tribute, User
 from bot.imaging.hot_odds import (
     BoardCardData, FeaturedMarket, TributeDetailData,
@@ -372,7 +372,7 @@ class DisplayCog(commands.Cog):
                 )
                 return
             async with get_session() as session:
-                user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
+                user = await _get_or_create_user(session, interaction.user, current_guild_id())
                 user_chips = user.chips
 
                 t = await session.get(Tribute, tribute_id)
@@ -429,7 +429,7 @@ class DisplayCog(commands.Cog):
 
         # ── Full board view (District / Alliance / Tribute toggle) ────────────
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
             user_chips = user.chips
 
             trib_result = await session.execute(
@@ -587,7 +587,7 @@ class DisplayCog(commands.Cog):
     async def balance(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user, interaction.guild_id or 0)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
             chips = user.chips
             wagered = user.total_wagered
             won = user.total_won
@@ -614,7 +614,7 @@ class DisplayCog(commands.Cog):
         async with get_session() as session:
             result = await session.execute(
                 select(User)
-                .where(User.guild_id == (interaction.guild_id or 0))
+                .where(User.guild_id == (current_guild_id()))
                 .order_by(User.chips.desc())
                 .limit(10)
             )
