@@ -112,6 +112,7 @@ class SportsBookBot(commands.Bot):
         log.info(f"Logged in as {self.user} (ID: {self.user.id})")
         for guild in self.guilds:
             await init_db(guild.id)
+            log.info(f"Serving guild {guild.id} ({guild.name}) → sportsbook_{guild.id}.db")
 
         if self.guilds:
             set_guild_context(self.guilds[0].id)

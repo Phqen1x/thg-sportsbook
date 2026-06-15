@@ -65,10 +65,13 @@ async def post_audit_log(
     interaction: discord.Interaction,
     target: discord.Member | discord.User | None = None,
 ) -> None:
-    from bot.database.engine import get_guild_setting, current_guild_id
+    from bot.database.engine import get_guild_setting, current_guild_id, set_guild_context
 
     if not interaction.guild_id:
         return
+    # on_app_command_completion dispatches in a separate task, so the command's
+    # guild context did not propagate here — bind it from the interaction.
+    set_guild_context(interaction.guild_id)
     raw = await get_guild_setting(current_guild_id(), "log_channel_id")
     if not raw:
         return

@@ -1,3 +1,4 @@
+import asyncio
 import contextvars
 import fcntl
 import json
@@ -21,6 +22,13 @@ _guild_id_ctx: contextvars.ContextVar[int] = contextvars.ContextVar("guild_id", 
 _engines: dict[int, AsyncEngine] = {}
 _factories: dict[int, async_sessionmaker[AsyncSession]] = {}
 
+# Guilds whose per-guild DB has had its schema created/migrated/seeded this
+# process. Plus an in-process async lock per guild so concurrent first-touches
+# serialise (the cross-process flock alone can't make a second coroutine wait
+# for the first one's CREATE TABLE within the same process).
+_initialized: set[int] = set()
+_init_locks: dict[int, asyncio.Lock] = {}
+
 
 def _db_path_for_guild(guild_id: int) -> Path:
     return Path(config.DB_PATH).parent / f"sportsbook_{guild_id}.db"
@@ -41,36 +49,40 @@ def _ensure_engine(guild_id: int) -> tuple[AsyncEngine, async_sessionmaker[Async
     return _engines[guild_id], _factories[guild_id]
 
 
-def _effective_guild_id(guild_id: int) -> int:
-    """Collapse the live Discord snowflake to the configured single-guild pin.
-
-    When GUILD_ID is set this deployment serves exactly one guild, so every live
-    interaction (whatever server it physically came from) must resolve to that
-    guild's DB / rows / settings — matching the web app. When unset, the live id
-    is used unchanged (true multi-guild behaviour)."""
-    return config.GUILD_ID or guild_id
-
-
 def set_guild_context(guild_id: int) -> None:
-    """Set the guild_id for the current async task context."""
-    _guild_id_ctx.set(_effective_guild_id(guild_id))
+    """Bind the current async task to a Discord guild's database. Called once
+    per interaction from the live interaction.guild_id, so every command, button,
+    modal, and audit log automatically resolves to that server's own DB."""
+    _guild_id_ctx.set(guild_id)
 
 
 def current_guild_id() -> int:
-    """The effective guild id for the current context — the single source of
-    truth for guild_id row stamps, query filters, and settings-key prefixes.
+    """The guild id bound to the current context — the single source of truth for
+    which DB to open and for guild_id row stamps, query filters, and settings
+    keys. Set per-interaction by set_guild_context."""
+    return _guild_id_ctx.get()
 
-    The GUILD_ID pin is applied at *read* time, not just when set_guild_context
-    runs: some DB access happens in tasks that never set the context (e.g.
-    on_app_command_completion → post_audit_log dispatches in a separate task, so
-    the command's contextvar does not propagate). Without read-time pinning
-    those fall back to the contextvar default 0 and spawn sportsbook_0.db."""
-    return _effective_guild_id(_guild_id_ctx.get())
+
+async def _ensure_initialized(guild_id: int) -> None:
+    """Lazily create/migrate/seed a guild's DB on first access this process, so a
+    server's database is always ready before a query runs — including new servers
+    the bot was just added to and interactions that arrive during startup before
+    on_ready's init loop finishes (which previously raised 'no such table')."""
+    if guild_id in _initialized:
+        return
+    lock = _init_locks.setdefault(guild_id, asyncio.Lock())
+    async with lock:
+        if guild_id not in _initialized:
+            await _do_init(guild_id)
 
 
 @asynccontextmanager
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    _, factory = _ensure_engine(current_guild_id())
+    gid = current_guild_id()
+    if not gid:
+        raise RuntimeError("No guild context set — database access requires a guild")
+    await _ensure_initialized(gid)
+    _, factory = _ensure_engine(gid)
     async with factory() as session:
         async with session.begin():
             yield session
@@ -79,7 +91,11 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 @asynccontextmanager
 async def get_read_session() -> AsyncGenerator[AsyncSession, None]:
     """Lightweight session for read-only queries — no explicit transaction begin/commit."""
-    _, factory = _ensure_engine(current_guild_id())
+    gid = current_guild_id()
+    if not gid:
+        raise RuntimeError("No guild context set — database access requires a guild")
+    await _ensure_initialized(gid)
+    _, factory = _ensure_engine(gid)
     async with factory() as session:
         yield session
 
@@ -102,7 +118,13 @@ def _init_lock(guild_id: int) -> Iterator[None]:
 
 
 async def init_db(guild_id: int) -> None:
-    guild_id = _effective_guild_id(guild_id)
+    """Idempotent public entry point used at startup / on_guild_join. Safe to
+    call repeatedly; the actual work runs once per guild per process."""
+    if guild_id:
+        await _ensure_initialized(guild_id)
+
+
+async def _do_init(guild_id: int) -> None:
     token = _guild_id_ctx.set(guild_id)
     try:
         with _init_lock(guild_id):
@@ -110,7 +132,14 @@ async def init_db(guild_id: int) -> None:
             async with eng.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             await _migrate_schema()
+            # Mark ready before seeding: _seed_defaults opens get_session for this
+            # same guild, which must short-circuit _ensure_initialized rather than
+            # recurse / deadlock on the per-guild lock held above.
+            _initialized.add(guild_id)
             await _seed_defaults()
+    except Exception:
+        _initialized.discard(guild_id)
+        raise
     finally:
         _guild_id_ctx.reset(token)
 

@@ -24,13 +24,6 @@ WITHDRAW_CHANNEL_ID: int | None = (
 DEV_GUILD_ID: int | None = (
     int(os.environ["DEV_GUILD_ID"]) if os.environ.get("DEV_GUILD_ID") else None
 )
-# Single-guild pin. When set, the bot serves exactly this guild's database
-# regardless of which server an interaction physically originates from — the
-# same pin the web app uses (web/config.GUILD_ID). The launcher derives DB_PATH
-# from this, so all three (bot DB file, row guild_id, settings keys) agree.
-GUILD_ID: int | None = (
-    int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
-)
 
 DEFAULT_CHIPS: int = int(os.environ.get("DEFAULT_CHIPS", "1000"))
 CASHOUT_ALLOWED: bool = os.environ.get("CASHOUT_ALLOWED", "false").lower() == "true"
@@ -39,9 +32,10 @@ CASHOUT_RATE: float = float(os.environ.get("CASHOUT_RATE", "0.65"))
 # Public base URL of the web app (used by /play to link the standalone Activity).
 WEB_BASE_URL: str | None = (os.environ.get("WEB_BASE_URL") or "").rstrip("/") or None
 
-DB_PATH: str = os.environ.get("DB_PATH") or str(
-    BASE_DIR / "data" / "sportsbook_1395951775160340551.db"
-)
+# Anchors the data directory only — the actual per-guild files are named
+# sportsbook_<guild_id>.db alongside this path. The filename here is never used
+# directly (the bot is fully multi-guild; each server gets its own DB).
+DB_PATH: str = os.environ.get("DB_PATH") or str(BASE_DIR / "data" / "sportsbook.db")
 FONTS_DIR: Path = Path(
     os.environ.get("FONTS_DIR") or str(BASE_DIR / "assets" / "fonts")
 )
