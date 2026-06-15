@@ -93,6 +93,61 @@ async def check_admin(member: dict, *, guild_id: int | None = None) -> bool:
         return False
 
 
+async def can_use_bot(member: dict, user_id: int, *, guild_id: int | None = None) -> bool:
+    """Return True if this member is allowed to use the bot's slash commands.
+
+    Mirrors the command-permission overrides set in Discord's
+    Server Settings -> Integrations UI, which are stored as application command
+    permissions. We evaluate the app-wide ("all commands") override using the
+    member's roles. Channel-specific overrides are ignored because website login
+    has no channel context. Fails open (allows) when no overrides exist or the
+    Discord API can't be reached, so a transient error never locks everyone out.
+    """
+    gid = guild_id or config.GUILD_ID
+    if not gid or not config.DISCORD_CLIENT_ID:
+        return True  # nothing to evaluate against
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{DISCORD_API}/applications/{config.DISCORD_CLIENT_ID}/guilds/{gid}/commands/permissions",
+                headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
+            )
+    except httpx.HTTPError:
+        return True  # fail open on network error
+    if r.status_code == 404:
+        return True  # no command permissions configured -> bot open to everyone
+    if r.status_code != 200:
+        return True  # fail open on unexpected response
+
+    app_id = config.DISCORD_CLIENT_ID
+    # The "all commands" default override has id == application_id.
+    overrides = next(
+        (o["permissions"] for o in r.json() if str(o.get("id")) == str(app_id)),
+        None,
+    )
+    if not overrides:
+        return True  # no app-wide restriction
+
+    ROLE, USER = 1, 2  # CHANNEL == 3 is ignored (no channel context at login)
+    member_role_ids = {int(x) for x in member.get("roles", [])}
+    member_role_ids.add(int(gid))  # @everyone role id == guild id; everyone has it
+
+    # An explicit user override takes precedence over roles.
+    for p in overrides:
+        if p["type"] == USER and str(p["id"]) == str(user_id):
+            return bool(p["permission"])
+
+    # Otherwise, any applicable role that explicitly allows wins over a deny.
+    applicable = [
+        bool(p["permission"])
+        for p in overrides
+        if p["type"] == ROLE and int(p["id"]) in member_role_ids
+    ]
+    if applicable:
+        return any(applicable)
+    return True  # no override applies to this member -> default allowed
+
+
 async def get_guild_name(guild_id: int) -> str | None:
     """Return the guild's name, or None on error."""
     async with httpx.AsyncClient() as c:

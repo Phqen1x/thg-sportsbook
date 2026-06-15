@@ -164,9 +164,20 @@ Format: D# | name | gender | age | kills | training_score | times_played | debil
 === TASK ===
 Generate exactly {count} parlay suggestions covering tiers: {tiers}.
 Use the district lore AND historical stats together to build narrative-driven,
-intelligently differentiated picks. SAFE parlays should favor historically
-strong districts and low-odds markets; LONGSHOT parlays should take risks
-grounded in underdog lore or surging kill leaders.
+intelligently differentiated picks. Tiers are defined by the parlay's COMBINED
+American odds (legs multiply together, so combined odds grow fast):
+  - SAFE     : combined odds below +500 (favor historically strong districts and
+               low-odds markets; typically fewer or shorter-priced legs)
+  - BALANCED : combined odds between +500 and +3000
+  - LONGSHOT : combined odds above +3000 (take risks grounded in underdog lore or
+               surging kill leaders; longer-priced legs)
+Choose legs so each parlay's combined odds land in its tier's range.
+Every leg in a single parlay must follow the same logical theme, and the name
+must match that theme. If a parlay is built around a district, alliance, or
+specific tribute, EVERY leg must involve that same subject — e.g. a parlay named
+"District 7 Double Down" may only contain markets about District 7 tributes; do
+not slip in unrelated districts or tributes. Pick a coherent angle first, name
+the parlay after it, then select only the legs that fit that angle.
 Each parlay must include 3–8 legs drawn from the market IDs above.
 
 Respond as a JSON array (no other text):

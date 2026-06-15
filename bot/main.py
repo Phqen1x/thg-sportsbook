@@ -41,9 +41,14 @@ def _install_component_guild_context() -> None:
 
 
 class SportsBookCommandTree(app_commands.CommandTree):
-    async def call(self, interaction: discord.Interaction) -> None:
+    async def _call(self, interaction: discord.Interaction) -> None:
+        # discord.py dispatches every slash/context-menu interaction through
+        # _call (via _from_interaction), not a public `call`, so this is the
+        # one hook that fires for *all* app commands — including read-only ones
+        # that aren't wrapped by the audit decorator. Stamp the per-guild DB
+        # context here so they don't fall through to sportsbook_0.db.
         set_guild_context(interaction.guild_id or 0)
-        await super().call(interaction)
+        await super()._call(interaction)
 
     async def sync(self, *, guild: Optional[discord.abc.Snowflake] = None):
         if guild is not None:

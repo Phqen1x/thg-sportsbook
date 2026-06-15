@@ -987,3 +987,57 @@ input[type=checkbox], input[type=radio] { accent-color: var(--header-gold); }
   .home-market-actions .btn-sm { width: auto; }
 }
 
+/* ── Join-our-server floating button ─────────────────────────────────────── */
+.join-fab {
+  position: fixed;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+.join-fab-logo {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: 2px solid var(--header-gold);
+  background: var(--header-dark);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.join-fab:hover .join-fab-logo {
+  transform: scale(1.06);
+  box-shadow: 0 6px 18px rgba(201, 162, 39, 0.45);
+}
+.join-fab-tip {
+  position: absolute;
+  right: calc(100% + 0.75rem);
+  bottom: 50%;
+  transform: translateY(50%) translateX(8px);
+  width: max-content;
+  max-width: 260px;
+  padding: 0.6rem 0.8rem;
+  background: var(--card-bg);
+  color: var(--text-white);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+  font-size: 0.85rem;
+  line-height: 1.35;
+  text-align: left;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.join-fab:hover .join-fab-tip,
+.join-fab:focus-visible .join-fab-tip {
+  opacity: 1;
+  transform: translateY(50%) translateX(0);
+}
+@media (max-width: 600px) {
+  .join-fab { right: 0.85rem; bottom: 0.85rem; }
+  .join-fab-logo { width: 48px; height: 48px; }
+  .join-fab-tip { max-width: 200px; font-size: 0.8rem; }
+}
+

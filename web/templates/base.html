@@ -19,7 +19,7 @@
     <a href="/markets" {% if request.url.path == '/markets' %}class="active"{% endif %}>Markets</a>
     <a href="/tributes" {% if request.url.path == '/tributes' %}class="active"{% endif %}>Tributes</a>
     <a href="/leaderboard" {% if request.url.path == '/leaderboard' %}class="active"{% endif %}>Leaderboard</a>
-    <a href="/tail" {% if request.url.path == '/tail' %}class="active"{% endif %}>Parlays</a>
+    <a href="/tail" {% if request.url.path == '/tail' %}class="active"{% endif %}>Tail</a>
     {% if user %}
       <a href="/balance" {% if request.url.path == '/balance' %}class="active"{% endif %}>Balance</a>
       <a href="/my-bets" {% if request.url.path == '/my-bets' %}class="active"{% endif %}>My Bets</a>
@@ -57,6 +57,13 @@
 <footer class="footer">
   <span>Panem Sportsbook &mdash; May the odds be ever in your favor.</span>
 </footer>
+
+<a href="https://discord.gg/DhVnFRsram" target="_blank" rel="noopener noreferrer"
+   class="join-fab"
+   aria-label="Want to participate in betting on The Hunger Games? Join our Interactive Discord Hunger Games server!">
+  <img src="/static/server-logo.png" alt="" class="join-fab-logo">
+  <span class="join-fab-tip">Want to participate in betting on The Hunger Games? Join our Interactive Discord Hunger Games server!</span>
+</a>
 
 
 <script>

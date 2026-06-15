@@ -553,6 +553,16 @@ async def tail_board(
             )
             tpl_flavor[tpl.id] = {"name": name, "description": desc}
 
+        # Combined odds per template, for live payout preview
+        tpl_combined: dict[int, int] = {}
+        for tpl in templates_raw:
+            odds_list = [
+                tpl_markets[leg.market_id].odds
+                for leg in tpl_legs.get(tpl.id, [])
+                if leg.market_id in tpl_markets
+            ]
+            tpl_combined[tpl.id] = combined_american(odds_list) if odds_list else None
+
         # Member public parlays
         mp_rows = (await db.execute(
             select(Parlay)
@@ -565,6 +575,7 @@ async def tail_board(
         member_parlay_legs: dict[int, list[Bet]] = {}
         member_parlay_markets: dict[int, Market] = {}
         member_parlay_owners: dict[int, str] = {}
+        member_parlay_combined: dict[int, int] = {}
 
         for mp in mp_rows:
             legs = (await db.execute(
@@ -582,6 +593,7 @@ async def tail_board(
                 continue
             member_parlays.append(mp)
             member_parlay_legs[mp.id] = list(legs)
+            member_parlay_combined[mp.id] = combined_american([m.odds for m in mkts])
             for mkt in mkts:
                 member_parlay_markets[mkt.id] = mkt
             owner = (await db.execute(
@@ -597,10 +609,12 @@ async def tail_board(
         "tpl_legs": tpl_legs,
         "tpl_markets": tpl_markets,
         "tpl_flavor": tpl_flavor,
+        "tpl_combined": tpl_combined,
         "member_parlays": member_parlays,
         "member_parlay_legs": member_parlay_legs,
         "member_parlay_markets": member_parlay_markets,
         "member_parlay_owners": member_parlay_owners,
+        "member_parlay_combined": member_parlay_combined,
         "success": success,
         "error": error,
     })

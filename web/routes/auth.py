@@ -57,6 +57,8 @@ async def callback(code: str | None = None, state: str | None = None, error: str
         member = await discord_api.get_member(uid)
         if member is None:
             return RedirectResponse("/?error=You+must+be+a+server+member+to+log+in.")
+        if not await discord_api.can_use_bot(member, uid):
+            return RedirectResponse("/?error=You+don't+have+permission+to+use+this+bot!")
         admin = await discord_api.check_admin(member)
         guilds = available_guilds()
         # Auto-select guild if there's only one option; otherwise let the user pick.

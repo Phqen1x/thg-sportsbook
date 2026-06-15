@@ -51,8 +51,13 @@
       <div class="form-group">
         <label class="form-label">Wager (chips)</label>
         <div class="input-row">
-          <input type="number" name="wager" class="form-control" min="1" max="{{ db_user.chips }}" value="100" required>
+          <input type="number" name="wager" class="form-control tail-wager" min="1" max="{{ db_user.chips }}" value="100" required
+                 data-odds="{{ tpl_combined.get(tpl.id) if tpl_combined.get(tpl.id) is not none else 0 }}" oninput="updateTailPayout(this)">
           <button type="submit" class="btn btn-primary">Tail</button>
+        </div>
+        <div class="payout-preview">
+          <span class="text-dim">Potential payout</span>
+          <span class="tail-payout text-gold font-bold">—</span>
         </div>
         <div class="text-dim" style="font-size:0.8rem">Balance: {{ db_user.chips | fmt_chips }} chips</div>
       </div>
@@ -102,8 +107,13 @@
       <div class="form-group">
         <label class="form-label">Wager (chips)</label>
         <div class="input-row">
-          <input type="number" name="wager" class="form-control" min="1" max="{{ db_user.chips }}" value="100" required>
+          <input type="number" name="wager" class="form-control tail-wager" min="1" max="{{ db_user.chips }}" value="100" required
+                 data-odds="{{ member_parlay_combined.get(mp.id) if member_parlay_combined.get(mp.id) is not none else 0 }}" oninput="updateTailPayout(this)">
           <button type="submit" class="btn btn-primary">Tail</button>
+        </div>
+        <div class="payout-preview">
+          <span class="text-dim">Potential payout</span>
+          <span class="tail-payout text-gold font-bold">—</span>
         </div>
         <div class="text-dim" style="font-size:0.8rem">Balance: {{ db_user.chips | fmt_chips }} chips</div>
       </div>
@@ -124,4 +134,25 @@
   <a href="/parlay" class="btn btn-outline mt-2">Build Your Own</a>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+function calcTailPayout(wager, odds) {
+  if (!odds) return 0;
+  if (odds > 0) return Math.round(wager * (odds / 100 + 1));
+  return Math.round(wager * (100 / Math.abs(odds) + 1));
+}
+
+function updateTailPayout(input) {
+  const odds = parseInt(input.dataset.odds) || 0;
+  const w = parseInt(input.value) || 0;
+  const display = input.closest('.form-group').querySelector('.tail-payout');
+  if (!display) return;
+  const p = w > 0 ? calcTailPayout(w, odds) : 0;
+  display.textContent = p > 0 ? p.toLocaleString() + ' chips' : '—';
+}
+
+document.querySelectorAll('.tail-wager').forEach(updateTailPayout);
+</script>
 {% endblock %}

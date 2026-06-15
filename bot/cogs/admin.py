@@ -461,6 +461,18 @@ DIFFICULTY_ODDS: dict[str, int] = {
     "LONGSHOT": +1500,
 }
 
+# AI-generated parlays are labelled by their actual combined American odds:
+#   Safe     : combined < +500
+#   Balanced : +500 <= combined <= +3000
+#   Longshot : combined > +3000
+def classify_parlay_tier(combined_odds: int) -> str:
+    if combined_odds < 500:
+        return "SAFE"
+    if combined_odds <= 3000:
+        return "BALANCED"
+    return "LONGSHOT"
+
+
 DIFFICULTY_CHOICES = [
     app_commands.Choice(name="Easy      (≈ -200 odds)", value="EASY"),
     app_commands.Choice(name="Moderate  (≈ +100 odds)", value="MODERATE"),
@@ -2206,12 +2218,16 @@ async def _try_generate_ai_parlays(
             await session.delete(tpl)
         await session.flush()
 
+        market_odds = {m.id: m.odds for m in open_markets}
         for sug in suggestions:
+            # Label by the parlay's true combined odds, not the AI's self-reported tier.
+            leg_odds = [market_odds[mid] for mid in sug["market_ids"] if mid in market_odds]
+            tier = classify_parlay_tier(combined_american(leg_odds)) if leg_odds else sug["tier"]
             tpl = ParlayTemplate(
                 name=sug["name"],
                 description=sug["description"],
                 source="AUTO",
-                difficulty=sug["tier"],
+                difficulty=tier,
                 phase_id=phase_id,
                 active=True,
             )
