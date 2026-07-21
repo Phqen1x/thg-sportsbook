@@ -2126,6 +2126,106 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     return created
 
 
+def _bundle_markets_by_subject(open_markets, tribute_by_id):
+    """Group OPEN markets by subject using structured fields (no label parsing).
+
+    Returns ``{(kind, ident): [Market, ...]}`` where ``kind`` is ``"D"``
+    (district) or ``"A"`` (alliance).  A market lands in a district bundle when
+    it references a tribute from that district (via tribute_a/tribute_b) or is a
+    ``DISTRICT_*`` market for it; alliance bundles come from ``ALLIANCE_*``
+    markets.  A cross-district versus market lands in both districts' bundles.
+    Bloodbath/global markets with no single subject are skipped, so every bundle
+    stays coherent — the model can only ever build a parlay from one subject.
+
+    Intra-district versus markets — where both tributes belong to the SAME
+    district (e.g. "D4F places higher than D4M") — are excluded from that
+    district's bundle, so a district-focused parlay never backs a tribute
+    against their own district partner.
+    """
+    bundles: dict[tuple[str, int], list] = {}
+    for m in open_markets:
+        ta = tribute_by_id.get(m.tribute_a_id) if m.tribute_a_id else None
+        tb = tribute_by_id.get(m.tribute_b_id) if m.tribute_b_id else None
+        # A market pits district-mates against each other when both tributes are
+        # set and share a district. Such a market only maps to that one district,
+        # so we drop it from that bundle entirely.
+        intra_district_versus = (
+            ta is not None and tb is not None and ta.district == tb.district
+        )
+        keys: list[tuple[str, int]] = []
+        for t in (ta, tb):
+            if t is not None:
+                keys.append(("D", t.district))
+        if m.type.startswith("DISTRICT_") and m.placement_num is not None:
+            keys.append(("D", m.placement_num))
+        if m.type.startswith("ALLIANCE_") and m.placement_num is not None:
+            keys.append(("A", m.placement_num))
+        for key in dict.fromkeys(keys):  # dedupe, preserve order
+            if intra_district_versus and key == ("D", ta.district):
+                continue  # never offer partner-vs-partner legs to a district parlay
+            bundles.setdefault(key, []).append(m)
+    return bundles
+
+
+def _tribute_payload(t) -> dict:
+    return {
+        "district": t.district,
+        "name": t.name,
+        "gender": t.display_gender,
+        "age": t.age,
+        "kills": t.kills,
+        "training_score": t.training_score,
+        "times_played": t.times_played,
+        "debilitation_level": t.debilitation_level,
+    }
+
+
+def _filter_conflicting_legs(market_ids, market_by_id):
+    """Drop legs that contradict another leg already in the parlay.
+
+    Currently guards against over/under conflicts: a parlay must not contain
+    both the OVER and the UNDER of the same market type for the same tribute
+    (e.g. "over 0.5 kills" and "under 0.5 kills" on the same tribute), which
+    could never both win.  The first-selected side of each such prop is kept and
+    any opposite-side leg is removed.  Order is preserved.
+    """
+    kept: list[int] = []
+    seen_side: dict[tuple, str] = {}
+    for mid in market_ids:
+        m = market_by_id.get(mid)
+        if m is None:
+            continue
+        if m.ou_side in ("OVER", "UNDER"):
+            key = (m.type, m.tribute_a_id, m.tribute_b_id)
+            prev = seen_side.get(key)
+            if prev is not None and prev != m.ou_side:
+                log.debug(
+                    "Dropping leg %d (%s %s): conflicts with existing %s side for %s",
+                    mid, m.type, m.ou_side, prev, key,
+                )
+                continue
+            seen_side.setdefault(key, m.ou_side)
+        kept.append(mid)
+    return kept
+
+
+def _district_record_payload(dr) -> dict:
+    return {
+        "district": dr.district,
+        "reputation": dr.reputation,
+        "funding_level": dr.funding_level,
+        "wins": dr.wins,
+        "avg_placement": dr.avg_placement,
+        "avg_placement_last5": dr.avg_placement_last5,
+        "top8_finishes": dr.top8_finishes,
+        "top5_finishes": dr.top5_finishes,
+        "total_kills": dr.total_kills,
+        "bloodbath_kills": dr.bloodbath_kills,
+        "kill_record": dr.kill_record,
+        "avg_training_score": dr.avg_training_score,
+    }
+
+
 async def _try_generate_ai_parlays(
     session, phase_id: int | None, count: int = 3
 ) -> int:
@@ -2142,7 +2242,7 @@ async def _try_generate_ai_parlays(
 
     try:
         from bot import config as _cfg
-        from bot.lemonade import LemonadeClient, generate_ai_parlays
+        from bot.lemonade import LemonadeClient, generate_ai_parlays_for_subjects
 
         client = LemonadeClient(base_url=_cfg.LEMONADE_BASE_URL, model=_cfg.LEMONADE_MODEL)
         if not await client.health():
@@ -2156,53 +2256,69 @@ async def _try_generate_ai_parlays(
         if len(open_markets) < 3:
             return 0
 
-        trib_rows = await session.execute(select(Tribute).where(Tribute.status == "ALIVE"))
-        alive_tributes = list(trib_rows.scalars().all())
+        # Load ALL tributes: markets can reference eliminated tributes, and we
+        # need every tribute's district to bundle markets by subject.
+        all_tributes = list((await session.execute(select(Tribute))).scalars().all())
+        tribute_by_id = {t.id: t for t in all_tributes}
+        alive_by_district: dict[int, list] = {}
+        for t in all_tributes:
+            if t.status == "ALIVE":
+                alive_by_district.setdefault(t.district, []).append(t)
 
-        districts = {t.district for t in alive_tributes}
-        if districts:
-            dr_rows = await session.execute(
-                select(DistrictRecord).where(DistrictRecord.district.in_(districts))
-            )
-            district_records = list(dr_rows.scalars().all())
-        else:
-            district_records = []
+        record_by_district = {
+            dr.district: dr
+            for dr in (await session.execute(select(DistrictRecord))).scalars().all()
+        }
+        alliance_by_id = {
+            a.id: a for a in (await session.execute(select(Alliance))).scalars().all()
+        }
 
-        suggestions = await generate_ai_parlays(
+        # Hard constraints in Python: bundle each market to its subject, keep
+        # only subjects with >= 3 markets, and pick DISTINCT subjects up front so
+        # the model never has to count, dedupe districts, or partition markets.
+        bundles = _bundle_markets_by_subject(open_markets, tribute_by_id)
+        eligible = [(k, ms) for k, ms in bundles.items() if len(ms) >= 3]
+        # Richer subjects first (more markets = more story), then most competitive.
+        eligible.sort(key=lambda kv: (-len(kv[1]), sum(abs(m.odds) for m in kv[1])))
+
+        tiers = ["SAFE", "BALANCED", "LONGSHOT"]
+        subjects: list[dict] = []
+        # Over-provision subjects so a few model failures don't starve the batch.
+        for idx, (key, ms) in enumerate(eligible[: count + 3]):
+            kind, ident = key
+            if kind == "D":
+                label = f"District {ident}"
+                subj_tributes = alive_by_district.get(ident, [])
+                recs = [record_by_district[ident]] if ident in record_by_district else []
+            else:  # alliance
+                a = alliance_by_id.get(ident)
+                label = f"Alliance: {a.name}" if a else f"Alliance {ident}"
+                subj_tributes = [
+                    t for t in all_tributes
+                    if t.alliance_id == ident and t.status == "ALIVE"
+                ]
+                member_districts = {t.district for t in subj_tributes}
+                recs = [
+                    record_by_district[d]
+                    for d in sorted(member_districts) if d in record_by_district
+                ]
+            subjects.append({
+                "subject_label": label,
+                "lore": lore_text,
+                "markets": [{"id": m.id, "label": m.label, "odds": m.odds} for m in ms],
+                "tributes": [_tribute_payload(t) for t in subj_tributes],
+                "district_records": [_district_record_payload(dr) for dr in recs],
+                "target_tier": tiers[idx % len(tiers)],
+            })
+
+        if not subjects:
+            log.debug("No subjects with >= 3 open markets; skipping AI parlays")
+            return 0
+
+        suggestions = await generate_ai_parlays_for_subjects(
             client,
-            lore=lore_text,
-            markets=[{"id": m.id, "label": m.label, "odds": m.odds} for m in open_markets],
-            tributes=[
-                {
-                    "district": t.district,
-                    "name": t.name,
-                    "gender": t.display_gender,
-                    "age": t.age,
-                    "kills": t.kills,
-                    "training_score": t.training_score,
-                    "times_played": t.times_played,
-                    "debilitation_level": t.debilitation_level,
-                }
-                for t in alive_tributes
-            ],
-            district_records=[
-                {
-                    "district": dr.district,
-                    "reputation": dr.reputation,
-                    "funding_level": dr.funding_level,
-                    "wins": dr.wins,
-                    "avg_placement": dr.avg_placement,
-                    "avg_placement_last5": dr.avg_placement_last5,
-                    "top8_finishes": dr.top8_finishes,
-                    "top5_finishes": dr.top5_finishes,
-                    "total_kills": dr.total_kills,
-                    "bloodbath_kills": dr.bloodbath_kills,
-                    "kill_record": dr.kill_record,
-                    "avg_training_score": dr.avg_training_score,
-                }
-                for dr in district_records
-            ],
-            count=count,
+            subjects,
+            limit=count,
             num_ctx=_cfg.LEMONADE_CTX_SIZE,
             timeout=_cfg.LEMONADE_TIMEOUT,
         )
@@ -2219,10 +2335,22 @@ async def _try_generate_ai_parlays(
         await session.flush()
 
         market_odds = {m.id: m.odds for m in open_markets}
+        market_by_id = {m.id: m for m in open_markets}
+        created = 0
         for sug in suggestions:
-            # Label by the parlay's true combined odds, not the AI's self-reported tier.
-            leg_odds = [market_odds[mid] for mid in sug["market_ids"] if mid in market_odds]
-            tier = classify_parlay_tier(combined_american(leg_odds)) if leg_odds else sug["tier"]
+            # Drop contradictory legs (e.g. over + under of the same prop) before
+            # anything else, since it changes the leg set and combined odds.
+            leg_ids = _filter_conflicting_legs(sug["market_ids"], market_by_id)
+            if len(leg_ids) < 2:
+                log.warning(
+                    "Parlay '%s' has fewer than 2 legs after conflict filtering; skipping",
+                    sug.get("name"),
+                )
+                continue
+            # Tier is assigned in code from true combined odds — the model is
+            # never trusted to do the odds arithmetic.
+            leg_odds = [market_odds[mid] for mid in leg_ids if mid in market_odds]
+            tier = classify_parlay_tier(combined_american(leg_odds)) if leg_odds else "BALANCED"
             tpl = ParlayTemplate(
                 name=sug["name"],
                 description=sug["description"],
@@ -2233,13 +2361,14 @@ async def _try_generate_ai_parlays(
             )
             session.add(tpl)
             await session.flush()
-            for order, mid in enumerate(sug["market_ids"]):
+            for order, mid in enumerate(leg_ids):
                 session.add(ParlayTemplateLeg(
                     template_id=tpl.id, market_id=mid, sort_order=order,
                 ))
+            created += 1
 
-        log.info("AI generated %d featured parlay(s) via Lemonade", len(suggestions))
-        return len(suggestions)
+        log.info("AI generated %d featured parlay(s) via Lemonade", created)
+        return created
 
     except Exception:
         log.exception("AI parlay generation failed; caller may fall back to algorithmic")

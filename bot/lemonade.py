@@ -72,46 +72,73 @@ class LemonadeClient:
         num_ctx: int = 0,
         json_mode: bool = False,
         timeout: float = 600.0,
+        http: httpx.AsyncClient | None = None,
         _retries: int = 2,
     ) -> str:
         """Send a chat completion request; return the assistant's reply text.
 
         num_ctx: override the model's context window (llama-server extension).
                  0 means use the server default.
+        http:    reuse a caller-owned AsyncClient (e.g. when fanning out many
+                 requests in parallel). When None, a client is created and
+                 closed for this single call.
         """
-        async with httpx.AsyncClient(timeout=timeout) as http:
-            model = await self._resolve_model(http)
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            if num_ctx:
-                payload["num_ctx"] = num_ctx
-            if json_mode:
-                payload["response_format"] = {"type": "json_object"}
+        if http is not None:
+            return await self._chat_complete(
+                http, messages,
+                temperature=temperature, max_tokens=max_tokens,
+                num_ctx=num_ctx, json_mode=json_mode, _retries=_retries,
+            )
+        async with httpx.AsyncClient(timeout=timeout) as owned_http:
+            return await self._chat_complete(
+                owned_http, messages,
+                temperature=temperature, max_tokens=max_tokens,
+                num_ctx=num_ctx, json_mode=json_mode, _retries=_retries,
+            )
 
-            for attempt in range(_retries + 1):
-                resp = await http.post(
-                    f"{self.base_url}/v1/chat/completions",
-                    json=payload,
+    async def _chat_complete(
+        self,
+        http: httpx.AsyncClient,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        num_ctx: int,
+        json_mode: bool,
+        _retries: int,
+    ) -> str:
+        model = await self._resolve_model(http)
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if num_ctx:
+            payload["num_ctx"] = num_ctx
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        for attempt in range(_retries + 1):
+            resp = await http.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+            )
+            if resp.status_code in (400, 503) and attempt < _retries:
+                log.warning(
+                    "Lemonade %s (attempt %d/%d): %s — retrying in 5s",
+                    resp.status_code, attempt + 1, _retries + 1, resp.text[:200],
                 )
-                if resp.status_code in (400, 503) and attempt < _retries:
-                    log.warning(
-                        "Lemonade %s (attempt %d/%d): %s — retrying in 5s",
-                        resp.status_code, attempt + 1, _retries + 1, resp.text[:200],
-                    )
-                    # Clear cached model so next attempt re-checks hot status
-                    self._resolved_model = None
-                    await asyncio.sleep(5)
-                    model = await self._resolve_model(http)
-                    payload["model"] = model
-                    continue
-                if not resp.is_success:
-                    log.error("Lemonade %s: %s", resp.status_code, resp.text[:500])
-                resp.raise_for_status()
-                break
+                # Clear cached model so next attempt re-checks hot status
+                self._resolved_model = None
+                await asyncio.sleep(5)
+                model = await self._resolve_model(http)
+                payload["model"] = model
+                continue
+            if not resp.is_success:
+                log.error("Lemonade %s: %s", resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+            break
 
         content = resp.json()["choices"][0]["message"]["content"] or ""
         log.debug("Lemonade raw response: %s", content[:500])
@@ -236,14 +263,22 @@ Respond as a JSON array (no other text):
 _MAX_MARKETS = 35
 _MAX_LORE_CHARS = 2000
 
+# Scoped per-subject path: keep each prompt small so it fits a modest server
+# context window and runs fast.  One subject needs only a handful of legs, so a
+# tight market cap and shorter lore slice cost nothing in quality.
+_SUBJECT_MAX_MARKETS = 20
+_SUBJECT_MAX_LORE_CHARS = 1000
 
-def _select_markets(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return up to _MAX_MARKETS markets, preferring competitive (near-zero) odds."""
-    if len(markets) <= _MAX_MARKETS:
+
+def _select_markets(
+    markets: list[dict[str, Any]], limit: int = _MAX_MARKETS
+) -> list[dict[str, Any]]:
+    """Return up to ``limit`` markets, preferring competitive (near-zero) odds."""
+    if len(markets) <= limit:
         return markets
     # Sort by closeness to 0 (most competitive odds first) to give the model
     # the most decision-relevant markets when we have to truncate.
-    return sorted(markets, key=lambda m: abs(m["odds"]))[:_MAX_MARKETS]
+    return sorted(markets, key=lambda m: abs(m["odds"]))[:limit]
 
 
 def _build_market_lines(markets: list[dict[str, Any]]) -> str:
@@ -415,3 +450,218 @@ async def generate_ai_parlays(
         })
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Scoped per-subject generation
+# ---------------------------------------------------------------------------
+#
+# The batch helper above asks one model call to partition all markets, dedupe
+# districts, count legs, and target odds tiers — reasoning small local models
+# do unreliably.  The scoped path instead does the hard constraints in Python
+# (the caller pre-bundles one subject's markets and picks distinct subjects),
+# then asks the model only for what it is good at: choosing legs from a small
+# bounded list and writing persuasive copy.  Coherence ("legs that go
+# together") is guaranteed by construction because each call only ever sees one
+# subject's markets.  Calls are independent, so they run in parallel.
+
+_SUBJECT_SYSTEM = """\
+You are a Panem Sportsbook analyst for the Hunger Games universe. You are given
+ONE subject (a single district or alliance): its lore, its historical stats,
+its tributes, and the LIST OF MARKETS that belong to it. Build exactly ONE
+coherent parlay using ONLY those markets, and write a pitch that makes a bettor
+want to tail it.
+
+Rules:
+- Use ONLY the market IDs from the provided list. Every leg is about this one
+  subject — you cannot reference any other district or tribute.
+- Pick 3 to 6 legs that tell a single, connected story.
+- Direction accuracy: only say you are "backing", "riding", or "on" a tribute
+  if EVERY leg bets in their favour. If a leg pits two tributes against each
+  other (e.g. "D4F places higher than D4M"), you are backing ONE tribute OVER
+  the other — never claim you back both. The description must match the real
+  direction of every leg.
+- Write like a sharp analyst selling a pick: a hook (why this angle is
+  compelling), one or two specific stats or lore facts as EVIDENCE, then a
+  punchy closer. Vary your sentence rhythm; do not just list the data.
+- Aim the parlay's risk level at: {target_tier}. SAFE = favour proven
+  favourites and shorter-priced legs. LONGSHOT = embrace underdog lore and
+  longer-priced legs. BALANCED = a mix. This is guidance, not a hard rule.
+
+Respond with a SINGLE JSON object only — no markdown fences, no prose outside
+the JSON:
+{{"name": "short evocative title, max 60 chars",
+  "description": "2-3 sentences, max 280 chars: hook -> evidence -> closer",
+  "market_ids": [integer IDs from the list above]}}
+"""
+
+_SUBJECT_USER_TMPL = """\
+=== SUBJECT ===
+{subject_label}
+
+=== LORE ===
+{lore}
+
+=== HISTORICAL STATS ===
+Format: D# | rep=1-5(1=best) | funding | wins | avg_place | last5_place | top8 | top5 | kills | bb_kills | kill_rec | avg_ts
+{district_records}
+
+=== TRIBUTES ===
+Format: D# | name | gender | age | kills | training_score | vet/rookie | debilitation
+{tributes}
+
+=== MARKETS FOR THIS SUBJECT (ID: label | odds) ===
+{markets}
+
+=== TASK ===
+Build one {target_tier}-leaning parlay for {subject_label} using 3-6 of the
+markets above. Return the single JSON object described in the system message.
+"""
+
+
+def _parse_subject_parlay(
+    raw: str, valid_ids: set[int], *, subject_label: str
+) -> dict[str, Any] | None:
+    """Parse one scoped parlay object; return None if it is unusable."""
+    try:
+        data = _extract_json(raw)
+    except (json.JSONDecodeError, ValueError):
+        log.warning("Lemonade subject '%s' returned non-JSON: %s", subject_label, raw[:200])
+        return None
+    # json_mode yields an object; tolerate a stray one-element array too.
+    if isinstance(data, list):
+        data = next((x for x in data if isinstance(x, dict)), None)
+    if not isinstance(data, dict):
+        return None
+    mids: list[int] = []
+    for mid in data.get("market_ids", []):
+        try:
+            mid_i = int(mid)
+        except (TypeError, ValueError):
+            continue
+        if mid_i in valid_ids and mid_i not in mids:
+            mids.append(mid_i)
+    if len(mids) < 3:
+        log.warning(
+            "Lemonade subject '%s' parlay has too few valid legs (%d); skipping",
+            subject_label, len(mids),
+        )
+        return None
+    return {
+        "name": str(data.get("name", "AI Parlay"))[:100],
+        "description": str(data.get("description", ""))[:500],
+        "market_ids": mids[:6],
+        "subject_label": subject_label,
+    }
+
+
+async def generate_ai_parlay_for_subject(
+    client: LemonadeClient,
+    *,
+    subject_label: str,
+    lore: str,
+    markets: list[dict[str, Any]],
+    tributes: list[dict[str, Any]],
+    district_records: list[dict[str, Any]] | None = None,
+    target_tier: str = "BALANCED",
+    http: httpx.AsyncClient | None = None,
+    num_ctx: int = 0,
+    timeout: float = 600.0,
+    _retries: int = 1,
+) -> dict[str, Any] | None:
+    """Generate one coherent parlay scoped to a single pre-bundled subject.
+
+    ``markets`` must already be limited to this subject's markets — the model is
+    told to pick only from them, so coherence is guaranteed.  Returns a dict with
+    keys name, description, market_ids, subject_label, or None if the model
+    returns nothing usable after ``_retries`` extra attempts.
+    """
+    truncated_lore = lore[:_SUBJECT_MAX_LORE_CHARS]
+    if len(lore) > _SUBJECT_MAX_LORE_CHARS:
+        truncated_lore = truncated_lore.rsplit(" ", 1)[0] + " [...]"
+    # Cap the market list so one subject's prompt stays small (fits a modest
+    # server context window, generates faster).  The model may only pick from
+    # the markets it is shown, so valid_ids is built from the capped set.
+    shown_markets = _select_markets(markets, _SUBJECT_MAX_MARKETS)
+    system = _SUBJECT_SYSTEM.format(target_tier=target_tier)
+    user_msg = _SUBJECT_USER_TMPL.format(
+        subject_label=subject_label,
+        lore=truncated_lore,
+        district_records=_build_district_record_lines(district_records or []),
+        tributes=_build_tribute_lines(tributes),
+        markets=_build_market_lines(shown_markets),
+        target_tier=target_tier,
+    )
+    valid_ids = {m["id"] for m in shown_markets}
+
+    for attempt in range(_retries + 1):
+        try:
+            raw = await client.chat_complete(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.8,
+                max_tokens=1024,
+                num_ctx=num_ctx,
+                json_mode=True,
+                timeout=timeout,
+                http=http,
+            )
+        except Exception:
+            log.exception("Lemonade call failed for subject '%s'", subject_label)
+            return None
+        parlay = _parse_subject_parlay(raw, valid_ids, subject_label=subject_label)
+        if parlay is not None:
+            return parlay
+        if attempt < _retries:
+            log.info("Retrying subject '%s' (attempt %d)", subject_label, attempt + 2)
+    return None
+
+
+async def generate_ai_parlays_for_subjects(
+    client: LemonadeClient,
+    subjects: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    num_ctx: int = 0,
+    timeout: float = 600.0,
+    max_concurrency: int = 2,
+) -> list[dict[str, Any]]:
+    """Generate one parlay per subject in parallel over a shared HTTP client.
+
+    Each entry in ``subjects`` is a dict with keys: subject_label, lore, markets,
+    tributes, district_records, target_tier.  Failed subjects are dropped.  When
+    ``limit`` is set, at most that many successful parlays are returned, in the
+    order the subjects were supplied (so callers can over-provision subjects to
+    absorb individual failures).
+
+    ``max_concurrency`` caps in-flight requests so we don't exceed a local
+    llama-server's parallel slots — excess subjects queue rather than error.
+    """
+    if not subjects:
+        return []
+    sem = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def _run(s: dict[str, Any], http: httpx.AsyncClient) -> dict[str, Any] | None:
+        async with sem:
+            return await generate_ai_parlay_for_subject(
+                client,
+                subject_label=s["subject_label"],
+                lore=s.get("lore", ""),
+                markets=s["markets"],
+                tributes=s.get("tributes", []),
+                district_records=s.get("district_records", []),
+                target_tier=s.get("target_tier", "BALANCED"),
+                http=http,
+                num_ctx=num_ctx,
+                timeout=timeout,
+            )
+
+    async with httpx.AsyncClient(timeout=timeout) as http:
+        results = await asyncio.gather(*(_run(s, http) for s in subjects))
+
+    parlays = [p for p in results if p is not None]
+    if limit is not None:
+        parlays = parlays[:limit]
+    return parlays
