@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import random
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -2180,17 +2181,95 @@ def _tribute_payload(t) -> dict:
     }
 
 
-def _filter_conflicting_legs(market_ids, market_by_id):
-    """Drop legs that contradict another leg already in the parlay.
+# Distinct narrative angles seeded into each subject's prompt so parlays don't
+# all converge on the same theme/title. One is assigned per subject per run.
+_PARLAY_ANGLES = [
+    "raw aggression and kill totals",
+    "surviving the bloodbath and grinding deep into the games",
+    "training-score pedigree and Career-style polish",
+    "underdog defiance against long odds",
+    "finishing position and a high placement ceiling",
+    "coordinated alliance muscle",
+    "late-game endurance into the final 8 and final 5",
+    "early separation and bloodbath chaos",
+    "a district's historical dynasty reasserting itself",
+    "momentum from current form and standout tributes",
+]
 
-    Currently guards against over/under conflicts: a parlay must not contain
-    both the OVER and the UNDER of the same market type for the same tribute
-    (e.g. "over 0.5 kills" and "under 0.5 kills" on the same tribute), which
-    could never both win.  The first-selected side of each such prop is kept and
-    any opposite-side leg is removed.  Order is preserved.
+# Market types whose outcome is unambiguously GOOD for the subject tribute /
+# district / alliance (they advance, survive, win, out-perform).
+_POS_MARKET_TYPES = {
+    "TRIBUTE_WINS", "TRIBUTE_TOP_N", "TRIBUTE_RUNNER_UP", "HIGHEST_TRAINING_SCORE",
+    "TRIBUTE_KILLS", "KILL_EVENT", "FIRST_BLOOD", "BLOODBATH_SURVIVOR",
+    "MAKES_FINAL_8", "MAKES_FINAL_5", "PARTNER_SCORE_HIGHER", "PARTNER_PLACE_HIGHER",
+    "DISTRICT_VICTOR", "DISTRICT_HIGHEST_SCORE", "DISTRICT_BOTH_BLOODBATH",
+    "DISTRICT_BOTH_FINAL_8", "DISTRICT_ONE_FINAL_8", "DISTRICT_BOTH_FINAL_5",
+    "DISTRICT_ONE_FINAL_5", "ALLIANCE_VICTOR", "ALLIANCE_ALL_BLOODBATH",
+    "ALLIANCE_ALL_FINAL_8", "ALLIANCE_ONE_FINAL_8", "ALLIANCE_ALL_FINAL_5",
+    "ALLIANCE_ONE_FINAL_5", "ALLIANCE_MOST_KILLS", "ALLIANCE_RUNNER_UP",
+}
+# Market types whose outcome is unambiguously BAD for the subject (they die,
+# are eliminated, get wiped, under-perform).
+_NEG_MARKET_TYPES = {
+    "FIRST_TRIBUTE_TO_DIE", "LOWEST_TRAINING_SCORE", "DEATH_CAUSE",
+    "TRIBUTE_KILLED_BLOODBATH", "FIRST_IN_ALLIANCE_DEATH", "MISSES_FINAL_8",
+    "MISSES_FINAL_5", "PARTNER_SCORE_LOWER", "PARTNER_PLACE_LOWER",
+    "FIRST_DISTRICT_WIPE", "DISTRICT_WIPED_BLOODBATH", "ALLIANCE_WIPED_BLOODBATH",
+    "FIRST_ALLIANCE_WIPED",
+}
+# Over/Under types where OVER is the "doing well" side (more kills, higher score).
+_OU_OVER_IS_GOOD = {"KILLS_OU", "DISTRICT_KILLS_OU", "ALLIANCE_KILLS_OU", "TRAINING_SCORE_OU"}
+
+
+def _market_polarity(m, subject_district, tribute_by_id) -> str:
+    """Classify a market as "POS", "NEG", or "NEUTRAL" for the subject.
+
+    POS  = pays out when the subject does well (survives, advances, out-kills).
+    NEG  = pays out when the subject does poorly (dies, is eliminated, wiped).
+    NEUTRAL = game/arena props or exact-value bets with no clear direction.
+
+    For head-to-head markets (e.g. "A kills B") the base polarity is from
+    tribute_a's perspective; when the subject district is on the B side, it is
+    inverted so "A kills B" reads as NEG for B's parlay.
+    """
+    t = m.type
+    if t in _POS_MARKET_TYPES:
+        base = "POS"
+    elif t in _NEG_MARKET_TYPES:
+        base = "NEG"
+    elif t in _OU_OVER_IS_GOOD:
+        base = "POS" if m.ou_side == "OVER" else "NEG" if m.ou_side == "UNDER" else "NEUTRAL"
+    elif t == "PLACEMENT_OU":  # lower placement number is better
+        base = "POS" if m.ou_side == "UNDER" else "NEG" if m.ou_side == "OVER" else "NEUTRAL"
+    elif t == "TRIBUTE_PLACEMENT":  # exact finish; top-8 is good
+        base = "POS" if (m.placement_num or 99) <= 8 else "NEG"
+    else:
+        base = "NEUTRAL"
+
+    if base in ("POS", "NEG") and subject_district is not None and m.tribute_a_id and m.tribute_b_id:
+        ta = tribute_by_id.get(m.tribute_a_id)
+        tb = tribute_by_id.get(m.tribute_b_id)
+        if ta and tb and tb.district == subject_district and ta.district != subject_district:
+            base = "NEG" if base == "POS" else "POS"
+    return base
+
+
+def _refine_parlay_legs(market_ids, market_by_id):
+    """Clean a selected leg set so the parlay is internally consistent.
+
+    - Over/under guard: never keep both the OVER and UNDER of the same market
+      type for the same tribute (e.g. "over 0.5 kills" and "under 0.5 kills"),
+      which could never both win. First-selected side wins.
+    - Variety cap: at most two legs of the same market type, so a parlay isn't
+      three near-identical bets (e.g. three "Survives the Bloodbath").
+
+    Order is preserved. Directional consistency (no "dies"/"eliminated" legs in a
+    backing parlay) is handled upstream by filtering candidates to non-NEG
+    polarity, so this only tidies what's left.
     """
     kept: list[int] = []
     seen_side: dict[tuple, str] = {}
+    type_counts: dict[str, int] = {}
     for mid in market_ids:
         m = market_by_id.get(mid)
         if m is None:
@@ -2199,12 +2278,13 @@ def _filter_conflicting_legs(market_ids, market_by_id):
             key = (m.type, m.tribute_a_id, m.tribute_b_id)
             prev = seen_side.get(key)
             if prev is not None and prev != m.ou_side:
-                log.debug(
-                    "Dropping leg %d (%s %s): conflicts with existing %s side for %s",
-                    mid, m.type, m.ou_side, prev, key,
-                )
+                log.debug("Dropping leg %d: over/under conflict for %s", mid, key)
                 continue
             seen_side.setdefault(key, m.ou_side)
+        if type_counts.get(m.type, 0) >= 2:
+            log.debug("Dropping leg %d: already 2 legs of type %s", mid, m.type)
+            continue
+        type_counts[m.type] = type_counts.get(m.type, 0) + 1
         kept.append(mid)
     return kept
 
@@ -2273,18 +2353,39 @@ async def _try_generate_ai_parlays(
             a.id: a for a in (await session.execute(select(Alliance))).scalars().all()
         }
 
-        # Hard constraints in Python: bundle each market to its subject, keep
-        # only subjects with >= 3 markets, and pick DISTINCT subjects up front so
-        # the model never has to count, dedupe districts, or partition markets.
+        # Hard constraints in Python: bundle each market to its subject, then
+        # keep only "backing" markets (drop NEG-polarity legs like dies /
+        # eliminated / places-poorly) so a positively-themed parlay can never
+        # include a leg that pays out when the subject fails.
         bundles = _bundle_markets_by_subject(open_markets, tribute_by_id)
-        eligible = [(k, ms) for k, ms in bundles.items() if len(ms) >= 3]
-        # Richer subjects first (more markets = more story), then most competitive.
-        eligible.sort(key=lambda kv: (-len(kv[1]), sum(abs(m.odds) for m in kv[1])))
+        pos_bundles: dict[tuple[str, int], list] = {}
+        for (kind, ident), ms in bundles.items():
+            subj_district = ident if kind == "D" else None
+            kept = [
+                m for m in ms
+                if _market_polarity(m, subj_district, tribute_by_id) != "NEG"
+            ]
+            if len(kept) >= 3:
+                pos_bundles[(kind, ident)] = kept
+
+        # Rank by richness, then randomise within the strong pool so different
+        # subjects get featured each run instead of the same districts every time.
+        eligible = sorted(
+            pos_bundles.items(),
+            key=lambda kv: (-len(kv[1]), sum(abs(m.odds) for m in kv[1])),
+        )
+        pool = eligible[: max(count * 3, count + 4)]
+        random.shuffle(pool)
+        # Distinct narrative angle per subject so themes, titles, and market-type
+        # mixes diverge (the model otherwise converges on "Silent Ascent").
+        angles = _PARLAY_ANGLES.copy()
+        random.shuffle(angles)
 
         tiers = ["SAFE", "BALANCED", "LONGSHOT"]
+        random.shuffle(tiers)
         subjects: list[dict] = []
         # Over-provision subjects so a few model failures don't starve the batch.
-        for idx, (key, ms) in enumerate(eligible[: count + 3]):
+        for idx, (key, ms) in enumerate(pool[: count + 3]):
             kind, ident = key
             if kind == "D":
                 label = f"District {ident}"
@@ -2309,6 +2410,7 @@ async def _try_generate_ai_parlays(
                 "tributes": [_tribute_payload(t) for t in subj_tributes],
                 "district_records": [_district_record_payload(dr) for dr in recs],
                 "target_tier": tiers[idx % len(tiers)],
+                "angle": angles[idx % len(angles)],
             })
 
         if not subjects:
@@ -2338,9 +2440,9 @@ async def _try_generate_ai_parlays(
         market_by_id = {m.id: m for m in open_markets}
         created = 0
         for sug in suggestions:
-            # Drop contradictory legs (e.g. over + under of the same prop) before
-            # anything else, since it changes the leg set and combined odds.
-            leg_ids = _filter_conflicting_legs(sug["market_ids"], market_by_id)
+            # Tidy the leg set (over/under conflicts, market-type variety cap)
+            # before anything else, since it changes the legs and combined odds.
+            leg_ids = _refine_parlay_legs(sug["market_ids"], market_by_id)
             if len(leg_ids) < 2:
                 log.warning(
                     "Parlay '%s' has fewer than 2 legs after conflict filtering; skipping",

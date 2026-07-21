@@ -472,15 +472,21 @@ its tributes, and the LIST OF MARKETS that belong to it. Build exactly ONE
 coherent parlay using ONLY those markets, and write a pitch that makes a bettor
 want to tail it.
 
+Every market you are given already pays out when this subject does WELL, so you
+are always BACKING them to succeed — write with that confidence.
+
 Rules:
 - Use ONLY the market IDs from the provided list. Every leg is about this one
   subject — you cannot reference any other district or tribute.
-- Pick 3 to 6 legs that tell a single, connected story.
-- Direction accuracy: only say you are "backing", "riding", or "on" a tribute
-  if EVERY leg bets in their favour. If a leg pits two tributes against each
-  other (e.g. "D4F places higher than D4M"), you are backing ONE tribute OVER
-  the other — never claim you back both. The description must match the real
-  direction of every leg.
+- Pick 3 to 6 legs that tell a single, connected story, all pulling in the same
+  direction (the subject thriving). Never frame it as the subject failing.
+- VARIETY: prefer legs of DIFFERENT market types (mix survival, advancement,
+  kills, placement, training). Do not stack three near-identical bets.
+- Frame the whole parlay around THIS angle: {angle}. Let that angle drive both
+  which legs you pick and how you pitch it.
+- ORIGINAL NAME: give it a distinctive, specific title tied to the angle and the
+  actual tributes/district. Do NOT reuse generic templates — avoid the words
+  "Silent", "Ascent", "Domination", "Triumph", and "Reign".
 - Write like a sharp analyst selling a pick: a hook (why this angle is
   compelling), one or two specific stats or lore facts as EVIDENCE, then a
   punchy closer. Vary your sentence rhythm; do not just list the data.
@@ -499,6 +505,9 @@ _SUBJECT_USER_TMPL = """\
 === SUBJECT ===
 {subject_label}
 
+=== ANGLE FOR THIS PARLAY ===
+{angle}
+
 === LORE ===
 {lore}
 
@@ -514,8 +523,9 @@ Format: D# | name | gender | age | kills | training_score | vet/rookie | debilit
 {markets}
 
 === TASK ===
-Build one {target_tier}-leaning parlay for {subject_label} using 3-6 of the
-markets above. Return the single JSON object described in the system message.
+Build one {target_tier}-leaning parlay for {subject_label}, framed around the
+angle above, using 3-6 of the markets. Mix market types and give it an original
+title. Return the single JSON object described in the system message.
 """
 
 
@@ -564,6 +574,7 @@ async def generate_ai_parlay_for_subject(
     tributes: list[dict[str, Any]],
     district_records: list[dict[str, Any]] | None = None,
     target_tier: str = "BALANCED",
+    angle: str = "",
     http: httpx.AsyncClient | None = None,
     num_ctx: int = 0,
     timeout: float = 600.0,
@@ -583,9 +594,11 @@ async def generate_ai_parlay_for_subject(
     # server context window, generates faster).  The model may only pick from
     # the markets it is shown, so valid_ids is built from the capped set.
     shown_markets = _select_markets(markets, _SUBJECT_MAX_MARKETS)
-    system = _SUBJECT_SYSTEM.format(target_tier=target_tier)
+    angle_text = angle or "the subject's standout strengths this season"
+    system = _SUBJECT_SYSTEM.format(target_tier=target_tier, angle=angle_text)
     user_msg = _SUBJECT_USER_TMPL.format(
         subject_label=subject_label,
+        angle=angle_text,
         lore=truncated_lore,
         district_records=_build_district_record_lines(district_records or []),
         tributes=_build_tribute_lines(tributes),
@@ -653,6 +666,7 @@ async def generate_ai_parlays_for_subjects(
                 tributes=s.get("tributes", []),
                 district_records=s.get("district_records", []),
                 target_tier=s.get("target_tier", "BALANCED"),
+                angle=s.get("angle", ""),
                 http=http,
                 num_ctx=num_ctx,
                 timeout=timeout,
