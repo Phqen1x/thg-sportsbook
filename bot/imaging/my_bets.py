@@ -250,20 +250,72 @@ def render_my_bets(
     return buf
 
 
+def _wrap_lines(draw, text, font, max_width, max_lines):
+    """Word-wrap ``text`` to fit ``max_width`` px, capped at ``max_lines``.
+
+    Measures with the actual font so it never hard-clips mid-word.  When the text
+    is longer than fits, the last kept line ends in an ellipsis so the reader can
+    tell it was trimmed rather than cut off arbitrarily.
+    """
+    words = (text or "").split()
+    lines: list[str] = []
+    cur = ""
+    i = 0
+    while i < len(words) and len(lines) < max_lines:
+        trial = f"{cur} {words[i]}".strip()
+        if draw.textlength(trial, font=font) <= max_width:
+            cur = trial
+            i += 1
+        elif not cur:  # single word wider than the line: place it anyway
+            cur = words[i]
+            i += 1
+            lines.append(cur)
+            cur = ""
+        else:
+            lines.append(cur)
+            cur = ""
+    if cur and len(lines) < max_lines:
+        lines.append(cur)
+        cur = ""
+    if (i < len(words) or cur) and lines:
+        last = lines[-1]
+        while last and draw.textlength(last + "…", font=font) > max_width:
+            last = last[:-1].rstrip()
+        lines[-1] = last + "…"
+    return lines
+
+
+TAIL_BOARD_PER_PAGE = 5
+
+
 def render_tail_board(
     featured: list[dict],
     member: list[dict],
+    page: int = 0,
+    per_page: int = TAIL_BOARD_PER_PAGE,
 ) -> io.BytesIO:
-    """Render a preview board of all available parlays to tail."""
+    """Render a preview board of tailable parlays, at most ``per_page`` per page.
+
+    ``featured`` and ``member`` are concatenated and sliced to ``page`` so the
+    board image never lists more than ``per_page`` parlays; callers page through
+    the rest with navigation buttons.  A "PAGE x / y" indicator is drawn in the
+    footer whenever there is more than one page.
+    """
     theme = get_active_theme()
     c = theme.colors
 
     # Convert tail dictionaries to ParlayData for rendering
     parlay_data: list[ParlayData] = []
-    
-    # Combined list for indexing
-    all_entries = featured + member
-    
+
+    # Concatenate, then slice down to the requested page so the board never shows
+    # more than per_page parlays at once.
+    combined = featured + member
+    per_page = max(1, per_page)
+    total_pages = max(1, -(-len(combined) // per_page))
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    all_entries = combined[start:start + per_page]
+
     for i, e in enumerate(all_entries):
         legs = [
             BetRowData(0, lbl, 0, odds, 0, "OPEN")
@@ -279,12 +331,26 @@ def render_tail_board(
         )
         parlay_data.append(p_data)
 
-    SUB_ROW_H = 26
+    # Description ("sub") wraps to at most two lines, measured against the card
+    # width so it is never hard-clipped mid-word (a trailing … marks overflow).
+    sub_font = rajdhani(13)
+    SUB_LINE_H = 17
+    SUB_PAD_V = 10
+    MAX_SUB_LINES = 2
+    sub_max_w = WIDTH - (PAD + 14) - PAD
+    _measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    sub_lines_by_idx = [
+        _wrap_lines(_measure, all_entries[idx]["sub"], sub_font, sub_max_w, MAX_SUB_LINES)
+        for idx in range(len(parlay_data))
+    ]
+
+    def _sub_block_h(lines: list[str]) -> int:
+        return len(lines) * SUB_LINE_H + SUB_PAD_V if lines else 0
 
     h = HEADER_H + SECTION_LABEL_H + PAD
     for idx, p in enumerate(parlay_data):
-        sub = all_entries[idx]["sub"]
-        h += PARLAY_HEADER_H + 2 + (SUB_ROW_H if sub else 0) + len(p.legs) * LEG_ROW_H + PARLAY_FOOTER_H + PAD
+        h += (PARLAY_HEADER_H + 2 + _sub_block_h(sub_lines_by_idx[idx])
+              + len(p.legs) * LEG_ROW_H + PARLAY_FOOTER_H + PAD)
     h += FOOTER_H + PAD
 
     img = Image.new("RGBA", (WIDTH, h), c["bg"])
@@ -309,7 +375,6 @@ def render_tail_board(
     for idx, p in enumerate(parlay_data):
         sc = status_color("WON", c) if p.status in ("SAFE", "BALANCED", "LONGSHOT") else c["text_gold"]
         display_name = all_entries[idx]["name"]
-        sub = all_entries[idx]["sub"]
 
         draw_rounded_rect(draw, (PAD, cur_y, WIDTH - PAD, cur_y + PARLAY_HEADER_H), 8,
                           fill=c["header_dark"],
@@ -329,10 +394,13 @@ def render_tail_board(
 
         y_leg = cur_y + PARLAY_HEADER_H + 2
 
-        if sub:
-            draw.rectangle((PAD, y_leg, WIDTH - PAD, y_leg + SUB_ROW_H - 1), fill=c["bg_mid"])
-            draw.text((PAD + 14, y_leg + 5), sub[:110], font=rajdhani(13), fill=c["text_dim"])
-            y_leg += SUB_ROW_H
+        sub_lines = sub_lines_by_idx[idx]
+        if sub_lines:
+            sub_h = _sub_block_h(sub_lines)
+            draw.rectangle((PAD, y_leg, WIDTH - PAD, y_leg + sub_h - 1), fill=c["bg_mid"])
+            for li, line in enumerate(sub_lines):
+                draw.text((PAD + 14, y_leg + 5 + li * SUB_LINE_H), line, font=sub_font, fill=c["text_dim"])
+            y_leg += sub_h
         leg_font = rajdhani(14)
         odds_font = rajdhani_bold(14)
         for i, leg in enumerate(p.legs):
@@ -359,7 +427,15 @@ def render_tail_board(
     # Footer
     draw.rectangle((0, h - FOOTER_H, WIDTH, h), fill=c["header_dark"])
     draw.rectangle((0, h - FOOTER_H, WIDTH, h - FOOTER_H + 3), fill=c["card_border"])
-    draw_text_centered(draw, "USE /parlay tail TO BROWSE AND BET", rajdhani_bold(14), c["text_dim"], WIDTH // 2, h - FOOTER_H + 18)
+    footer_text = (
+        "USE ◀ ▶ TO CHANGE PAGE · TAP A PARLAY TO BET"
+        if total_pages > 1
+        else "USE /parlay tail TO BROWSE AND BET"
+    )
+    draw_text_centered(draw, footer_text, rajdhani_bold(14), c["text_dim"], WIDTH // 2, h - FOOTER_H + 18)
+    if total_pages > 1:
+        draw_text_right(draw, f"PAGE {page + 1} / {total_pages}", rajdhani_bold(14),
+                        c["header_gold"], WIDTH - PAD - 10, h - FOOTER_H + 18)
 
     theme.draw_fg(img, WIDTH, h)
 

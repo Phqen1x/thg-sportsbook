@@ -62,6 +62,10 @@ class Tribute(Base):
     # highest_placement = best finish across all prior games (2–24; lower is better).
     times_played: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     highest_placement: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Kills scored specifically while the Bloodbath phase was active (subset of
+    # `kills`), used to resolve BLOODBATH_KILLS_OU / ANY_BB_DOUBLE_KILL correctly
+    # regardless of when the admin actually triggers the Bloodbath→Arena transition.
+    bloodbath_kills: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     @property
@@ -126,13 +130,26 @@ class Parlay(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Optional member-supplied title, shown on the tail board in place of the
+    # default "{username}'s Parlay #{id}" when set.
+    name: Mapped[str | None] = mapped_column(String(80), nullable=True)
     total_wager: Mapped[int] = mapped_column(Integer, nullable=False)
     total_payout: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(10), default="PENDING", nullable=False)
     cashout_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Per-parlay cashout override, same pattern as Market.cashout_allowed/rate —
+    # NULL defers to the global cashout_allowed/cashout_rate GameSetting.
+    cashout_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    cashout_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     # When True the parlay is listed on the public tailing board so other members
     # can copy it. Members can opt out at submit time; tailed copies default off.
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Set when this parlay was created via the tail board's "Tail & Bet" flow off
+    # another member's public parlay — lets us DM the original poster on resolve.
+    tailed_from_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tailed_from_parlay_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("parlays.id"), nullable=True
+    )
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     legs: Mapped[list["Bet"]] = relationship("Bet", back_populates="parlay")
@@ -311,3 +328,21 @@ class BettingRestriction(Base):
     tribute_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("tributes.id", ondelete="CASCADE"), nullable=True
     )
+
+
+class TributeLock(Base):
+    """A Discord user playing as an in-game Tribute, locked out of all
+    sportsbook interaction (bot commands, the Activity, and the website) to
+    prevent betting on themselves or their own outcome. Distinct from
+    Tribute.discord_user_id, which just links a roster character to a member
+    for flavor/odds purposes (e.g. seniority) and carries no access
+    restriction on its own."""
+    __tablename__ = "tribute_locks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tribute_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("tributes.id", ondelete="SET NULL"), nullable=True
+    )
+    locked_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

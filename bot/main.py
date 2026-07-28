@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot import config
-from bot.database.engine import get_setting, init_db, set_guild_context
+from bot.database.engine import get_read_session, get_setting, get_tribute_lock, init_db, set_guild_context, TRIBUTE_LOCK_MESSAGE
 from bot.imaging.base import get_theme_by_name, set_active_theme
 
 logging.basicConfig(
@@ -19,21 +19,44 @@ logging.basicConfig(
 log = logging.getLogger("capitol")
 
 
+async def _reject_if_tribute_locked(interaction: discord.Interaction) -> bool:
+    """True (and responds) if this interaction's user is locked out as a
+    Tribute — call sites must stop processing the interaction when this
+    returns True. Assumes set_guild_context has already been called."""
+    async with get_read_session() as session:
+        lock = await get_tribute_lock(session, interaction.guild_id or 0, interaction.user.id)
+    if lock is None:
+        return False
+    try:
+        await interaction.response.send_message(TRIBUTE_LOCK_MESSAGE, ephemeral=True)
+    except discord.InteractionResponded:
+        pass
+    except discord.HTTPException:
+        pass
+    return True
+
+
 def _install_component_guild_context() -> None:
     """discord.py routes component (button/select) and modal-submit interactions
     through View/Modal._scheduled_task — NOT through CommandTree.call — so the
     per-guild DB context set in the tree never fires for them and they fall back
     to the contextvar default 0 (sportsbook_0.db). Wrap those task entry points
-    to stamp the guild context in the same task that runs the callback."""
+    to stamp the guild context in the same task that runs the callback — and,
+    while we're already intercepting every component/modal interaction here,
+    also block Tribute-locked users from buttons, selects, and modal submits."""
     _orig_view_task = discord.ui.View._scheduled_task
     _orig_modal_task = discord.ui.Modal._scheduled_task
 
     async def _view_task(self, item, interaction):
         set_guild_context(interaction.guild_id or 0)
+        if await _reject_if_tribute_locked(interaction):
+            return
         return await _orig_view_task(self, item, interaction)
 
     async def _modal_task(self, interaction, *args, **kwargs):
         set_guild_context(interaction.guild_id or 0)
+        if await _reject_if_tribute_locked(interaction):
+            return
         return await _orig_modal_task(self, interaction, *args, **kwargs)
 
     discord.ui.View._scheduled_task = _view_task
@@ -48,6 +71,8 @@ class SportsBookCommandTree(app_commands.CommandTree):
         # that aren't wrapped by the audit decorator. Stamp the per-guild DB
         # context here so they don't fall through to sportsbook_0.db.
         set_guild_context(interaction.guild_id or 0)
+        if await _reject_if_tribute_locked(interaction):
+            return
         await super()._call(interaction)
 
     async def sync(self, *, guild: Optional[discord.abc.Snowflake] = None):

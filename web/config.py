@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(os.environ.get("DOTENV_PATH"))
+load_dotenv(os.environ.get("DOTENV_PATH"), override=True)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 

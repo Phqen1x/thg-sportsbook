@@ -110,7 +110,7 @@
           <div class="market-label">{{ market.label }}</div>
           {% if ta or tb %}
           <div class="text-dim" style="font-size:0.8rem">
-            {% if ta %}{{ ta.name }}{% endif %}{% if tb %} vs {{ tb.name }}{% endif %}
+            {% if ta %}{{ ta.name }}{% endif %}{% if tb %} {{ pair_word(market.type) }} {{ tb.name }}{% endif %}
           </div>
           {% endif %}
         </td>

@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy import select, func, text
 
 from bot import config
-from bot.database.models import Base, BettingPhase, DistrictRecord, GameSetting, MarketTemplate
+from bot.database.models import Base, BettingPhase, DistrictRecord, GameSetting, MarketTemplate, TributeLock
 
 _guild_id_ctx: contextvars.ContextVar[int] = contextvars.ContextVar("guild_id", default=0)
 
@@ -251,6 +251,10 @@ async def _migrate_schema() -> None:
             await conn.execute(text(
                 "ALTER TABLE tributes ADD COLUMN highest_placement INTEGER"
             ))
+        if "bloodbath_kills" not in trib_cols:
+            await conn.execute(text(
+                "ALTER TABLE tributes ADD COLUMN bloodbath_kills INTEGER NOT NULL DEFAULT 0"
+            ))
 
         # Migrate district_records from per-tribute rows to per-district aggregate rows
         rows = await conn.execute(text("PRAGMA table_info(district_records)"))
@@ -420,6 +424,45 @@ async def _migrate_schema() -> None:
             await conn.execute(text(
                 "ALTER TABLE parlays ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT 1"
             ))
+        if parlay_cols and "name" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN name VARCHAR(80)"
+            ))
+        if parlay_cols and "tailed_from_user_id" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN tailed_from_user_id BIGINT"
+            ))
+        if parlay_cols and "tailed_from_parlay_id" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN tailed_from_parlay_id INTEGER "
+                "REFERENCES parlays(id)"
+            ))
+        if parlay_cols and "cashout_allowed" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN cashout_allowed BOOLEAN"
+            ))
+        if parlay_cols and "cashout_rate" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN cashout_rate REAL"
+            ))
+
+        # Move "Sponsors Open" to after Arena (was Pre-Games(0), Bloodbath(1),
+        # Sponsors Open(2), Arena(3), ... — sponsors used to open mid-Bloodbath
+        # instead of once the arena action actually starts). Guarded on the old
+        # ordering so this only runs once per DB.
+        arena_order = (await conn.execute(text(
+            "SELECT sort_order FROM betting_phases WHERE name = 'Arena'"
+        ))).scalar()
+        sponsors_open_order = (await conn.execute(text(
+            "SELECT sort_order FROM betting_phases WHERE name = 'Sponsors Open'"
+        ))).scalar()
+        if arena_order is not None and sponsors_open_order is not None and arena_order > sponsors_open_order:
+            await conn.execute(text(
+                "UPDATE betting_phases SET sort_order = :o WHERE name = 'Arena'"
+            ), {"o": sponsors_open_order})
+            await conn.execute(text(
+                "UPDATE betting_phases SET sort_order = :o WHERE name = 'Sponsors Open'"
+            ), {"o": arena_order})
 
         # ── Multi-server isolation: add guild_id to all user-scoped tables ────────
         # When migrating a guild-specific DB (created by copying sportsbook.db),
@@ -570,7 +613,6 @@ _BUILTIN_MARKET_TYPES = [
     # ── Alliance-level markets ─────────────────────────────────────────────────
     ("ALLIANCE_VICTOR",         "Alliance Victor",                      "HARD",      "A member of the alliance wins the Games. Resolves at game end."),
     ("ALLIANCE_KILLS_OU",       "Alliance Total Kills Over/Under",      "MODERATE",  "Bet over or under on the alliance's combined kill total. Resolves at game end."),
-    ("ALLIANCE_ALL_BLOODBATH",  "Alliance All Survive Bloodbath",       "MODERATE",  "All alliance members survive the opening bloodbath. Resolves when Bloodbath ends."),
     ("ALLIANCE_ALL_FINAL_8",    "Alliance All Make Final 8",            "HARD",      "All alliance members are alive when the Final 8 phase begins."),
     ("ALLIANCE_ONE_FINAL_8",    "Alliance At Least One Makes Final 8",  "MODERATE",  "At least one alliance member is alive when the Final 8 phase begins."),
     ("ALLIANCE_ALL_FINAL_5",    "Alliance All Make Final 5",            "VERY_HARD", "All alliance members are alive when the Final 5 phase begins."),
@@ -591,7 +633,6 @@ _BUILTIN_MARKET_TYPES = [
     ("DISTRICT_WIPED_BLOODBATH","District Wiped in Bloodbath",          "HARD",      "Both district tributes are killed during the opening bloodbath. Auto-resolves when Arena phase begins."),
     # ── New alliance-level markets ─────────────────────────────────────────────
     ("ALLIANCE_RUNNER_UP",      "Alliance Produces Runner-Up",          "HARD",      "A member of this alliance finishes 2nd overall. Auto-resolves at game end."),
-    ("ALLIANCE_WIPED_BLOODBATH","Alliance Wiped in Bloodbath",          "VERY_HARD", "All alliance members are killed during the opening bloodbath. Auto-resolves when Arena phase begins."),
     # ── Game-level prop markets ────────────────────────────────────────────────
     ("BLOODBATH_KILLS_OU",      "Bloodbath Kills Over/Under",           "MODERATE",  "Over or under on total tribute-on-tribute kills scored during the bloodbath. Auto-resolves when Arena phase begins."),
     ("BLOODBATH_DEATHS_OU",     "Bloodbath Deaths Over/Under",          "MODERATE",  "Over or under on total tribute deaths in the bloodbath. Auto-resolves when Bloodbath phase ends."),
@@ -641,8 +682,8 @@ async def _seed_defaults() -> None:
             default_phases = [
                 ("Pre-Games",        "Only District Victor and tribute score markets are open", 0),
                 ("Bloodbath",        "The initial cornucopia bloodbath — bloodbath markets open", 1),
-                ("Sponsors Open",    "Sponsorship window opens — funded districts surge",         2),
-                ("Arena",            "The arena opens — all remaining markets go live",           3),
+                ("Arena",            "The arena opens — all remaining markets go live",           2),
+                ("Sponsors Open",    "Sponsorship window opens — funded districts surge",         3),
                 ("Sponsors Closing", "Sponsorship window closes — funding edge fades",            4),
                 ("Final 8",          "The top 8 tributes remain",                                 5),
                 ("Final 5",          "The top 5 tributes remain",                                 6),
@@ -686,3 +727,25 @@ async def get_guild_setting(guild_id: int, key: str) -> str | None:
 
 async def set_guild_setting(guild_id: int, key: str, value) -> None:
     await set_setting(f"{guild_id}:{key}", value)
+
+
+# Shared verbatim by the bot's global command-tree check, the web dashboard's
+# login gate, and the Activity's token exchange, so a Tribute-locked user is
+# blocked identically everywhere with the exact same message.
+TRIBUTE_LOCK_MESSAGE = "Your status as a tribute prevents you from interacting with the sportsbook."
+
+
+async def get_tribute_lock(session, guild_id: int, discord_user_id: int) -> TributeLock | None:
+    """Return the TributeLock row for this user in this guild, or None.
+
+    Takes a plain AsyncSession so it works whether called with a bot-side
+    session (get_session/get_read_session) or a web-side one (web/database.py's
+    get_db) — the query itself doesn't care which engine produced the session.
+    """
+    result = await session.execute(
+        select(TributeLock).where(
+            TributeLock.guild_id == guild_id,
+            TributeLock.discord_user_id == discord_user_id,
+        )
+    )
+    return result.scalar_one_or_none()

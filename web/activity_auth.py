@@ -46,14 +46,23 @@ def _token_from_request(request: Request) -> str | None:
     return None
 
 
-def bearer_user(request: Request) -> SessionUser:
-    """FastAPI dependency: require a valid activity token."""
+async def bearer_user(request: Request) -> SessionUser:
+    """FastAPI dependency: require a valid activity token.
+
+    Also re-checks Tribute-lock status on every call (not just at token mint
+    time in /token) so a lock applied mid-session takes effect immediately
+    rather than waiting out the token's up-to-2-hour lifetime.
+    """
     raw = _token_from_request(request)
     user = verify_token(raw) if raw else None
     if user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
-    from web.database import set_request_guild
+    from web.database import set_request_guild, get_db
     set_request_guild(user.guild_id or 0)
+    from bot.database.engine import get_tribute_lock, TRIBUTE_LOCK_MESSAGE
+    async with get_db() as db:
+        if await get_tribute_lock(db, user.guild_id or 0, user.discord_id) is not None:
+            raise HTTPException(status_code=403, detail=TRIBUTE_LOCK_MESSAGE)
     return user
 
 
@@ -64,10 +73,10 @@ async def bearer_admin(request: Request) -> SessionUser:
     Discord (via the same 5-minute cache used by the cookie session path) so that a
     revoked admin role takes effect within one cache TTL rather than the full token TTL.
     """
-    user = bearer_user(request)
+    user = await bearer_user(request)
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
     from web.deps import _live_is_admin
-    if not await _live_is_admin(user.discord_id):
+    if not await _live_is_admin(user.discord_id, user.guild_id):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user

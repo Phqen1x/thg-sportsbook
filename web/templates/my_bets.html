@@ -36,9 +36,9 @@
           </td>
           <td><span class="badge badge-{{ bet.status.lower().replace('_', '-') }}">{{ bet.status }}</span></td>
           <td>
-            {% if bet.status == 'PENDING' and mkt %}
-              <form method="post" action="/cashout/bet/{{ bet.id }}" onsubmit="return confirm('Cash out this bet now?')">
-                <button class="btn btn-sm btn-outline">Cash Out</button>
+            {% if bet.status == 'PENDING' and mkt and bet.id in bet_cashout_preview %}
+              <form method="post" action="/cashout/bet/{{ bet.id }}" onsubmit="return confirm('Cash out this bet for {{ bet_cashout_preview[bet.id] | fmt_chips }} chips?')">
+                <button class="btn btn-sm btn-outline">Cash Out ({{ bet_cashout_preview[bet.id] | fmt_chips }})</button>
               </form>
             {% endif %}
           </td>
@@ -69,9 +69,9 @@
           {% endif %}
         </span>
         <span class="badge badge-{{ parlay.status.lower().replace('_', '-') }}">{{ parlay.status }}</span>
-        {% if parlay.status == 'PENDING' %}
-        <form method="post" action="/cashout/parlay/{{ parlay.id }}" onsubmit="return confirm('Cash out this parlay?')">
-          <button class="btn btn-sm btn-outline ml-1">Cash Out</button>
+        {% if parlay.status == 'PENDING' and parlay.id in parlay_cashout_preview %}
+        <form method="post" action="/cashout/parlay/{{ parlay.id }}" onsubmit="return confirm('Cash out this parlay for {{ parlay_cashout_preview[parlay.id] | fmt_chips }} chips?')">
+          <button class="btn btn-sm btn-outline ml-1">Cash Out ({{ parlay_cashout_preview[parlay.id] | fmt_chips }})</button>
         </form>
         {% endif %}
       </div>

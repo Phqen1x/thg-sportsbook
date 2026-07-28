@@ -84,8 +84,6 @@ def market_type_label(t: str) -> str:
         "DISTRICT_ONE_FINAL_5":    "District One Final 5",
         "ALLIANCE_VICTOR":         "Alliance Victor",
         "ALLIANCE_KILLS_OU":       "Alliance Kills O/U",
-        "ALLIANCE_ALL_BLOODBATH":    "Alliance All Bloodbath",
-        "ALLIANCE_WIPED_BLOODBATH":  "Alliance BB Wipe",
         "BLOODBATH_KILLS_OU":        "Bloodbath Kills O/U",
         "ALLIANCE_ALL_FINAL_8":    "Alliance All Final 8",
         "ALLIANCE_ONE_FINAL_8":    "Alliance One Final 8",

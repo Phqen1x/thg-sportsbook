@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import math
 import random
 import re
 from contextlib import asynccontextmanager
@@ -31,6 +32,7 @@ from bot.database.models import (
     ParlayTemplateLeg,
     PendingParlayLeg,
     Tribute,
+    TributeLock,
     User,
 )
 from bot.odds.calculator import (
@@ -85,7 +87,7 @@ from bot.utils.formatters import fmt_chips, fmt_odds, safe_defer
 from bot.utils.market_view import MarketPageView, MarketTypePageView, sort_markets
 # Leg-compatibility validation lives in the betting cog; reused here so admin and
 # auto-generated parlays obey the same conflict rules as member-built ones.
-from bot.cogs.betting import _parlay_conflict, PARLAY_PAYOUT_CAP
+from bot.cogs.betting import _parlay_conflict, tribute_lookup_for_markets, PARLAY_PAYOUT_CAP
 
 log = logging.getLogger("capitol.admin")
 
@@ -162,7 +164,17 @@ async def _send_resolution_dms(bot: commands.Bot, notifications: list[dict]) -> 
                         f"Your parlay has been **VOIDED**. "
                         f"Your **{fmt_chips(notif['wager'])}** wager has been refunded."
                     )
+                poster_username = notif.get("original_poster_username")
+                if poster_username:
+                    msg += f"\n(Tailed from **{poster_username}**'s board listing.)"
                 await user.send(content=msg, file=file)
+            elif notif["type"] == "tail_notify":
+                verb = {"WON": "won", "LOST": "lost", "VOIDED": "been voided"}.get(status, status.lower())
+                msg = (
+                    f"**{notif['tailer_username']}** tailed your Parlay #{notif['parlay_id']} "
+                    f"off the board — it just **{verb}**."
+                )
+                await user.send(content=msg)
         except discord.Forbidden:
             log.warning("Cannot DM user %s — DMs disabled", notif["user_id"])
         except Exception:
@@ -265,12 +277,6 @@ MARKET_TYPES = [
     app_commands.Choice(
         name="Alliance Total Kills Over/Under", value="ALLIANCE_KILLS_OU"
     ),
-    app_commands.Choice(
-        name="Alliance All Survive Bloodbath", value="ALLIANCE_ALL_BLOODBATH"
-    ),
-    app_commands.Choice(
-        name="Alliance Wiped in Bloodbath", value="ALLIANCE_WIPED_BLOODBATH"
-    ),
     app_commands.Choice(name="Alliance All Make Final 8", value="ALLIANCE_ALL_FINAL_8"),
     app_commands.Choice(
         name="Alliance At Least One Makes Final 8", value="ALLIANCE_ONE_FINAL_8"
@@ -325,6 +331,15 @@ _PREGAMES_PROP_TYPES = {
     "PARTNER_SCORE_HIGHER",
     "PARTNER_SCORE_LOWER",
 }
+# The subset of _PREGAMES_OPEN_TYPES that does NOT carry forward into Bloodbath —
+# training-score/scouting props are only meaningful before the Games start.
+# (District Victor and Tribute Wins are pre-game markets too, but they run the
+# whole game, so they're excluded here and stay open into Bloodbath and beyond.)
+_PREGAMES_EXCLUSIVE_TYPES = _PREGAMES_PROP_TYPES | {
+    "HIGHEST_TRAINING_SCORE",
+    "LOWEST_TRAINING_SCORE",
+    "DISTRICT_HIGHEST_SCORE",
+}
 # Bloodbath markets — resolve/void when Bloodbath ends
 _BLOODBATH_RESOLVE_TYPES = {"BLOODBATH_SURVIVOR"}
 _BLOODBATH_VOID_TYPES = {"FIRST_BLOOD"}
@@ -332,8 +347,13 @@ _BLOODBATH_VOID_TYPES = {"FIRST_BLOOD"}
 # ── Phase-gated market availability ───────────────────────────────────────────
 # Markets open progressively as the Games advance. During Pre-Games the District
 # and individual-Tribute victor moneylines plus the training-score / scouting
-# props are live; the bloodbath markets join in the Bloodbath (and stay open
-# through Sponsors Open); from the Arena on, every market is open.
+# props are live. Bloodbath opens every market type except the pre-game-exclusive
+# props/scores and all alliance-level markets (see _BLOODBATH_OPEN_TYPES below,
+# computed after _ALLIANCE_MARKET_TYPES is defined) — alliance markets stay closed
+# until Arena. Bloodbath markets resolve the instant Arena begins (see
+# game_set_phase), and every market type is open from Arena onward — including
+# through Sponsors Open/Closing, which only affect funding-modifier strength
+# (_set_sponsor_state), never which types are open.
 _PREGAMES_OPEN_TYPES = _PREGAMES_PROP_TYPES | {
     "HIGHEST_TRAINING_SCORE",
     "LOWEST_TRAINING_SCORE",
@@ -341,34 +361,17 @@ _PREGAMES_OPEN_TYPES = _PREGAMES_PROP_TYPES | {
     "DISTRICT_VICTOR",
     "TRIBUTE_WINS",
 }
-_BLOODBATH_OPEN_TYPES = {
-    "BLOODBATH_SURVIVOR",
-    "TRIBUTE_KILLED_BLOODBATH",
-    "FIRST_BLOOD",
-    "KILL_EVENT",
-    "DISTRICT_BOTH_BLOODBATH",
-    "DISTRICT_WIPED_BLOODBATH",
-    "ALLIANCE_ALL_BLOODBATH",
-    "ALLIANCE_WIPED_BLOODBATH",
-    "BLOODBATH_KILLS_OU",
-    "BLOODBATH_DEATHS_OU",
-    "EXACT_BLOODBATH_DEATHS",
-    "BLOODBATH_NO_DEATHS",
-    "ANY_BB_DOUBLE_KILL",
-    # District Victor opened in Pre-Games and runs until game end.
-    "DISTRICT_VICTOR",
-}
 
 
 def _open_types_for_phase(phase_name: str | None) -> set[str] | None:
     """Market types that should be OPEN during ``phase_name``.
 
     Returns ``None`` when there is no type restriction — every market is open
-    (the Arena phase onward, including the sponsor-closing and final phases).
+    (Arena onward, including the sponsor-open, sponsor-closing, and final phases).
     """
     if phase_name == "Pre-Games":
         return _PREGAMES_OPEN_TYPES
-    if phase_name in ("Bloodbath", "Sponsors Open"):
+    if phase_name == "Bloodbath":
         return _BLOODBATH_OPEN_TYPES
     return None
 
@@ -417,8 +420,6 @@ _DISTRICT_PHASE_ENTRY: dict[str, tuple[str, ...]] = {
 _ALLIANCE_MARKET_TYPES = {
     "ALLIANCE_VICTOR",
     "ALLIANCE_KILLS_OU",
-    "ALLIANCE_ALL_BLOODBATH",
-    "ALLIANCE_WIPED_BLOODBATH",
     "ALLIANCE_ALL_FINAL_8",
     "ALLIANCE_ONE_FINAL_8",
     "ALLIANCE_ALL_FINAL_5",
@@ -428,6 +429,13 @@ _ALLIANCE_MARKET_TYPES = {
     "EXACT_ALLIANCE_KILLS",
     "ALLIANCE_RUNNER_UP",
 }
+
+# Bloodbath opens every built-in market type except the pre-game-exclusive props
+# (training scores, arena type, partner-score comparisons) and all alliance-level
+# markets, which stay closed until Arena begins.
+_BLOODBATH_OPEN_TYPES = (
+    {c.value for c in MARKET_TYPES} - _PREGAMES_EXCLUSIVE_TYPES - _ALLIANCE_MARKET_TYPES
+)
 
 # Game-level prop markets (no tribute, district, or alliance — whole-game props)
 _GAME_PROP_TYPES = {
@@ -605,6 +613,26 @@ async def open_market_autocomplete(
         label = f"[{m.status}] {m.label}"
         if current.lower() in label.lower():
             choices.append(app_commands.Choice(name=label[:100], value=str(m.id)))
+    return choices[:25]
+
+
+async def public_parlay_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Pending, publicly-tailable member parlays — for admin per-parlay cashout overrides."""
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(Parlay)
+            .where(Parlay.status == "PENDING", Parlay.is_public == True)  # noqa: E712
+            .order_by(Parlay.id.desc())
+            .limit(100)
+        )
+        parlays = result.scalars().all()
+    choices = []
+    for p in parlays:
+        label = f"Parlay #{p.id} — {fmt_chips(p.total_wager)} wager"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=str(p.id)))
     return choices[:25]
 
 
@@ -1513,9 +1541,9 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
             bet.status = (
                 "WON" if result is True else ("VOIDED" if result is None else "LOST")
             )
-            parlay_notif = await _check_parlay(session, bet.parlay_id)
-            if buf is not None and parlay_notif is not None:
-                buf.append(parlay_notif)
+            parlay_notifs = await _check_parlay(session, bet.parlay_id)
+            if buf is not None:
+                buf.extend(parlay_notifs)
         resolved_count += 1
 
     # An auto-generated featured parlay is considered "resolved" the moment any
@@ -1534,6 +1562,67 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
     return {"resolved": resolved_count, "credits": credits_issued}
 
 
+async def _resolve_score_completion_markets(
+    session, all_tributes: list["Tribute"], tribute_map: dict[int, "Tribute"]
+) -> tuple[int, int]:
+    """Resolve HIGHEST/LOWEST_TRAINING_SCORE and DISTRICT_HIGHEST_SCORE once every
+    tribute who can still receive one has a training score.
+
+    A tribute killed before ever being scored counts as a null score: they don't
+    block this from resolving, and they're excluded from the max/min/district
+    totals below (their own markets are voided separately at kill time).
+    """
+    still_pending = any(
+        tr.training_score is None and tr.status != "DEAD" for tr in all_tributes
+    )
+    if still_pending:
+        return 0, 0
+    scored = [tr for tr in all_tributes if tr.training_score is not None]
+    if not scored:
+        return 0, 0
+
+    resolved = 0
+    credits = 0
+    max_score = max(tr.training_score for tr in scored)
+    min_score = min(tr.training_score for tr in scored)
+    for mtype, target in (
+        ("HIGHEST_TRAINING_SCORE", max_score),
+        ("LOWEST_TRAINING_SCORE", min_score),
+    ):
+        hl_result = await session.execute(
+            select(Market).where(
+                Market.type == mtype,
+                Market.status.in_(["OPEN", "CLOSED"]),
+            )
+        )
+        for mkt in hl_result.scalars().all():
+            trib = tribute_map.get(mkt.tribute_a_id) if mkt.tribute_a_id else None
+            result = bool(trib and trib.training_score == target)
+            stats = await _resolve_market(session, mkt, result)
+            resolved += 1
+            credits += stats.get("credits", 0)
+
+    dist_scores: dict[int, int] = {}
+    for tr in scored:
+        dist_scores[tr.district] = dist_scores.get(tr.district, 0) + tr.training_score
+    if dist_scores:
+        max_dist_score = max(dist_scores.values())
+        dhs_result = await session.execute(
+            select(Market).where(
+                Market.type == "DISTRICT_HIGHEST_SCORE",
+                Market.status.in_(["OPEN", "CLOSED"]),
+            )
+        )
+        for mkt in dhs_result.scalars().all():
+            d = mkt.placement_num
+            result = d is not None and dist_scores.get(d, 0) == max_dist_score
+            stats = await _resolve_market(session, mkt, result)
+            resolved += 1
+            credits += stats.get("credits", 0)
+
+    return resolved, credits
+
+
 # ── Auto-generated featured parlays ────────────────────────────────────────────
 # Three tailable parlays are (re)generated at the start of each phase from the
 # markets open at that moment, spanning a spread of risk/payout profiles. They
@@ -1544,6 +1633,19 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
 AUTO_PARLAY_MAX_WAGER = 1_000
 _MIN_PARLAY_LEGS = 3
 _MAX_PARLAY_LEGS = 8
+
+# Temporary kill switch: when False, AI-generated featured parlays are stored
+# with a blank description so admins can write their own via
+# `/admin parlay set-description`.  The model still picks legs and titles; we
+# just drop its description text.  Flip back to True to restore AI blurbs.
+_AI_PARLAY_DESCRIPTIONS_ENABLED = False
+
+# Temporary kill switch: when False, all AUTO/AI featured-parlay generation is
+# disabled at the source, so every caller — automatic (game start, phase
+# transitions) and manual (/admin parlay generate, /admin parlay ai-generate) —
+# becomes a no-op. Admin-authored parlay templates (source="ADMIN") are
+# unaffected. Flip back to True to re-enable.
+_AUTO_PARLAY_GENERATION_ENABLED = False
 
 
 def _ordinal(n: int) -> str:
@@ -1567,11 +1669,13 @@ def _pick_themed_legs(
     min_legs: int = _MIN_PARLAY_LEGS,
     *,
     worst_odds_first: bool = False,
+    tribute_by_id: dict[int, "Tribute"] | None = None,
 ) -> list[Market]:
     """Greedily pick conflict-free, cap-safe legs.
 
     By default sorts probability high→low (best odds first). Pass worst_odds_first=True
-    to pick the most difficult markets — used for LONGSHOT fallback.
+    to pick the most difficult markets — used for LONGSHOT fallback. ``tribute_by_id``
+    is forwarded to _parlay_conflict for district-aware rules.
     """
     sorted_cands = sorted(
         candidates,
@@ -1581,7 +1685,7 @@ def _pick_themed_legs(
     for target in range(min(max_legs, len(sorted_cands)), min_legs - 1, -1):
         chosen: list[Market] = []
         for m in sorted_cands:
-            if _parlay_conflict(chosen, m) is not None:
+            if _parlay_conflict(chosen, m, tribute_by_id) is not None:
                 continue
             chosen.append(m)
             if not _parlay_within_cap(chosen):
@@ -1610,6 +1714,8 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     Each parlay is built around a central entity — one tribute, one alliance, or one
     district — so every leg in the parlay is narratively coherent. Legs: 3–8.
     """
+    if not _AUTO_PARLAY_GENERATION_ENABLED:
+        return 0
     old = await session.execute(
         select(ParlayTemplate).where(ParlayTemplate.source == "AUTO")
     )
@@ -1781,7 +1887,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             for theme_type, theme_key, mkts in groupings:
                 if not _tribute_allowed(theme_type, theme_key):
                     continue
-                legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l)
+                legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map)
                 if len(legs) >= min_l:
                     leg_key = frozenset(l.id for l in legs)
                     if leg_key not in used_leg_sets:
@@ -1794,7 +1900,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                         continue
                     legs = _pick_themed_legs(
                         mkts, max_legs=_MAX_PARLAY_LEGS, min_legs=_MIN_PARLAY_LEGS,
-                        worst_odds_first=True,
+                        worst_odds_first=True, tribute_by_id=tributes_map,
                     )
                     if len(legs) >= _MIN_PARLAY_LEGS:
                         leg_key = frozenset(l.id for l in legs)
@@ -1809,7 +1915,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                         assert isinstance(theme_key, int)
                         if theme_key in used_tribute_keys:
                             continue
-                    legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l)
+                    legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map)
                     if len(legs) >= min_l:
                         leg_key = frozenset(l.id for l in legs)
                         if leg_key not in used_leg_sets:
@@ -2181,20 +2287,105 @@ def _tribute_payload(t) -> dict:
     }
 
 
-# Distinct narrative angles seeded into each subject's prompt so parlays don't
-# all converge on the same theme/title. One is assigned per subject per run.
-_PARLAY_ANGLES = [
-    "raw aggression and kill totals",
-    "surviving the bloodbath and grinding deep into the games",
-    "training-score pedigree and Career-style polish",
-    "underdog defiance against long odds",
-    "finishing position and a high placement ceiling",
-    "coordinated alliance muscle",
-    "late-game endurance into the final 8 and final 5",
-    "early separation and bloodbath chaos",
+# Theme-locked angles: each maps to the market types whose legs actually support
+# that story.  A parlay's title is written from its angle, so the angle must only
+# be used when the subject really has enough legs of that theme — otherwise the
+# model writes e.g. a "Bloodbath" title over "Makes Final 8" legs.  We derive the
+# angle from the subject's own markets (see ``_assign_theme``) and show the model
+# ONLY that theme's markets, so title and legs match by construction.
+_ANGLE_THEMES: dict[str, dict] = {
+    "BLOODBATH": {
+        "angle": "surviving the opening bloodbath and the early-arena chaos",
+        "types": {
+            "BLOODBATH_SURVIVOR", "DISTRICT_BOTH_BLOODBATH",
+            "FIRST_BLOOD", "BLOODBATH_KILLS_OU",
+        },
+    },
+    "FINALS": {
+        "angle": "late-game endurance, grinding into the final 8 and final 5",
+        "types": {
+            "MAKES_FINAL_8", "MAKES_FINAL_5",
+            "DISTRICT_BOTH_FINAL_8", "DISTRICT_ONE_FINAL_8",
+            "DISTRICT_BOTH_FINAL_5", "DISTRICT_ONE_FINAL_5",
+            "ALLIANCE_ALL_FINAL_8", "ALLIANCE_ONE_FINAL_8",
+            "ALLIANCE_ALL_FINAL_5", "ALLIANCE_ONE_FINAL_5",
+        },
+    },
+    "KILLS": {
+        "angle": "raw aggression and stacking up kills",
+        "types": {
+            "TRIBUTE_KILLS", "KILLS_OU", "KILL_EVENT", "DISTRICT_KILLS_OU",
+            "DISTRICT_PARTNER_KILL", "ALLIANCE_MOST_KILLS", "ALLIANCE_KILLS_OU",
+        },
+    },
+    "TRAINING": {
+        "angle": "training-score pedigree and Career-style polish",
+        "types": {
+            "HIGHEST_TRAINING_SCORE", "TRAINING_SCORE_OU",
+            "DISTRICT_HIGHEST_SCORE", "COMBINED_DISTRICT_SCORE",
+        },
+    },
+    "VICTORY": {
+        "angle": "a deep run at the crown and a high placement ceiling",
+        "types": {
+            "TRIBUTE_WINS", "TRIBUTE_TOP_N", "TRIBUTE_RUNNER_UP", "TRIBUTE_PLACEMENT",
+            "PLACEMENT_OU", "DISTRICT_VICTOR", "ALLIANCE_VICTOR", "ALLIANCE_RUNNER_UP",
+            "PARTNER_PLACE_HIGHER", "PARTNER_SCORE_HIGHER",
+        },
+    },
+}
+
+# Framing angles that make no event-timing claim, so they stay coherent with
+# whatever legs the model picks.  Used only when no single theme has enough
+# markets to stand on its own (see ``_assign_theme``).
+_FREE_ANGLES = [
     "a district's historical dynasty reasserting itself",
+    "underdog defiance against long odds",
     "momentum from current form and standout tributes",
+    "coordinated alliance muscle",
 ]
+
+_TYPE_TO_THEME = {
+    t: theme for theme, spec in _ANGLE_THEMES.items() for t in spec["types"]
+}
+
+
+def _assign_theme(markets, used_themes: set[str]):
+    """Pick a coherent angle for one subject and the markets that support it.
+
+    Groups the subject's (already POS-filtered) markets by narrative theme.  A
+    theme qualifies only when it has at least 3 markets across at least 2 distinct
+    market types — enough to build a varied 3-leg parlay from that theme alone.
+    When one qualifies we lock the parlay to it: the returned markets are just
+    that theme's, so every leg the model can pick matches the title it writes.
+    ``used_themes`` is consulted (and updated) so different subjects in a batch
+    get different themes.  If nothing qualifies we fall back to a framing angle
+    that makes no event-timing claim and hand back all markets.
+
+    Returns ``(angle_text, shown_markets)``.
+    """
+    buckets: dict[str, list] = {}
+    for m in markets:
+        theme = _TYPE_TO_THEME.get(m.type)
+        if theme:
+            buckets.setdefault(theme, []).append(m)
+
+    candidates = [
+        theme for theme, ms in buckets.items()
+        if len(ms) >= 3 and len({m.type for m in ms}) >= 2
+    ]
+    if candidates:
+        random.shuffle(candidates)
+        # Stable sort keeps the shuffle order within each group but (1) pulls
+        # not-yet-used themes ahead of already-used ones for batch variety, then
+        # (2) prefers richer buckets so the model has room to build a 4-5 leg
+        # parlay instead of being boxed into the 3-leg minimum by a thin theme.
+        candidates.sort(key=lambda th: (th in used_themes, -len(buckets[th])))
+        theme = candidates[0]
+        used_themes.add(theme)
+        return _ANGLE_THEMES[theme]["angle"], buckets[theme]
+
+    return random.choice(_FREE_ANGLES), markets
 
 # Market types whose outcome is unambiguously GOOD for the subject tribute /
 # district / alliance (they advance, survive, win, out-perform).
@@ -2204,7 +2395,7 @@ _POS_MARKET_TYPES = {
     "MAKES_FINAL_8", "MAKES_FINAL_5", "PARTNER_SCORE_HIGHER", "PARTNER_PLACE_HIGHER",
     "DISTRICT_VICTOR", "DISTRICT_HIGHEST_SCORE", "DISTRICT_BOTH_BLOODBATH",
     "DISTRICT_BOTH_FINAL_8", "DISTRICT_ONE_FINAL_8", "DISTRICT_BOTH_FINAL_5",
-    "DISTRICT_ONE_FINAL_5", "ALLIANCE_VICTOR", "ALLIANCE_ALL_BLOODBATH",
+    "DISTRICT_ONE_FINAL_5", "ALLIANCE_VICTOR",
     "ALLIANCE_ALL_FINAL_8", "ALLIANCE_ONE_FINAL_8", "ALLIANCE_ALL_FINAL_5",
     "ALLIANCE_ONE_FINAL_5", "ALLIANCE_MOST_KILLS", "ALLIANCE_RUNNER_UP",
 }
@@ -2214,7 +2405,7 @@ _NEG_MARKET_TYPES = {
     "FIRST_TRIBUTE_TO_DIE", "LOWEST_TRAINING_SCORE", "DEATH_CAUSE",
     "TRIBUTE_KILLED_BLOODBATH", "FIRST_IN_ALLIANCE_DEATH", "MISSES_FINAL_8",
     "MISSES_FINAL_5", "PARTNER_SCORE_LOWER", "PARTNER_PLACE_LOWER",
-    "FIRST_DISTRICT_WIPE", "DISTRICT_WIPED_BLOODBATH", "ALLIANCE_WIPED_BLOODBATH",
+    "FIRST_DISTRICT_WIPE", "DISTRICT_WIPED_BLOODBATH",
     "FIRST_ALLIANCE_WIPED",
 }
 # Over/Under types where OVER is the "doing well" side (more kills, higher score).
@@ -2260,8 +2451,9 @@ def _refine_parlay_legs(market_ids, market_by_id):
     - Over/under guard: never keep both the OVER and UNDER of the same market
       type for the same tribute (e.g. "over 0.5 kills" and "under 0.5 kills"),
       which could never both win. First-selected side wins.
-    - Variety cap: at most two legs of the same market type, so a parlay isn't
-      three near-identical bets (e.g. three "Survives the Bloodbath").
+    - Variety cap: at most three legs of the same market type, so a parlay isn't
+      an endless stack of one bet while still allowing, say, three different
+      tributes to each "Survive the Bloodbath" (distinct bets, same type).
 
     Order is preserved. Directional consistency (no "dies"/"eliminated" legs in a
     backing parlay) is handled upstream by filtering candidates to non-NEG
@@ -2281,12 +2473,433 @@ def _refine_parlay_legs(market_ids, market_by_id):
                 log.debug("Dropping leg %d: over/under conflict for %s", mid, key)
                 continue
             seen_side.setdefault(key, m.ou_side)
-        if type_counts.get(m.type, 0) >= 2:
-            log.debug("Dropping leg %d: already 2 legs of type %s", mid, m.type)
+        if type_counts.get(m.type, 0) >= 3:
+            log.debug("Dropping leg %d: already 3 legs of type %s", mid, m.type)
             continue
         type_counts[m.type] = type_counts.get(m.type, 0) + 1
         kept.append(mid)
     return kept
+
+
+# Aggregate district/alliance markets that summarise an event across a whole
+# district or alliance, mapped to the individual-tribute market type covering the
+# same event.  A "both/all/one make final 8" bet is entailed by (and perfectly
+# correlated with) the individual "makes final 8" legs; likewise a district/
+# alliance victor is guaranteed once one of its tributes is bet to win.  Pairing
+# them just double-books the same outcome, so we keep the granular individual
+# legs and drop the redundant aggregate.
+_AGGREGATE_EVENT = {
+    "DISTRICT_BOTH_FINAL_8": "MAKES_FINAL_8",
+    "DISTRICT_ONE_FINAL_8": "MAKES_FINAL_8",
+    "DISTRICT_BOTH_FINAL_5": "MAKES_FINAL_5",
+    "DISTRICT_ONE_FINAL_5": "MAKES_FINAL_5",
+    "DISTRICT_BOTH_BLOODBATH": "BLOODBATH_SURVIVOR",
+    "DISTRICT_VICTOR": "TRIBUTE_WINS",
+    "ALLIANCE_ALL_FINAL_8": "MAKES_FINAL_8",
+    "ALLIANCE_ONE_FINAL_8": "MAKES_FINAL_8",
+    "ALLIANCE_ALL_FINAL_5": "MAKES_FINAL_5",
+    "ALLIANCE_ONE_FINAL_5": "MAKES_FINAL_5",
+    "ALLIANCE_VICTOR": "TRIBUTE_WINS",
+}
+# Individual leg types that entail an aggregate above (kept in sync with the map).
+_AGGREGATE_INDIVIDUAL_TYPES = set(_AGGREGATE_EVENT.values())
+
+
+def _drop_redundant_aggregates(leg_ids, market_by_id, tribute_by_id):
+    """Drop whole-district/alliance legs that individual-tribute legs already cover.
+
+    If any individual leg for the same event and the same district/alliance is in
+    the slip, the aggregate ("D10 Both Make Final 8", or a district victor once a
+    D-tribute is bet to win) is redundant with it, so we remove the aggregate and
+    keep the individual legs.  ``placement_num`` carries the district number on
+    ``DISTRICT_*`` markets and the alliance id on ``ALLIANCE_*`` markets (see
+    ``_bundle_markets_by_subject``).
+    """
+    legs = [(mid, market_by_id[mid]) for mid in leg_ids if mid in market_by_id]
+    indiv_district: set[tuple[str, int]] = set()
+    indiv_alliance: set[tuple[str, int]] = set()
+    for _mid, m in legs:
+        if m.type in _AGGREGATE_INDIVIDUAL_TYPES:
+            t = tribute_by_id.get(m.tribute_a_id)
+            if t is not None:
+                indiv_district.add((m.type, t.district))
+                if t.alliance_id is not None:
+                    indiv_alliance.add((m.type, t.alliance_id))
+
+    kept: list[int] = []
+    for mid, m in legs:
+        event = _AGGREGATE_EVENT.get(m.type)
+        if event is not None and m.placement_num is not None:
+            covered = (
+                (m.type.startswith("DISTRICT_") and (event, m.placement_num) in indiv_district)
+                or (m.type.startswith("ALLIANCE_") and (event, m.placement_num) in indiv_alliance)
+            )
+            if covered:
+                log.debug("Dropping redundant aggregate leg %d (%s)", mid, m.type)
+                continue
+        kept.append(mid)
+    return kept
+
+
+def _placement_threshold(m) -> int | None:
+    """Best finishing position that still wins a single-tribute placement leg.
+
+    Returns the position cut-off (lower = harder/more specific) so nested legs can
+    be compared: winning (1) implies top-5 (5) implies top-8 (8).  ``None`` for
+    non-placement markets.  Only single-tribute markets qualify.
+    """
+    if not m.tribute_a_id or m.tribute_b_id:
+        return None
+    t = m.type
+    if t == "TRIBUTE_WINS":
+        return 1
+    if t == "TRIBUTE_RUNNER_UP":
+        return 2
+    if t == "TRIBUTE_PLACEMENT":
+        return m.placement_num or 2
+    if t == "MAKES_FINAL_5":
+        return 5
+    if t == "MAKES_FINAL_8":
+        return 8
+    if t == "TRIBUTE_TOP_N":
+        return m.top_n or 3
+    if t == "PLACEMENT_OU" and m.ou_side == "UNDER" and m.ou_line is not None:
+        return int(math.floor(m.ou_line))
+    return None
+
+
+def _drop_nested_placement_legs(leg_ids, market_by_id):
+    """Keep at most one placement leg per tribute — the most specific one.
+
+    A tribute can't independently "make the final 5" and "make the final 8": the
+    harder finish implies the easier one, so stacking them just inflates the odds
+    for no added risk (and exact-placement legs that can't co-occur make the
+    parlay unwinnable).  We keep the smallest-threshold leg (best finish) per
+    tribute and drop the rest; ties keep the first in leg order.
+    """
+    thresh: dict[int, int] = {}
+    trib: dict[int, int] = {}
+    for mid in leg_ids:
+        m = market_by_id.get(mid)
+        if m is None:
+            continue
+        th = _placement_threshold(m)
+        if th is not None:
+            thresh[mid] = th
+            trib[mid] = m.tribute_a_id
+
+    keeper: dict[int, int] = {}  # tribute_id -> mid to keep
+    for mid in leg_ids:
+        if mid not in thresh:
+            continue
+        tid = trib[mid]
+        if tid not in keeper or thresh[mid] < thresh[keeper[tid]]:
+            keeper[tid] = mid
+
+    kept: list[int] = []
+    for mid in leg_ids:
+        if mid in thresh and keeper.get(trib[mid]) != mid:
+            log.debug("Dropping nested placement leg %d (tribute %d)", mid, trib[mid])
+            continue
+        kept.append(mid)
+    return kept
+
+
+def _drop_nested_ou_legs(leg_ids, market_by_id):
+    """Keep at most one over/under leg per tribute + market type + side.
+
+    Two lines on the same side of the same stat nest: "over 1.5 kills" already
+    implies "over 0.5 kills", so holding both just inflates the odds for no added
+    risk (the lower line pays out for free once the higher one hits).  We keep the
+    single dominant line per (type, tribute pair, side) group — the higher line
+    for OVER, the lower for UNDER — and drop the rest; ties keep the first in leg
+    order.
+    """
+    grp: dict[int, tuple] = {}
+    line: dict[int, float] = {}
+    for mid in leg_ids:
+        m = market_by_id.get(mid)
+        if m is None or m.ou_side not in ("OVER", "UNDER") or m.ou_line is None:
+            continue
+        grp[mid] = (m.type, m.tribute_a_id, m.tribute_b_id, m.ou_side)
+        line[mid] = m.ou_line
+
+    keeper: dict[tuple, int] = {}  # group -> mid to keep
+    for mid in leg_ids:
+        g = grp.get(mid)
+        if g is None:
+            continue
+        cur = keeper.get(g)
+        if cur is None:
+            keeper[g] = mid
+            continue
+        # OVER: the higher line is the stronger, non-redundant bet; UNDER: lower.
+        if (g[3] == "OVER" and line[mid] > line[cur]) or (
+            g[3] == "UNDER" and line[mid] < line[cur]
+        ):
+            keeper[g] = mid
+
+    kept: list[int] = []
+    for mid in leg_ids:
+        if mid in grp and keeper.get(grp[mid]) != mid:
+            log.debug("Dropping nested over/under leg %d (group %s)", mid, grp[mid])
+            continue
+        kept.append(mid)
+    return kept
+
+
+# Markets only one tribute in the whole field can win: the first kill, the most
+# kills, and the crown.  Backing two different tributes for the same one-of-field
+# outcome can never all pay out, so a parlay may hold at most one leg of each.
+_ONE_OF_FIELD_TYPES = {"FIRST_BLOOD", "TRIBUTE_KILLS", "TRIBUTE_WINS"}
+
+
+def _drop_duplicate_one_of_field_legs(leg_ids, market_by_id):
+    """Keep at most one leg per one-of-the-field market type.
+
+    Only a single tribute can take the first kill / most kills / win, so two such
+    legs make the parlay unwinnable.  For each type we keep the most-favoured leg
+    (smallest American odds; ties keep the first in leg order) and drop the rest.
+    """
+    keeper: dict[str, int] = {}
+    for mid in leg_ids:
+        m = market_by_id.get(mid)
+        if m is None or m.type not in _ONE_OF_FIELD_TYPES:
+            continue
+        cur = keeper.get(m.type)
+        if cur is None or m.odds < market_by_id[cur].odds:
+            keeper[m.type] = mid
+
+    kept: list[int] = []
+    for mid in leg_ids:
+        m = market_by_id.get(mid)
+        if m is not None and m.type in _ONE_OF_FIELD_TYPES and keeper.get(m.type) != mid:
+            log.debug("Dropping duplicate one-of-field leg %d (%s)", mid, m.type)
+            continue
+        kept.append(mid)
+    return kept
+
+
+def _kill_over_floor(m) -> int | None:
+    """Minimum kill count required for a kills OVER leg to win (None otherwise)."""
+    if m.ou_side != "OVER" or m.ou_line is None:
+        return None
+    return int(math.floor(m.ou_line)) + 1
+
+
+def _drop_duplicate_district_score_legs(leg_ids, market_by_id):
+    """Keep at most one "District combined score = N" leg per district.
+
+    A district's combined training score is one exact number, so two different
+    guesses for the same tribute pair can never both win. For each pair we keep
+    the most-favoured leg (smallest American odds; ties keep the first in leg
+    order) and drop the rest.
+    """
+    keeper: dict[frozenset, int] = {}
+    for mid in leg_ids:
+        m = market_by_id.get(mid)
+        if m is None or m.type != "COMBINED_DISTRICT_SCORE":
+            continue
+        if m.tribute_a_id is None or m.tribute_b_id is None:
+            continue
+        pair = frozenset((m.tribute_a_id, m.tribute_b_id))
+        cur = keeper.get(pair)
+        if cur is None or m.odds < market_by_id[cur].odds:
+            keeper[pair] = mid
+
+    kept: list[int] = []
+    for mid in leg_ids:
+        m = market_by_id.get(mid)
+        if (
+            m is not None
+            and m.type == "COMBINED_DISTRICT_SCORE"
+            and m.tribute_a_id is not None
+            and m.tribute_b_id is not None
+        ):
+            pair = frozenset((m.tribute_a_id, m.tribute_b_id))
+            if keeper.get(pair) != mid:
+                log.debug("Dropping duplicate district-score leg %d (pair %s)", mid, pair)
+                continue
+        kept.append(mid)
+    return kept
+
+
+_DISTRICT_SCORE_FLOOR = 2  # lowest possible combined training score; see COMBINED_DISTRICT_SCORE creation
+
+
+def _drop_district_score_floor_vs_highest_legs(leg_ids, market_by_id, tribute_by_id):
+    """Drop one side when a district's rock-bottom combined-score guess (2, the
+    floor of the 2-24 range) and that same district's "highest combined score"
+    bet are both in the leg set — the lowest possible total can't also be the
+    highest, so keep whichever leg has the better odds and drop the other.
+    """
+    def _district_of(m):
+        if m.tribute_a_id is None:
+            return None
+        t = tribute_by_id.get(m.tribute_a_id)
+        return t.district if t else None
+
+    floor_by_district: dict[int, int] = {}
+    highest_by_district: dict[int, int] = {}
+    for mid in leg_ids:
+        m = market_by_id.get(mid)
+        if m is None:
+            continue
+        if m.type == "COMBINED_DISTRICT_SCORE" and m.placement_num == _DISTRICT_SCORE_FLOOR:
+            d = _district_of(m)
+            if d is not None:
+                floor_by_district[d] = mid
+        elif m.type == "DISTRICT_HIGHEST_SCORE" and m.placement_num is not None:
+            highest_by_district[m.placement_num] = mid
+
+    drop: set[int] = set()
+    for d, floor_mid in floor_by_district.items():
+        highest_mid = highest_by_district.get(d)
+        if highest_mid is None:
+            continue
+        loser = (
+            floor_mid if market_by_id[floor_mid].odds > market_by_id[highest_mid].odds
+            else highest_mid
+        )
+        log.debug(
+            "Dropping district-score-floor/highest conflict leg %d (district %d)", loser, d
+        )
+        drop.add(loser)
+
+    if not drop:
+        return leg_ids
+    return [mid for mid in leg_ids if mid not in drop]
+
+
+def _drop_redundant_kill_legs(leg_ids, market_by_id, tribute_by_id):
+    """Drop kill legs whose outcome is already guaranteed by other legs.
+
+    - A tribute's "over N.5 kills" leg is redundant when the slip already bets
+      that tribute to kill enough named victims to clear the line (kills of X and
+      Y guarantee 2 kills, so "over 1.5" adds no risk).
+    - A district/alliance "total kills over N.5" leg is redundant when the summed
+      guaranteed kills of its members (from their own over-lines and named-victim
+      legs) already exceed the line — e.g. both D10 tributes over 1.5 forces >=4
+      district kills, so "D10 total over 2.5" can never fail if they win.
+
+    In every case the granular per-tribute legs are kept and the entailed
+    aggregate/over leg is removed.
+    """
+    legs = [(mid, market_by_id[mid]) for mid in leg_ids if mid in market_by_id]
+
+    # Distinct named victims per killer -> a guaranteed kill floor for that killer.
+    victims: dict[int, set[int]] = {}
+    for _mid, m in legs:
+        if m.type == "KILL_EVENT" and m.tribute_a_id and m.tribute_b_id:
+            victims.setdefault(m.tribute_a_id, set()).add(m.tribute_b_id)
+    eff_floor: dict[int, int] = {tid: len(v) for tid, v in victims.items()}
+    for _mid, m in legs:
+        if m.type == "KILLS_OU" and m.tribute_a_id:
+            of = _kill_over_floor(m)
+            if of is not None:
+                eff_floor[m.tribute_a_id] = max(eff_floor.get(m.tribute_a_id, 0), of)
+
+    # Summed guaranteed kills per district / alliance (for the aggregate O/U legs).
+    district_sum: dict[int, int] = {}
+    alliance_sum: dict[int, int] = {}
+    for tid, fl in eff_floor.items():
+        t = tribute_by_id.get(tid)
+        if t is None:
+            continue
+        district_sum[t.district] = district_sum.get(t.district, 0) + fl
+        if t.alliance_id is not None:
+            alliance_sum[t.alliance_id] = alliance_sum.get(t.alliance_id, 0) + fl
+
+    drop: set[int] = set()
+    for mid, m in legs:
+        if m.type == "KILLS_OU" and m.ou_side == "OVER" and m.tribute_a_id:
+            of = _kill_over_floor(m)
+            if of is not None and len(victims.get(m.tribute_a_id, ())) >= of:
+                log.debug("Dropping redundant kills-over leg %d (guaranteed by victims)", mid)
+                drop.add(mid)
+        elif m.ou_side == "OVER" and m.ou_line is not None and m.placement_num is not None:
+            need = int(math.floor(m.ou_line)) + 1
+            if m.type == "DISTRICT_KILLS_OU" and district_sum.get(m.placement_num, 0) >= need:
+                log.debug("Dropping redundant district kills-over leg %d", mid)
+                drop.add(mid)
+            elif m.type == "ALLIANCE_KILLS_OU" and alliance_sum.get(m.placement_num, 0) >= need:
+                log.debug("Dropping redundant alliance kills-over leg %d", mid)
+                drop.add(mid)
+
+    return [mid for mid in leg_ids if mid not in drop]
+
+
+def _join_names(names: list[str]) -> str:
+    """Join tribute names for a title: 'A', 'A & B', or 'A, B & C'."""
+    names = [n for n in names if n]
+    if len(names) <= 1:
+        return names[0] if names else ""
+    if len(names) == 2:
+        return f"{names[0]} & {names[1]}"
+    return ", ".join(names[:-1]) + f" & {names[-1]}"
+
+
+def _ensure_title_names_all_tributes(name, leg_ids, market_by_id, tribute_by_id, subject_label):
+    """Rewrite a title that headlines only one of several tributes it bets on.
+
+    When a district-scoped parlay's legs back two or more of that district's
+    tributes but the model's title names just one, we expand the named tribute to
+    the full list (e.g. "Torque's Blood Harvest" -> "Torque & Fizzeé's Blood
+    Harvest"), keeping the same name form the model used.  Titles that name no
+    tribute (purely thematic/district titles) or already name all of them are
+    left untouched.  Alliance parlays keep their title — the alliance name in the
+    subject already covers every member.
+    """
+    if not subject_label.startswith("District "):
+        return name
+    try:
+        subj_district = int(subject_label.split()[1])
+    except (IndexError, ValueError):
+        return name
+
+    involved: list = []
+    seen: set[int] = set()
+    for mid in leg_ids:
+        m = market_by_id.get(mid)
+        if m is None:
+            continue
+        for tid in (m.tribute_a_id, m.tribute_b_id):
+            if not tid:
+                continue
+            t = tribute_by_id.get(tid)
+            if t is not None and t.district == subj_district and t.id not in seen:
+                seen.add(t.id)
+                involved.append(t)
+    if len(involved) < 2:
+        return name
+
+    def name_tokens(t):
+        parts = [p for p in re.split(r"[\s\-]+", t.name) if len(p) >= 3]
+        return parts or [t.name]
+
+    matched_form = None  # "first" or "last" — mirror whatever form the title used
+    mentioned: list = []
+    for t in involved:
+        parts = name_tokens(t)
+        for i, tok in enumerate(parts):
+            if re.search(rf"\b{re.escape(tok)}\b", name, re.IGNORECASE):
+                mentioned.append(t)
+                if matched_form is None:
+                    matched_form = "first" if (i == 0 and len(parts) > 1) else "last"
+                break
+    if not mentioned or len(mentioned) == len(involved):
+        return name
+
+    def form_name(t):
+        parts = name_tokens(t)
+        return parts[0] if matched_form == "first" else parts[-1]
+
+    joined = _join_names([form_name(t) for t in involved])
+    for tok in name_tokens(mentioned[0]):
+        hit = re.search(rf"\b{re.escape(tok)}\b", name, re.IGNORECASE)
+        if hit:
+            return (name[: hit.start()] + joined + name[hit.end():]).strip()
+    return name
 
 
 def _district_record_payload(dr) -> dict:
@@ -2307,15 +2920,20 @@ def _district_record_payload(dr) -> dict:
 
 
 async def _try_generate_ai_parlays(
-    session, phase_id: int | None, count: int = 3
+    session, phase_id: int | None, count: int = 3, *, replace_existing: bool = True
 ) -> int:
     """Attempt AI-powered featured parlay generation via Lemonade.
 
-    Clears existing AUTO templates and writes new ones (source="AUTO") when
-    successful.  Returns the count created, or 0 if Lemonade is unreachable,
+    When ``replace_existing`` is True (the default, used by phase transitions),
+    the current AUTO templates are cleared before the new ones are written so the
+    board always reflects the latest phase.  Pass False to keep the existing AUTO
+    parlays and append the new batch alongside them.  Writes new templates with
+    source="AUTO".  Returns the count created, or 0 if Lemonade is unreachable,
     no lore is stored, or the model returns nothing usable.  All exceptions
     are logged and swallowed so callers can fall back to the algorithmic path.
     """
+    if not _AUTO_PARLAY_GENERATION_ENABLED:
+        return 0
     lore_raw = await get_setting("lemonade_district_lore")
     if not lore_raw:
         return 0
@@ -2376,17 +2994,18 @@ async def _try_generate_ai_parlays(
         )
         pool = eligible[: max(count * 3, count + 4)]
         random.shuffle(pool)
-        # Distinct narrative angle per subject so themes, titles, and market-type
-        # mixes diverge (the model otherwise converges on "Silent Ascent").
-        angles = _PARLAY_ANGLES.copy()
-        random.shuffle(angles)
 
         tiers = ["SAFE", "BALANCED", "LONGSHOT"]
         random.shuffle(tiers)
         subjects: list[dict] = []
+        # Angle is derived from each subject's own markets so the title the model
+        # writes always matches its legs; used_themes spreads themes across the
+        # batch so subjects don't all pitch the same story.
+        used_themes: set[str] = set()
         # Over-provision subjects so a few model failures don't starve the batch.
         for idx, (key, ms) in enumerate(pool[: count + 3]):
             kind, ident = key
+            angle_text, shown_markets = _assign_theme(ms, used_themes)
             if kind == "D":
                 label = f"District {ident}"
                 subj_tributes = alive_by_district.get(ident, [])
@@ -2406,21 +3025,25 @@ async def _try_generate_ai_parlays(
             subjects.append({
                 "subject_label": label,
                 "lore": lore_text,
-                "markets": [{"id": m.id, "label": m.label, "odds": m.odds} for m in ms],
+                "markets": [{"id": m.id, "label": m.label, "odds": m.odds} for m in shown_markets],
                 "tributes": [_tribute_payload(t) for t in subj_tributes],
                 "district_records": [_district_record_payload(dr) for dr in recs],
                 "target_tier": tiers[idx % len(tiers)],
-                "angle": angles[idx % len(angles)],
+                "angle": angle_text,
             })
 
         if not subjects:
             log.debug("No subjects with >= 3 open markets; skipping AI parlays")
             return 0
 
+        # Don't cap at `count` here: post-processing below can still drop a slip
+        # (e.g. conflict filtering leaves it under the 3-leg minimum), so we take
+        # every successful suggestion and stop once `count` have actually been
+        # written.  Subjects are over-provisioned above to feed this.
         suggestions = await generate_ai_parlays_for_subjects(
             client,
             subjects,
-            limit=count,
+            limit=None,
             num_ctx=_cfg.LEMONADE_CTX_SIZE,
             timeout=_cfg.LEMONADE_TIMEOUT,
         )
@@ -2429,33 +3052,48 @@ async def _try_generate_ai_parlays(
             log.warning("Lemonade returned no valid parlay suggestions")
             return 0
 
-        old_rows = await session.execute(
-            select(ParlayTemplate).where(ParlayTemplate.source == "AUTO")
-        )
-        for tpl in old_rows.scalars().all():
-            await session.delete(tpl)
-        await session.flush()
+        if replace_existing:
+            old_rows = await session.execute(
+                select(ParlayTemplate).where(ParlayTemplate.source == "AUTO")
+            )
+            for tpl in old_rows.scalars().all():
+                await session.delete(tpl)
+            await session.flush()
 
         market_odds = {m.id: m.odds for m in open_markets}
         market_by_id = {m.id: m for m in open_markets}
         created = 0
         for sug in suggestions:
-            # Tidy the leg set (over/under conflicts, market-type variety cap)
-            # before anything else, since it changes the legs and combined odds.
+            # Tidy the leg set (over/under conflicts, market-type variety cap,
+            # then drop district/alliance aggregates that individual legs already
+            # cover) before anything else, since it changes the legs and odds.
             leg_ids = _refine_parlay_legs(sug["market_ids"], market_by_id)
-            if len(leg_ids) < 2:
+            leg_ids = _drop_nested_ou_legs(leg_ids, market_by_id)
+            leg_ids = _drop_redundant_aggregates(leg_ids, market_by_id, tribute_by_id)
+            leg_ids = _drop_nested_placement_legs(leg_ids, market_by_id)
+            leg_ids = _drop_duplicate_one_of_field_legs(leg_ids, market_by_id)
+            leg_ids = _drop_duplicate_district_score_legs(leg_ids, market_by_id)
+            leg_ids = _drop_district_score_floor_vs_highest_legs(leg_ids, market_by_id, tribute_by_id)
+            leg_ids = _drop_redundant_kill_legs(leg_ids, market_by_id, tribute_by_id)
+            if len(leg_ids) < 3:
                 log.warning(
-                    "Parlay '%s' has fewer than 2 legs after conflict filtering; skipping",
+                    "Parlay '%s' has fewer than 3 legs after conflict filtering; skipping",
                     sug.get("name"),
                 )
                 continue
+            # Rewrite the title if it headlines only one of several tributes the
+            # (now-final) legs actually back.
+            final_name = _ensure_title_names_all_tributes(
+                sug["name"], leg_ids, market_by_id, tribute_by_id,
+                sug.get("subject_label", ""),
+            )
             # Tier is assigned in code from true combined odds — the model is
             # never trusted to do the odds arithmetic.
             leg_odds = [market_odds[mid] for mid in leg_ids if mid in market_odds]
             tier = classify_parlay_tier(combined_american(leg_odds)) if leg_odds else "BALANCED"
             tpl = ParlayTemplate(
-                name=sug["name"],
-                description=sug["description"],
+                name=final_name,
+                description=sug["description"] if _AI_PARLAY_DESCRIPTIONS_ENABLED else "",
                 source="AUTO",
                 difficulty=tier,
                 phase_id=phase_id,
@@ -2468,6 +3106,8 @@ async def _try_generate_ai_parlays(
                     template_id=tpl.id, market_id=mid, sort_order=order,
                 ))
             created += 1
+            if created >= count:
+                break
 
         log.info("AI generated %d featured parlay(s) via Lemonade", created)
         return created
@@ -2477,14 +3117,45 @@ async def _try_generate_ai_parlays(
         return 0
 
 
-async def _check_parlay(session, parlay_id: int) -> dict | None:
+async def _check_parlay(session, parlay_id: int) -> list[dict]:
     """Check whether a parlay has fully resolved and settle it if so.
 
-    Returns a notification dict when the parlay finalizes (WON/LOST/VOIDED), else None.
+    Returns the notification dicts to send when the parlay finalizes
+    (WON/LOST/VOIDED): the owner's own result notif, plus — if this parlay was
+    created by tailing another member's board listing — a second notif so the
+    original poster learns their parlay got tailed and how it turned out.
+    Returns an empty list while the parlay is still pending.
     """
     parlay = await session.get(Parlay, parlay_id)
     if parlay is None or parlay.status != "PENDING":
-        return None
+        return []
+
+    async def _finalize(owner_notif: dict) -> list[dict]:
+        notifs = [owner_notif]
+        if parlay.tailed_from_user_id is not None:
+            _tur = await session.execute(
+                select(User).where(
+                    User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id
+                )
+            )
+            tailer = _tur.scalar_one_or_none()
+            notifs.append({
+                "type": "tail_notify",
+                "user_id": parlay.tailed_from_user_id,
+                "status": owner_notif["status"],
+                "tailer_username": tailer.username if tailer else "A member",
+                "parlay_id": parlay.tailed_from_parlay_id,
+            })
+            _pour = await session.execute(
+                select(User).where(
+                    User.guild_id == parlay.guild_id,
+                    User.discord_id == parlay.tailed_from_user_id,
+                )
+            )
+            poster = _pour.scalar_one_or_none()
+            owner_notif["original_poster_username"] = poster.username if poster else "a member"
+        return notifs
+
     leg_result = await session.execute(select(Bet).where(Bet.parlay_id == parlay_id))
     legs = leg_result.scalars().all()
     statuses = [leg.status for leg in legs]
@@ -2498,21 +3169,21 @@ async def _check_parlay(session, parlay_id: int) -> dict | None:
                 "odds": leg.odds_at_placement,
                 "status": leg.status,
             })
-        return {
+        return await _finalize({
             "type": "parlay",
             "user_id": parlay.user_id,
             "status": "LOST",
             "wager": parlay.total_wager,
             "payout": 0,
             "legs": leg_data,
-        }
+        })
     if any(s == "PENDING" for s in statuses):
         active_legs = [l for l in legs if l.status != "VOIDED"]
         if len(active_legs) < len(legs):
             parlay.total_payout = parlay_payout(
                 parlay.total_wager, [l.odds_at_placement for l in active_legs]
             )
-        return None
+        return []
     active_legs = [l for l in legs if l.status != "VOIDED"]
     if all(l.status == "WON" for l in active_legs):
         parlay.status = "WON"
@@ -2531,14 +3202,14 @@ async def _check_parlay(session, parlay_id: int) -> dict | None:
                 "odds": leg.odds_at_placement,
                 "status": leg.status,
             })
-        return {
+        return await _finalize({
             "type": "parlay",
             "user_id": parlay.user_id,
             "status": "WON",
             "wager": parlay.total_wager,
             "payout": parlay.total_payout,
             "legs": leg_data,
-        }
+        })
     elif all(l.status == "VOIDED" for l in legs):
         parlay.status = "WON"
         _pur = await session.execute(
@@ -2555,15 +3226,15 @@ async def _check_parlay(session, parlay_id: int) -> dict | None:
                 "odds": leg.odds_at_placement,
                 "status": leg.status,
             })
-        return {
+        return await _finalize({
             "type": "parlay",
             "user_id": parlay.user_id,
             "status": "VOIDED",
             "wager": parlay.total_wager,
             "payout": parlay.total_wager,
             "legs": leg_data,
-        }
-    return None
+        })
+    return []
 
 
 async def _unresolve_market(
@@ -2677,6 +3348,13 @@ def _placement_market_result(market: Market, placement: int) -> bool:
     line = market.ou_line if market.ou_line is not None else 0.5
     return placement > line if market.ou_side == "OVER" else placement <= line
 
+
+# Fixed line for every tribute's Placement Over/Under market — previously this
+# was computed from the field size *at the moment that tribute's markets were
+# generated* (e.g. during a staggered reaping reveal), so different tributes
+# ended up with different, inconsistent lines. Every tribute now gets the same
+# "Places Over 12.5" / "Places Under 12.5" pair regardless of field size.
+PLACEMENT_OU_LINE = 12.5
 
 _PLACEMENT_MARKET_TYPES = (
     "TRIBUTE_PLACEMENT",
@@ -2830,7 +3508,6 @@ async def _auto_create_tribute_markets(
     session, new_tribute: Tribute, all_tributes: list[Tribute]
 ) -> int:
     """Creates all standard markets when a tribute is added. Returns count created."""
-    n = len([t for t in all_tributes if t.status == "ALIVE"])
 
     # Pre-Games phase ID — stamped on training-score markets so phase-gating works
     pre_phase_result = await session.execute(
@@ -2920,9 +3597,8 @@ async def _auto_create_tribute_markets(
         for side in ["OVER", "UNDER"]:
             created += _add("KILLS_OU", new_tribute, ou_line=line, ou_side=side)
 
-    mid = round(n / 2.0 + 0.5, 1) if n > 1 else 1.5
     for side in ["OVER", "UNDER"]:
-        created += _add("PLACEMENT_OU", new_tribute, ou_line=mid, ou_side=side)
+        created += _add("PLACEMENT_OU", new_tribute, ou_line=PLACEMENT_OU_LINE, ou_side=side)
 
     # ── Milestone markets (auto-resolve when respective phase begins) ──────────
     for mtype in (
@@ -3047,8 +3723,8 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
     from the set of existing market keys the market is created fresh.
 
     PLACEMENT_OU is keyed only by (type, tribute_id, ou_side) — not the line —
-    because the midpoint shifts with field size. If any OVER/UNDER market of
-    that type already exists for the tribute, we leave it alone.
+    since every tribute uses the same fixed PLACEMENT_OU_LINE. If any OVER/UNDER
+    market of that type already exists for the tribute, we leave it alone.
     COMBINED_DISTRICT_SCORE is keyed by (type, min_id, max_id, guessed_sum)
     so a/b ordering in the DB doesn't matter.
     District markets are keyed by (type, district_num, ou_line, ou_side).
@@ -3069,10 +3745,6 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
     )
     pre_phase_obj = pre_phase_result.scalars().first()
     pre_phase_id = pre_phase_obj.id if pre_phase_obj else None
-
-    # Current field size for PLACEMENT_OU midpoint
-    n_alive = len([t for t in all_tributes if t.status == "ALIVE"])
-    mid = round(n_alive / 2.0 + 0.5, 1) if n_alive > 1 else 1.5
 
     # ── Build existing-market key sets ─────────────────────────────────────────
     # simple: (type, tribute_a_id) — single-tribute, no extra params
@@ -3282,7 +3954,7 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
         for side in ["OVER", "UNDER"]:
             key = ("PLACEMENT_OU", tid, side)
             if key not in existing_keyed:
-                _make("PLACEMENT_OU", tribute, ou_line=mid, ou_side=side)
+                _make("PLACEMENT_OU", tribute, ou_line=PLACEMENT_OU_LINE, ou_side=side)
                 existing_keyed.add(key)
 
         for score in range(1, 13):
@@ -3413,7 +4085,7 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
             _make_alliance(aid, aname, "ALLIANCE_VICTOR")
             existing_alliance.add(("ALLIANCE_VICTOR", aid, None, None))
 
-        for line in [0.5, 1.5, 2.5]:
+        for line in [3.5, 4.5, 5.5]:
             for side in ["OVER", "UNDER"]:
                 key = ("ALLIANCE_KILLS_OU", aid, line, side)
                 if key not in existing_alliance:
@@ -3421,14 +4093,6 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
                         aid, aname, "ALLIANCE_KILLS_OU", ou_line=line, ou_side=side
                     )
                     existing_alliance.add(key)
-
-        if ("ALLIANCE_ALL_BLOODBATH", aid, None, None) not in existing_alliance:
-            _make_alliance(aid, aname, "ALLIANCE_ALL_BLOODBATH")
-            existing_alliance.add(("ALLIANCE_ALL_BLOODBATH", aid, None, None))
-
-        if ("ALLIANCE_WIPED_BLOODBATH", aid, None, None) not in existing_alliance:
-            _make_alliance(aid, aname, "ALLIANCE_WIPED_BLOODBATH")
-            existing_alliance.add(("ALLIANCE_WIPED_BLOODBATH", aid, None, None))
 
         for mtype in (
             "ALLIANCE_ALL_FINAL_8",
@@ -3442,6 +4106,99 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
                 existing_alliance.add(key)
 
     return created_counts
+
+
+async def _start_game() -> dict:
+    """Shared game-start logic behind both the ``/game start`` Discord command
+    and the web Activity's admin "Start Game" action, so the two stay in sync
+    instead of drifting. Always begins in the lowest sort_order phase
+    (Pre-Games), seeds ARENA_TYPE prop markets, backfills anything voided by a
+    prior game cycle, and opens whatever the opening phase allows.
+
+    Returns ``{"error": "already_active"}`` if a game is already running, else
+    ``{"opened": int, "phase_name": str | None, "auto_parlays": int}``.
+    """
+    game_active_raw = await get_setting("game_active")
+    if json.loads(game_active_raw or "false"):
+        return {"error": "already_active"}
+
+    async with get_session() as session:
+        # Always start in the first phase (lowest sort_order = Pre-Games)
+        phase_result = await session.execute(
+            select(BettingPhase).order_by(BettingPhase.sort_order).limit(1)
+        )
+        pre_phase = phase_result.scalars().first()
+        pre_phase_id = pre_phase.id if pre_phase else None
+        pre_phase_name = pre_phase.name if pre_phase else None
+
+        # Create ARENA_TYPE prop markets for this game (idempotent)
+        art_row = await session.get(GameSetting, "arena_artificial_count")
+        nat_row = await session.get(GameSetting, "arena_natural_count")
+        art_count = int(json.loads(art_row.value)) if art_row else 0
+        nat_count = int(json.loads(nat_row.value)) if nat_row else 0
+        total_arena = art_count + nat_count
+
+        from bot.odds.calculator import prob_to_american as _p2a
+
+        for arena_cause in ("ARTIFICIAL", "NATURAL"):
+            exists = await session.execute(
+                select(Market).where(
+                    Market.type == "ARENA_TYPE",
+                    Market.cause == arena_cause,
+                    Market.status.in_(["OPEN", "CLOSED"]),
+                )
+            )
+            if not exists.scalars().first():
+                if total_arena > 0:
+                    count = art_count if arena_cause == "ARTIFICIAL" else nat_count
+                    raw_prob = count / total_arena
+                    arena_odds = _p2a(min(0.95, raw_prob * 1.05))
+                else:
+                    arena_odds = -110
+                arena_label = f"Arena Type — {'Artificial' if arena_cause == 'ARTIFICIAL' else 'Natural'}"
+                session.add(
+                    Market(
+                        type="ARENA_TYPE",
+                        label=arena_label,
+                        tribute_a_id=None,
+                        cause=arena_cause,
+                        phase_id=pre_phase_id,
+                        odds=arena_odds,
+                        status="CLOSED",
+                    )
+                )
+
+        # Recreate any per-tribute markets that were resolved (voided) in a
+        # prior game cycle — backfill skips resolved rows, so they're gone now.
+        await _backfill_missing_markets(session)
+
+        # Open only the markets available in the opening phase (Pre-Games:
+        # District Victor + training-score/scouting props). Everything else
+        # opens progressively via /game set_phase.
+        allowed_types = _open_types_for_phase(pre_phase_name)
+        mkt_result = await session.execute(
+            select(Market).where(Market.status == "CLOSED")
+        )
+        opened = 0
+        for m in mkt_result.scalars().all():
+            if _market_should_open(m, pre_phase_id, allowed_types):
+                m.status = "OPEN"
+                opened += 1
+
+        # A fresh game starts before the sponsorship window opens.
+        await _set_sponsor_state(session, None)
+
+        # Seed the tailing board with three featured parlays for this phase.
+        auto_made = (
+            await _try_generate_ai_parlays(session, pre_phase_id)
+            or await _generate_auto_parlays(session, pre_phase_id)
+        )
+
+    await set_setting("game_active", True)
+    if pre_phase_id is not None:
+        await set_setting("current_phase_id", pre_phase_id)
+
+    return {"opened": opened, "phase_name": pre_phase_name, "auto_parlays": auto_made}
 
 
 async def _auto_create_alliance_markets(
@@ -3480,11 +4237,9 @@ async def _auto_create_alliance_markets(
 
     created = 0
     created += _add("ALLIANCE_VICTOR")
-    for line in [0.5, 1.5, 2.5]:
+    for line in [3.5, 4.5, 5.5]:
         for side in ["OVER", "UNDER"]:
             created += _add("ALLIANCE_KILLS_OU", ou_line=line, ou_side=side)
-    created += _add("ALLIANCE_ALL_BLOODBATH")
-    created += _add("ALLIANCE_WIPED_BLOODBATH")
     for mtype in (
         "ALLIANCE_ALL_FINAL_8",
         "ALLIANCE_ONE_FINAL_8",
@@ -3842,7 +4597,7 @@ class AdminCog(commands.Cog):
     )
     restrict = app_commands.Group(
         name="restrict",
-        description="Manage user betting restrictions",
+        description="Manage user betting and sportsbook access restrictions",
         default_permissions=_ADMIN_PERMS,
     )
     # Top-level (not under /admin) to stay within Discord's 8000-char limit on
@@ -4245,46 +5000,12 @@ class AdminCog(commands.Cog):
                 markets_resolved += 1
                 chips_issued += stats.get("credits", 0)
 
-            # Resolve HIGHEST/LOWEST training score markets once every tribute has a score
-            if all(tr.training_score is not None for tr in all_tributes):
-                max_score = max(tr.training_score for tr in all_tributes)
-                min_score = min(tr.training_score for tr in all_tributes)
-                for mtype, target in (
-                    ("HIGHEST_TRAINING_SCORE", max_score),
-                    ("LOWEST_TRAINING_SCORE", min_score),
-                ):
-                    hl_result = await session.execute(
-                        select(Market).where(
-                            Market.type == mtype,
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )
-                    )
-                    for mkt in hl_result.scalars().all():
-                        trib = tribute_map.get(mkt.tribute_a_id) if mkt.tribute_a_id else None
-                        result = bool(trib and trib.training_score == target)
-                        stats = await _resolve_market(session, mkt, result)
-                        markets_resolved += 1
-                        chips_issued += stats.get("credits", 0)
-
-                # Resolve DISTRICT_HIGHEST_SCORE now that every tribute has a score
-                dist_scores: dict[int, int] = {}
-                for tr in all_tributes:
-                    dist_scores[tr.district] = (
-                        dist_scores.get(tr.district, 0) + tr.training_score
-                    )
-                max_dist_score = max(dist_scores.values())
-                dhs_result = await session.execute(
-                    select(Market).where(
-                        Market.type == "DISTRICT_HIGHEST_SCORE",
-                        Market.status.in_(["OPEN", "CLOSED"]),
-                    )
-                )
-                for mkt in dhs_result.scalars().all():
-                    d = mkt.placement_num
-                    result = d is not None and dist_scores.get(d, 0) == max_dist_score
-                    stats = await _resolve_market(session, mkt, result)
-                    markets_resolved += 1
-                    chips_issued += stats.get("credits", 0)
+            # Resolve HIGHEST/LOWEST training score + DISTRICT_HIGHEST_SCORE markets
+            # once every tribute who can still be scored has a score (dead,
+            # never-scored tributes count as null and don't block this).
+            r, c = await _resolve_score_completion_markets(session, all_tributes, tribute_map)
+            markets_resolved += r
+            chips_issued += c
 
             await _recalculate_markets(session)
 
@@ -4331,6 +5052,9 @@ class AdminCog(commands.Cog):
                 ephemeral=True,
             )
             return
+        current_phase_raw = await get_setting("current_phase_id")
+        current_phase_id = json.loads(current_phase_raw) if current_phase_raw else None
+
         _kill_notifs: list[dict] = []
         _kill_token = _notif_buffer.set(_kill_notifs)
         async with get_session() as session:
@@ -4343,8 +5067,21 @@ class AdminCog(commands.Cog):
                     "A tribute cannot be their own killer.", ephemeral=True
                 )
                 return
+            # Kills scored while Bloodbath is the active phase also bump the
+            # tribute's bloodbath-scoped counter, so BLOODBATH_KILLS_OU /
+            # ANY_BB_DOUBLE_KILL resolve on exactly the kills that happened
+            # during the Bloodbath — regardless of when the admin later
+            # triggers the transition into Arena.
+            in_bloodbath = False
+            if current_phase_id is not None:
+                cur_phase = await session.get(BettingPhase, current_phase_id)
+                in_bloodbath = bool(cur_phase and cur_phase.name == "Bloodbath")
             t.status = "DEAD"
             t.death_cause = cause
+            # Died before ever receiving a training score (typically a Pre-Games
+            # death) — every bet made on them is voided and refunded rather than
+            # resolved as a loss, since they never got a fair shot at the Games.
+            void_scoreless_death = t.training_score is None
             killer_name = None
             killer_district = None
             killer_gender = None
@@ -4362,6 +5099,8 @@ class AdminCog(commands.Cog):
                     dr = kill_boost_dr_factor(killer.kills, nkr)
                     killer.kill_boost = (killer.kill_boost or 0.0) + max(0.0, kill_boost_factor - 1.0) * dr
                     killer.kills += 1
+                    if in_bloodbath:
+                        killer.bloodbath_kills += 1
                     killer_name = killer.name
                     killer_district = killer.district
                     killer_gender = killer.display_gender
@@ -4430,8 +5169,17 @@ class AdminCog(commands.Cog):
                 )
             )
             for mkt in a_mkts.scalars().all():
-                if mkt.type in ("MISSES_FINAL_8", "MISSES_FINAL_5"):
+                if void_scoreless_death:
+                    # Never trained/scored before dying — void every bet on them
+                    # instead of resolving it, win or lose.
+                    await _resolve_market(session, mkt, None)
+                elif mkt.type in ("MISSES_FINAL_8", "MISSES_FINAL_5"):
                     await _resolve_market(session, mkt, True)
+                elif mkt.type == "TRIBUTE_KILLED_BLOODBATH":
+                    # WIN only if this death happened while Bloodbath was the
+                    # active phase — the catch-all below would otherwise always
+                    # resolve this LOSE, since dying is the winning condition.
+                    await _resolve_market(session, mkt, in_bloodbath)
                 elif mkt.type == "DEATH_CAUSE":
                     # Exactly one cause wins; all others lose.
                     await _resolve_market(session, mkt, mkt.cause == cause)
@@ -4470,7 +5218,9 @@ class AdminCog(commands.Cog):
                 )
             )
             for mkt in b_mkts.scalars().all():
-                if mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
+                if void_scoreless_death:
+                    await _resolve_market(session, mkt, None)
+                elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
                     # tribute_b (the partner) just died — resolve if tribute_a placement is known.
                     ta_obj = await session.get(Tribute, mkt.tribute_a_id) if mkt.tribute_a_id else None
                     if ta_obj and ta_obj.placement is not None:
@@ -4613,6 +5363,16 @@ class AdminCog(commands.Cog):
                                 session, mkt, mkt.placement_num == t_alliance_id
                             )
 
+            # This tribute is now excluded from the training-score completion
+            # check (dead + never scored counts as null) — dying may be exactly
+            # what was blocking HIGHEST/LOWEST_TRAINING_SCORE / DISTRICT_HIGHEST_SCORE
+            # from resolving, so re-check now rather than waiting on a future
+            # /admin tribute set_score call that will never come for this tribute.
+            all_result = await session.execute(select(Tribute))
+            all_tributes = list(all_result.scalars().all())
+            tribute_map = {tr.id: tr for tr in all_tributes}
+            await _resolve_score_completion_markets(session, all_tributes, tribute_map)
+
             await _recalculate_markets(session)
 
         _notif_buffer.reset(_kill_token)
@@ -4638,7 +5398,13 @@ class AdminCog(commands.Cog):
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
+        current_phase_raw = await get_setting("current_phase_id")
+        current_phase_id = json.loads(current_phase_raw) if current_phase_raw else None
         async with get_session() as session:
+            in_bloodbath = False
+            if current_phase_id is not None:
+                cur_phase = await session.get(BettingPhase, current_phase_id)
+                in_bloodbath = bool(cur_phase and cur_phase.name == "Bloodbath")
             t = await session.get(Tribute, int(tribute_id))
             if not t:
                 await interaction.followup.send("Tribute not found.", ephemeral=True)
@@ -4806,6 +5572,8 @@ class AdminCog(commands.Cog):
                 dr = kill_boost_dr_factor(killer.kills - 1, nkr)
                 contribution = max(0.0, kill_boost_factor - 1.0) * dr
                 killer.kills -= 1
+                if in_bloodbath and killer.bloodbath_kills > 0:
+                    killer.bloodbath_kills -= 1
                 killer.kill_boost = max(0.0, (killer.kill_boost or 0.0) - contribution)
                 killer_str = f" (credited kill removed from D{killer.district}{killer.display_gender} {killer.name})"
 
@@ -5219,6 +5987,256 @@ class AdminCog(commands.Cog):
 
         embed = discord.Embed(
             title="Mass Import Complete",
+            description="\n".join(lines),
+            color=0x4CAF50,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @tribute.command(
+        name="score_import_template",
+        description="Download the current roster as a JSON template for mass score import",
+    )
+    @is_admin()
+    async def tribute_score_import_template(self, interaction: discord.Interaction) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        import io
+        async with get_read_session() as session:
+            result = await session.execute(
+                select(Tribute).order_by(Tribute.district, Tribute.gender)
+            )
+            tributes = result.scalars().all()
+        if not tributes:
+            await interaction.followup.send(
+                "No tributes exist yet — add tributes before importing scores.", ephemeral=True
+            )
+            return
+        template = [
+            {
+                "tribute_id": t.id,
+                "name": t.name,
+                "district": t.district,
+                "gender": t.display_gender,
+                "score": t.training_score,
+            }
+            for t in tributes
+        ]
+        buf = io.BytesIO(json.dumps(template, indent=2).encode("utf-8"))
+        await interaction.followup.send(
+            "Fill in the `score` field (1–12) for each tribute and upload it with "
+            "`/tribute mass_import_scores`. Leave `score` as `null` to skip a tribute.",
+            file=discord.File(buf, filename="tribute_scores_template.json"),
+            ephemeral=True,
+        )
+
+    @tribute.command(
+        name="mass_import_scores",
+        description="Bulk-set training scores from a JSON file and resolve score markets",
+    )
+    @app_commands.describe(
+        file="JSON file containing tribute scores (get the template with /tribute score_import_template)"
+    )
+    @is_admin()
+    async def tribute_mass_import_scores(
+        self,
+        interaction: discord.Interaction,
+        file: discord.Attachment,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+
+        if not file.filename.endswith(".json"):
+            await interaction.followup.send("File must be a `.json` file.", ephemeral=True)
+            return
+        if file.size > 512_000:
+            await interaction.followup.send("File is too large (max 512 KB).", ephemeral=True)
+            return
+
+        try:
+            raw = await file.read()
+            data = json.loads(raw)
+        except Exception as exc:
+            await interaction.followup.send(f"Failed to parse JSON: {exc}", ephemeral=True)
+            return
+
+        if not isinstance(data, list):
+            await interaction.followup.send(
+                "JSON must be a list (`[...]`) of tribute score objects.", ephemeral=True
+            )
+            return
+
+        errors: list[str] = []
+        updates: dict[int, int] = {}
+        seen_ids: set[int] = set()
+
+        for i, entry in enumerate(data):
+            row = i + 1
+            if not isinstance(entry, dict):
+                errors.append(f"Row {row}: not an object")
+                continue
+
+            tribute_id = entry.get("tribute_id")
+            if not isinstance(tribute_id, int) or isinstance(tribute_id, bool):
+                errors.append(f"Row {row}: 'tribute_id' is required and must be an integer")
+                continue
+
+            score = entry.get("score")
+            if score is None:
+                continue  # unfilled row — skip silently, not an error
+
+            if not isinstance(score, int) or isinstance(score, bool) or not (1 <= score <= 12):
+                errors.append(
+                    f"Row {row} (tribute #{tribute_id}): 'score' must be an integer 1–12 or null"
+                )
+                continue
+
+            if tribute_id in seen_ids:
+                errors.append(f"Row {row}: tribute #{tribute_id} appears more than once in this file")
+                continue
+            seen_ids.add(tribute_id)
+            updates[tribute_id] = score
+
+        if errors:
+            error_text = "\n".join(errors[:20])
+            if len(errors) > 20:
+                error_text += f"\n… and {len(errors) - 20} more"
+            await interaction.followup.send(
+                f"**Validation failed.** Fix these issues and re-upload:\n```\n{error_text}\n```",
+                ephemeral=True,
+            )
+            return
+
+        if not updates:
+            await interaction.followup.send(
+                "No scores to import — every row was null or the file was empty.", ephemeral=True
+            )
+            return
+
+        async with _collect_notifications() as notifs:
+            async with get_session() as session:
+                all_result = await session.execute(select(Tribute))
+                all_tributes = list(all_result.scalars().all())
+                tribute_map = {t.id: t for t in all_tributes}
+
+                missing = [tid for tid in updates if tid not in tribute_map]
+                if missing:
+                    await interaction.followup.send(
+                        f"Tribute ID(s) not found: {', '.join(str(m) for m in missing)}",
+                        ephemeral=True,
+                    )
+                    return
+
+                scored_names: list[str] = []
+                for tid, score in updates.items():
+                    t = tribute_map[tid]
+                    t.training_score = score
+                    scored_names.append(f"D{t.district}{t.gender} {t.name}: {score}")
+                await session.flush()
+
+                markets_resolved = 0
+                chips_issued = 0
+                updated_ids = set(updates.keys())
+
+                # Resolve EXACT_TRAINING_SCORE and TRAINING_SCORE_OU for each updated tribute
+                ts_result = await session.execute(
+                    select(Market).where(
+                        Market.tribute_a_id.in_(updated_ids),
+                        Market.type.in_(["EXACT_TRAINING_SCORE", "TRAINING_SCORE_OU"]),
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                    )
+                )
+                for mkt in ts_result.scalars().all():
+                    trib = tribute_map[mkt.tribute_a_id]
+                    if mkt.type == "EXACT_TRAINING_SCORE":
+                        result = trib.training_score == mkt.placement_num
+                    else:
+                        line = mkt.ou_line if mkt.ou_line is not None else 6.5
+                        result = (
+                            trib.training_score > line
+                            if mkt.ou_side == "OVER"
+                            else trib.training_score <= line
+                        )
+                    stats = await _resolve_market(session, mkt, result)
+                    markets_resolved += 1
+                    chips_issued += stats.get("credits", 0)
+
+                # Resolve COMBINED_DISTRICT_SCORE markets where both tributes now have scores
+                combined_result = await session.execute(
+                    select(Market).where(
+                        or_(
+                            Market.tribute_a_id.in_(updated_ids),
+                            Market.tribute_b_id.in_(updated_ids),
+                        ),
+                        Market.type == "COMBINED_DISTRICT_SCORE",
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                    )
+                )
+                for mkt in combined_result.scalars().all():
+                    ta = tribute_map.get(mkt.tribute_a_id) if mkt.tribute_a_id else None
+                    tb = tribute_map.get(mkt.tribute_b_id) if mkt.tribute_b_id else None
+                    if (
+                        ta is None
+                        or tb is None
+                        or ta.training_score is None
+                        or tb.training_score is None
+                    ):
+                        continue  # partner score not yet set — resolve later
+                    result = ta.training_score + tb.training_score == mkt.placement_num
+                    stats = await _resolve_market(session, mkt, result)
+                    markets_resolved += 1
+                    chips_issued += stats.get("credits", 0)
+
+                # Resolve PARTNER_SCORE_* markets where both tributes now have scores
+                pscore_result = await session.execute(
+                    select(Market).where(
+                        or_(
+                            Market.tribute_a_id.in_(updated_ids),
+                            Market.tribute_b_id.in_(updated_ids),
+                        ),
+                        Market.type.in_(["PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER"]),
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                    )
+                )
+                for mkt in pscore_result.scalars().all():
+                    ta = tribute_map.get(mkt.tribute_a_id) if mkt.tribute_a_id else None
+                    tb = tribute_map.get(mkt.tribute_b_id) if mkt.tribute_b_id else None
+                    if (
+                        ta is None
+                        or tb is None
+                        or ta.training_score is None
+                        or tb.training_score is None
+                    ):
+                        continue  # partner score not yet set — resolve later
+                    if mkt.type == "PARTNER_SCORE_HIGHER":
+                        result = ta.training_score > tb.training_score
+                    else:
+                        result = ta.training_score < tb.training_score
+                    stats = await _resolve_market(session, mkt, result)
+                    markets_resolved += 1
+                    chips_issued += stats.get("credits", 0)
+
+                # Resolve HIGHEST/LOWEST training score + DISTRICT_HIGHEST_SCORE markets
+                # once every tribute who can still be scored has a score (dead,
+                # never-scored tributes count as null and don't block this).
+                r, c = await _resolve_score_completion_markets(session, all_tributes, tribute_map)
+                markets_resolved += r
+                chips_issued += c
+
+                await _recalculate_markets(session)
+
+        await _send_resolution_dms(self.bot, notifs)
+
+        lines = [
+            f"**{len(scored_names)}** tribute(s) scored, **{markets_resolved}** market(s) resolved."
+        ]
+        if chips_issued:
+            lines.append(f"**{fmt_chips(chips_issued)}** in chips paid out.")
+        if scored_names:
+            bullet_block = "\n".join(f"• {lbl}" for lbl in scored_names)
+            lines.append(f"\n**Scores:**\n{bullet_block}")
+
+        embed = discord.Embed(
+            title="Mass Score Import Complete",
             description="\n".join(lines),
             color=0x4CAF50,
         )
@@ -5782,23 +6800,38 @@ class AdminCog(commands.Cog):
             embed.add_field(name="Chips Paid Out", value=fmt_chips(stats["credits"]))
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @market.command(name="bulk_close", description="Close ALL open markets immediately")
+    @market.command(
+        name="bulk_close",
+        description="Close open markets immediately, optionally filtered by type",
+    )
+    @app_commands.describe(
+        market_type="Market type filter (blank = close all open markets)",
+    )
+    @app_commands.autocomplete(market_type=market_type_autocomplete)
     @is_admin()
-    async def market_bulk_close(self, interaction: discord.Interaction) -> None:
+    async def market_bulk_close(
+        self, interaction: discord.Interaction, market_type: str | None = None
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            result = await session.execute(
-                select(Market).where(Market.status == "OPEN")
-            )
+            query = select(Market).where(Market.status == "OPEN")
+            if market_type:
+                query = query.where(Market.type == market_type)
+            result = await session.execute(query)
             markets = result.scalars().all()
             count = len(markets)
             for m in markets:
                 m.status = "CLOSED"
 
-        await interaction.followup.send(
-            f"Closed {count} open market(s).", ephemeral=True
-        )
+        if market_type:
+            await interaction.followup.send(
+                f"Closed {count} open {market_type} market(s).", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"Closed {count} open market(s).", ephemeral=True
+            )
 
     @market.command(
         name="bulk_open",
@@ -6140,100 +7173,24 @@ class AdminCog(commands.Cog):
     async def game_start(self, interaction: discord.Interaction) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
-        game_active_raw = await get_setting("game_active")
-        if json.loads(game_active_raw or "false"):
+        result = await _start_game()
+        if result.get("error") == "already_active":
             await interaction.followup.send(
                 "The Games are already running. Use `/game end` to conclude them first.",
                 ephemeral=True,
             )
             return
 
-        async with get_session() as session:
-            # Always start in the first phase (lowest sort_order = Pre-Games)
-            phase_result = await session.execute(
-                select(BettingPhase).order_by(BettingPhase.sort_order).limit(1)
-            )
-            pre_phase = phase_result.scalars().first()
-            pre_phase_id = pre_phase.id if pre_phase else None
-            pre_phase_name = pre_phase.name if pre_phase else None
-
-            # Create ARENA_TYPE prop markets for this game (idempotent)
-            art_row = await session.get(GameSetting, "arena_artificial_count")
-            nat_row = await session.get(GameSetting, "arena_natural_count")
-            art_count = int(json.loads(art_row.value)) if art_row else 0
-            nat_count = int(json.loads(nat_row.value)) if nat_row else 0
-            total_arena = art_count + nat_count
-
-            from bot.odds.calculator import prob_to_american as _p2a
-
-            for arena_cause in ("ARTIFICIAL", "NATURAL"):
-                exists = await session.execute(
-                    select(Market).where(
-                        Market.type == "ARENA_TYPE",
-                        Market.cause == arena_cause,
-                        Market.status.in_(["OPEN", "CLOSED"]),
-                    )
-                )
-                if not exists.scalars().first():
-                    if total_arena > 0:
-                        count = art_count if arena_cause == "ARTIFICIAL" else nat_count
-                        raw_prob = count / total_arena
-                        arena_odds = _p2a(min(0.95, raw_prob * 1.05))
-                    else:
-                        arena_odds = -110
-                    arena_label = f"Arena Type — {'Artificial' if arena_cause == 'ARTIFICIAL' else 'Natural'}"
-                    session.add(
-                        Market(
-                            type="ARENA_TYPE",
-                            label=arena_label,
-                            tribute_a_id=None,
-                            cause=arena_cause,
-                            phase_id=pre_phase_id,
-                            odds=arena_odds,
-                            status="CLOSED",
-                        )
-                    )
-
-            # Recreate any per-tribute markets that were resolved (voided) in a
-            # prior game cycle — backfill skips resolved rows, so they're gone now.
-            await _backfill_missing_markets(session)
-
-            # Open only the markets available in the opening phase (Pre-Games:
-            # District Victor + training-score/scouting props). Everything else
-            # opens progressively via /game set_phase.
-            allowed_types = _open_types_for_phase(pre_phase_name)
-            mkt_result = await session.execute(
-                select(Market).where(Market.status == "CLOSED")
-            )
-            opened = 0
-            for m in mkt_result.scalars().all():
-                if _market_should_open(m, pre_phase_id, allowed_types):
-                    m.status = "OPEN"
-                    opened += 1
-
-            # A fresh game starts before the sponsorship window opens.
-            await _set_sponsor_state(session, None)
-
-            # Seed the tailing board with three featured parlays for this phase.
-            auto_made = (
-                await _try_generate_ai_parlays(session, pre_phase_id)
-                or await _generate_auto_parlays(session, pre_phase_id)
-            )
-
-        await set_setting("game_active", True)
-        if pre_phase_id is not None:
-            await set_setting("current_phase_id", pre_phase_id)
-
-        phase_str = f" ({pre_phase_name} phase)" if pre_phase_name else ""
+        phase_str = f" ({result['phase_name']} phase)" if result["phase_name"] else ""
         embed = discord.Embed(
             title="⚡ THE HUNGER GAMES HAVE BEGUN",
-            description=f"Opened **{opened}** market(s){phase_str}. May the odds be ever in your favor.",
+            description=f"Opened **{result['opened']}** market(s){phase_str}. May the odds be ever in your favor.",
             color=0xC9A227,
         )
-        if auto_made:
+        if result["auto_parlays"]:
             embed.add_field(
                 name="Featured Parlays",
-                value=f"{auto_made} auto-parlay(s) posted to the tailing board.",
+                value=f"{result['auto_parlays']} auto-parlay(s) posted to the tailing board.",
                 inline=False,
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -6303,11 +7260,14 @@ class AdminCog(commands.Cog):
         )
 
     @game.command(name="set_phase", description="Transition to a new betting phase")
-    @app_commands.describe(phase_id="Phase to activate")
+    @app_commands.describe(
+        phase_id="Phase to activate",
+        confirm="Type 'yes' to proceed off Pre-Games even though some tributes have no training score",
+    )
     @app_commands.autocomplete(phase_id=phase_autocomplete)
     @is_admin()
     async def game_set_phase(
-        self, interaction: discord.Interaction, phase_id: str
+        self, interaction: discord.Interaction, phase_id: str, confirm: str | None = None
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
@@ -6324,12 +7284,37 @@ class AdminCog(commands.Cog):
         async with get_session() as session:
             new_phase = await session.get(BettingPhase, new_phase_id)
             if not new_phase:
+                _notif_buffer.reset(_phase_token)
                 await interaction.followup.send("Phase not found.", ephemeral=True)
                 return
 
             old_phase: BettingPhase | None = None
             if old_phase_id:
                 old_phase = await session.get(BettingPhase, old_phase_id)
+
+            # Leaving Pre-Games with tributes still missing a training score is
+            # usually a mistake (scouting/training-score markets resolve the
+            # instant Pre-Games ends) — require an explicit confirm to proceed.
+            if (
+                old_phase
+                and old_phase.name == "Pre-Games"
+                and new_phase_id != old_phase_id
+                and (confirm or "").lower() != "yes"
+            ):
+                missing_result = await session.execute(
+                    select(Tribute).where(Tribute.training_score.is_(None))
+                )
+                missing = list(missing_result.scalars().all())
+                if missing:
+                    _notif_buffer.reset(_phase_token)
+                    names = ", ".join(_tribute_label(t) for t in missing[:20])
+                    more = f" (+{len(missing) - 20} more)" if len(missing) > 20 else ""
+                    await interaction.followup.send(
+                        f"⚠️ **{len(missing)}** tribute(s) have no training score set yet: "
+                        f"{names}{more}.\nRe-run with `confirm: yes` to leave Pre-Games anyway.",
+                        ephemeral=True,
+                    )
+                    return
 
             closed_count = 0
             opened_count = 0
@@ -6394,32 +7379,6 @@ class AdminCog(commands.Cog):
                             f"{dbb_count} District Both Survive Bloodbath"
                         )
 
-                    # Resolve ALLIANCE_ALL_BLOODBATH: WIN if all alliance members alive
-                    abb_result = await session.execute(
-                        select(Market).where(
-                            Market.type == "ALLIANCE_ALL_BLOODBATH",
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )
-                    )
-                    abb_count = 0
-                    for mkt in abb_result.scalars().all():
-                        aid = mkt.placement_num
-                        if aid is None:
-                            await _resolve_market(session, mkt, None)
-                        else:
-                            a_members = [
-                                t for t in all_tributes if t.alliance_id == aid
-                            ]
-                            all_alive = len(a_members) > 0 and all(
-                                t.id in alive_ids for t in a_members
-                            )
-                            await _resolve_market(session, mkt, all_alive)
-                        abb_count += 1
-                    if abb_count:
-                        auto_resolved.append(
-                            f"{abb_count} Alliance All Survive Bloodbath"
-                        )
-
                     # Resolve TRIBUTE_KILLED_BLOODBATH: WIN if tribute is dead
                     tkb_result = await session.execute(
                         select(Market).where(
@@ -6466,34 +7425,8 @@ class AdminCog(commands.Cog):
                             f"{dwb_count} District Wiped in Bloodbath"
                         )
 
-                    # Resolve ALLIANCE_WIPED_BLOODBATH: WIN if all alliance members dead
-                    awb_result = await session.execute(
-                        select(Market).where(
-                            Market.type == "ALLIANCE_WIPED_BLOODBATH",
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )
-                    )
-                    awb_count = 0
-                    for mkt in awb_result.scalars().all():
-                        aid = mkt.placement_num
-                        if aid is None:
-                            await _resolve_market(session, mkt, None)
-                        else:
-                            a_members = [
-                                t for t in all_tributes if t.alliance_id == aid
-                            ]
-                            all_dead = len(a_members) > 0 and all(
-                                t.id not in alive_ids for t in a_members
-                            )
-                            await _resolve_market(session, mkt, all_dead)
-                        awb_count += 1
-                    if awb_count:
-                        auto_resolved.append(
-                            f"{awb_count} Alliance Wiped in Bloodbath"
-                        )
-
-                    # Resolve BLOODBATH_KILLS_OU: sum kills across all tributes
-                    bb_kills_total = sum(t.kills for t in all_tributes)
+                    # Resolve BLOODBATH_KILLS_OU: sum kills scored during Bloodbath
+                    bb_kills_total = sum(t.bloodbath_kills for t in all_tributes)
                     bk_result = await session.execute(
                         select(Market).where(
                             Market.type == "BLOODBATH_KILLS_OU",
@@ -6564,10 +7497,9 @@ class AdminCog(commands.Cog):
                         if bbd_mkts:
                             auto_resolved.append(f"{len(bbd_mkts)} {bb_type.replace('_', ' ').title()}")
 
-                    # ANY_BB_DOUBLE_KILL: did any tribute rack up 2+ kills in the
-                    # Bloodbath? All kills so far were scored this phase, so any
-                    # tribute sitting on 2+ kills satisfies it.
-                    bb_double = any(t.kills >= 2 for t in all_tributes)
+                    # ANY_BB_DOUBLE_KILL: did any tribute rack up 2+ kills during
+                    # the Bloodbath specifically.
+                    bb_double = any(t.bloodbath_kills >= 2 for t in all_tributes)
                     abdk_result = await session.execute(
                         select(Market).where(
                             Market.type == "ANY_BB_DOUBLE_KILL",
@@ -6877,6 +7809,8 @@ class AdminCog(commands.Cog):
                     auto_resolved.append("Funding modifiers reduced (sponsors closed)")
 
                 # Refresh the three featured parlays from this phase's open markets.
+                # Both generators are gated by _AUTO_PARLAY_GENERATION_ENABLED, so
+                # this is a no-op while that kill switch is off.
                 auto_made = (
                     await _try_generate_ai_parlays(session, new_phase_id)
                     or await _generate_auto_parlays(session, new_phase_id)
@@ -7829,7 +8763,8 @@ class AdminCog(commands.Cog):
                 await interaction.followup.send("That market is already a leg.", ephemeral=True)
                 return
             existing_mkts = [m for _, m in pairs if m is not None]
-            conflict = _parlay_conflict(existing_mkts, new_mkt)
+            tribute_by_id = await tribute_lookup_for_markets(session, existing_mkts + [new_mkt])
+            conflict = _parlay_conflict(existing_mkts, new_mkt, tribute_by_id)
             if conflict:
                 await interaction.followup.send(conflict, ephemeral=True)
                 return
@@ -7945,6 +8880,44 @@ class AdminCog(commands.Cog):
             f"Template **#{template_id} — {name}** is now **{state}**.", ephemeral=True
         )
 
+    @parlay.command(
+        name="set-description",
+        description="Edit the description shown for a parlay (works on auto-generated ones too)",
+    )
+    @app_commands.describe(
+        template_id="Template to edit",
+        description="New description text (use 'none' to clear it)",
+    )
+    @app_commands.autocomplete(template_id=parlay_template_autocomplete)
+    @is_admin()
+    async def parlay_set_description(
+        self, interaction: discord.Interaction, template_id: str, description: str
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        if not template_id.isdigit():
+            await interaction.followup.send("Pick a template from the list.", ephemeral=True)
+            return
+        from bot.lemonade import _fit_description
+
+        async with get_session() as session:
+            tpl = await session.get(ParlayTemplate, int(template_id))
+            if tpl is None:
+                await interaction.followup.send("Template not found.", ephemeral=True)
+                return
+            if description.strip().lower() == "none":
+                tpl.description = ""
+            else:
+                # Same whitespace-collapse + 2-line fit the board applies to AI
+                # blurbs, so a manual description can't overflow the card.
+                tpl.description = _fit_description(description)
+            name = tpl.name
+            new_desc = tpl.description
+        await interaction.followup.send(
+            f"Updated description for **#{template_id} — {name}**:\n> {new_desc or '_(cleared)_'}",
+            ephemeral=True,
+        )
+
     @parlay.command(name="delete", description="Delete a parlay template")
     @app_commands.describe(template_id="Template to delete")
     @app_commands.autocomplete(template_id=parlay_template_autocomplete)
@@ -7978,6 +8951,11 @@ class AdminCog(commands.Cog):
         count: int = 3,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
+            return
+        if not _AUTO_PARLAY_GENERATION_ENABLED:
+            await interaction.followup.send(
+                "Parlay auto-generation is temporarily disabled.", ephemeral=True
+            )
             return
         count = max(1, min(count, 10))
         phase_raw = await get_setting("current_phase_id")
@@ -8051,14 +9029,24 @@ class AdminCog(commands.Cog):
         name="ai-generate",
         description="Use local AI (Lemonade) to regenerate featured parlays from district lore and stats",
     )
-    @app_commands.describe(count="How many parlays to generate (default 3, max 10)")
+    @app_commands.describe(
+        count="How many parlays to generate (default 3, max 10)",
+        clear_existing="Delete the previous auto-generated parlays first (default True). "
+        "Set False to add these alongside the current ones.",
+    )
     @is_admin()
     async def parlay_ai_generate(
         self,
         interaction: discord.Interaction,
         count: int = 3,
+        clear_existing: bool = True,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
+            return
+        if not _AUTO_PARLAY_GENERATION_ENABLED:
+            await interaction.followup.send(
+                "Parlay auto-generation is temporarily disabled.", ephemeral=True
+            )
             return
         count = max(1, min(count, 10))
 
@@ -8075,11 +9063,14 @@ class AdminCog(commands.Cog):
         phase_id = json.loads(phase_raw) if phase_raw else None
 
         async with get_session() as session:
-            made = await _try_generate_ai_parlays(session, phase_id, count)
+            made = await _try_generate_ai_parlays(
+                session, phase_id, count, replace_existing=clear_existing
+            )
 
         if made:
+            kept_note = "" if clear_existing else " (kept the existing ones)"
             await interaction.followup.send(
-                f"AI generated **{made}** featured parlay(s) using Lemonade "
+                f"AI generated **{made}** featured parlay(s){kept_note} using Lemonade "
                 f"(`{_cfg.LEMONADE_MODEL}`) with district lore and historical stats.",
                 ephemeral=True,
             )
@@ -9090,6 +10081,86 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
+    @settings.command(
+        name="market_type_cashout",
+        description="Override cashout settings for every market of one type",
+    )
+    @app_commands.describe(
+        market_type="Market type to override",
+        allowed="Allow early cashout for this market type",
+        rate="Cashout rate 0.0–1.0 (0.65 = 65% profit)",
+    )
+    @app_commands.choices(
+        allowed=[
+            app_commands.Choice(name="Allow", value="yes"),
+            app_commands.Choice(name="Disallow", value="no"),
+        ]
+    )
+    @app_commands.autocomplete(market_type=market_type_autocomplete)
+    @is_admin()
+    async def settings_market_type_cashout(
+        self,
+        interaction: discord.Interaction,
+        market_type: str,
+        allowed: app_commands.Choice[str],
+        rate: app_commands.Range[float, 0.0, 1.0] | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        raw = await get_setting("cashout_by_type")
+        by_type: dict = json.loads(raw) if raw else {}
+        entry = {"allowed": allowed.value == "yes"}
+        if rate is not None:
+            entry["rate"] = rate
+        elif market_type in by_type and "rate" in by_type[market_type]:
+            entry["rate"] = by_type[market_type]["rate"]
+        by_type[market_type] = entry
+        await set_setting("cashout_by_type", by_type)
+
+        rate_str = f" at **{rate * 100:.0f}%** rate" if rate is not None else ""
+        await interaction.followup.send(
+            f"Cashout for market type `{market_type}` set to "
+            f"{'allowed' if allowed.value == 'yes' else 'disabled'}{rate_str}.",
+            ephemeral=True,
+        )
+
+    @settings.command(
+        name="parlay_cashout",
+        description="Override cashout settings for one specific publicly-tailable parlay",
+    )
+    @app_commands.autocomplete(parlay_id=public_parlay_autocomplete)
+    @app_commands.choices(
+        allowed=[
+            app_commands.Choice(name="Allow", value="yes"),
+            app_commands.Choice(name="Disallow", value="no"),
+        ]
+    )
+    @is_admin()
+    async def settings_parlay_cashout(
+        self,
+        interaction: discord.Interaction,
+        parlay_id: str,
+        allowed: app_commands.Choice[str],
+        rate: app_commands.Range[float, 0.0, 1.0] | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            p = await session.get(Parlay, int(parlay_id))
+            if not p:
+                await interaction.followup.send("Parlay not found.", ephemeral=True)
+                return
+            p.cashout_allowed = allowed.value == "yes"
+            if rate is not None:
+                p.cashout_rate = rate
+
+        rate_str = f" at **{rate * 100:.0f}%** rate" if rate is not None else ""
+        await interaction.followup.send(
+            f"Cashout for **Parlay #{parlay_id}** set to "
+            f"{'allowed' if allowed.value == 'yes' else 'disabled'}{rate_str}.",
+            ephemeral=True,
+        )
+
     @settings.command(name="chips_give", description="Give chips to a user")
     @app_commands.describe(user="User to give chips to", amount="Amount of chips")
     @is_admin()
@@ -9760,6 +10831,88 @@ class AdminCog(commands.Cog):
         embed.description = "\n".join(lines)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @restrict.command(
+        name="lock_tribute",
+        description="Mark a user as playing a Tribute, blocking all sportsbook access (bot, Activity, website)",
+    )
+    @app_commands.describe(
+        member="The Discord user playing as this Tribute",
+        tribute_id="Which Tribute they're playing as",
+    )
+    @app_commands.autocomplete(tribute_id=tribute_autocomplete)
+    @is_admin()
+    async def restrict_lock_tribute(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        tribute_id: str,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        tid = _parse_tribute_id(tribute_id)
+        if tid is None:
+            await interaction.followup.send(
+                "Invalid tribute. Please pick one from the autocomplete list.",
+                ephemeral=True,
+            )
+            return
+        async with get_session() as session:
+            tribute = await session.get(Tribute, tid)
+            if not tribute:
+                await interaction.followup.send("Tribute not found.", ephemeral=True)
+                return
+            existing = await session.execute(
+                select(TributeLock).where(
+                    TributeLock.guild_id == current_guild_id(),
+                    TributeLock.discord_user_id == member.id,
+                )
+            )
+            row = existing.scalar_one_or_none()
+            if row:
+                row.tribute_id = tid
+            else:
+                session.add(TributeLock(
+                    guild_id=current_guild_id(),
+                    discord_user_id=member.id,
+                    tribute_id=tid,
+                ))
+            tribute_name = tribute.name
+        await interaction.followup.send(
+            f"**{member.display_name}** is now locked out of the sportsbook as **{tribute_name}** — "
+            "blocked from bot commands, the Activity, and the website.",
+            ephemeral=True,
+        )
+
+    @restrict.command(
+        name="unlock_tribute",
+        description="Restore sportsbook access for a user previously locked out as a Tribute",
+    )
+    @app_commands.describe(member="User to unlock")
+    @is_admin()
+    async def restrict_unlock_tribute(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            existing = await session.execute(
+                select(TributeLock).where(
+                    TributeLock.guild_id == current_guild_id(),
+                    TributeLock.discord_user_id == member.id,
+                )
+            )
+            row = existing.scalar_one_or_none()
+            if not row:
+                await interaction.followup.send(
+                    f"**{member.display_name}** is not locked out as a Tribute.",
+                    ephemeral=True,
+                )
+                return
+            await session.delete(row)
+        await interaction.followup.send(
+            f"**{member.display_name}**'s sportsbook access has been restored.", ephemeral=True
+        )
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -9870,8 +11023,6 @@ def _build_label(
         # Alliance-level markets (cause = alliance name)
         "ALLIANCE_VICTOR": f"{cause or 'Alliance'} Victor",
         "ALLIANCE_KILLS_OU": f"{cause or 'Alliance'} Total Kills — {side} {line_str}",
-        "ALLIANCE_ALL_BLOODBATH": f"{cause or 'Alliance'} All Survive Bloodbath",
-        "ALLIANCE_WIPED_BLOODBATH": f"{cause or 'Alliance'} All Killed in Bloodbath",
         "ALLIANCE_ALL_FINAL_8": f"{cause or 'Alliance'} All Make Final 8",
         "ALLIANCE_ONE_FINAL_8": f"Someone from {cause or 'Alliance'} Makes Final 8",
         "ALLIANCE_ALL_FINAL_5": f"{cause or 'Alliance'} All Make Final 5",

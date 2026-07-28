@@ -1036,28 +1036,6 @@ def alliance_default_odds(
         prob = p_over if ou_side == "OVER" else 1.0 - p_over
         return prob_to_american(prob)
 
-    if market_type == "ALLIANCE_ALL_BLOODBATH":
-        sum_inv = sum(1.0 / max(s, 1) for s in alive_all_scores) or 1.0
-        p_all = 1.0
-        for t in alive:
-            inv = 1.0 / max(t.training_score or 6, 1)
-            p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
-            p_death = max(0.03, min(0.92, p_death))
-            p_survive = (1.0 - p_death) * _wf(t)
-            p_all *= max(0.03, min(0.97, p_survive))
-        return prob_to_american(max(0.01, min(0.99, p_all)))
-
-    if market_type == "ALLIANCE_WIPED_BLOODBATH":
-        sum_inv = sum(1.0 / max(s, 1) for s in alive_all_scores) or 1.0
-        p_all_dead = 1.0
-        for t in alive:
-            inv = 1.0 / max(t.training_score or 6, 1)
-            p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
-            p_death = max(0.03, min(0.92, p_death))
-            p_die = p_death * _wf(t)
-            p_all_dead *= max(0.03, min(0.97, p_die))
-        return prob_to_american(max(0.01, min(0.99, p_all_dead)))
-
     if market_type in _ALLIANCE_K_ALL:
         k = _ALLIANCE_K_ALL[market_type]
         p_all = 1.0

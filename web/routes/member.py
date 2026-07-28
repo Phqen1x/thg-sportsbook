@@ -4,21 +4,57 @@ import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from fastapi.responses import JSONResponse, RedirectResponse
+from sqlalchemy import select, text
 
-from bot.cogs.betting import _parlay_conflict, PARLAY_PAYOUT_CAP, MAX_PARLAY_LEGS
+from bot.cogs.betting import (
+    _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
+    PARLAY_PAYOUT_CAP, MAX_PARLAY_LEGS,
+)
 from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
 from web.routes.public import _parlay_flavor
-from bot.odds.calculator import straight_payout, parlay_payout, combined_american, cashout_value
+from bot.odds.calculator import straight_payout, parlay_payout, combined_american, resolve_cashout
 from web.database import get_db, get_request_guild
-from web.deps import optional_user, require_user
+from web.deps import require_user
 from web.session import SessionUser
 from web import config as _web_config
 
 router = APIRouter(tags=["member"])
 
 _GUILD_ID = get_request_guild
+
+
+async def _cashout_settings(db) -> tuple[bool, float, dict]:
+    """Global cashout settings, shared by the bet/parlay cashout preview + POST routes."""
+    row = (await db.execute(text("SELECT value FROM game_settings WHERE key='cashout_allowed'"))).fetchone()
+    global_allowed = (row[0].lower() == "true") if row else False
+    rate_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='cashout_rate'"))).fetchone()
+    global_rate = float(rate_row[0]) if rate_row else 0.65
+    by_type_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='cashout_by_type'"))).fetchone()
+    cashout_by_type: dict = json.loads(by_type_row[0]) if by_type_row else {}
+    return global_allowed, global_rate, cashout_by_type
+
+
+async def _bet_cashout_preview(db, bet: Bet, market: Market | None, settings: tuple[bool, float, dict]) -> tuple[bool, int]:
+    global_allowed, global_rate, cashout_by_type = settings
+    type_override = cashout_by_type.get(market.type) if market else None
+    return resolve_cashout(
+        wager=bet.wager, payout_if_win=bet.payout_if_win,
+        global_allowed=global_allowed, global_rate=global_rate,
+        item_allowed=market.cashout_allowed if market else None,
+        item_rate=market.cashout_rate if market else None,
+        type_allowed=type_override["allowed"] if type_override else None,
+        type_rate=type_override.get("rate") if type_override else None,
+    )
+
+
+async def _parlay_cashout_preview(parlay: Parlay, settings: tuple[bool, float, dict]) -> tuple[bool, int]:
+    global_allowed, global_rate, _by_type = settings
+    return resolve_cashout(
+        wager=parlay.total_wager, payout_if_win=parlay.total_payout,
+        global_allowed=global_allowed, global_rate=global_rate,
+        item_allowed=parlay.cashout_allowed, item_rate=parlay.cashout_rate,
+    )
 
 
 async def _get_or_create_user(db, session_user: SessionUser) -> User:
@@ -49,6 +85,24 @@ def _redirect(url: str, msg: str = "", error: str = "") -> RedirectResponse:
     return RedirectResponse(url, status_code=303)
 
 
+def _wants_json(request: Request) -> bool:
+    """True when the client asked for a JSON response (our fetch()-based
+    progressive enhancement in web/static/app.js) rather than a plain form
+    post-back that expects the usual redirect."""
+    return "application/json" in request.headers.get("accept", "")
+
+
+def _respond(request: Request, url: str, *, msg: str = "", error: str = ""):
+    """Like _redirect, but answers JSON in place for AJAX callers so the page
+    doesn't navigate away — existing error/success strings use "+" in place of
+    spaces (see call sites below), so undo that for the human-readable JSON."""
+    if _wants_json(request):
+        if error:
+            return JSONResponse({"ok": False, "detail": error.replace("+", " ")}, status_code=400)
+        return JSONResponse({"ok": True, "message": msg.replace("+", " ")})
+    return _redirect(url, msg=msg, error=error)
+
+
 # ── Balance ────────────────────────────────────────────────────────────────────
 
 @router.get("/balance")
@@ -70,10 +124,13 @@ async def balance(
             select(Parlay).where(Parlay.guild_id == _GUILD_ID(), Parlay.user_id == user.discord_id)
         )).scalars().all()
 
-        won = sum(b.payout_if_win for b in bets if b.status == "WON")
-        won += sum(p.total_payout for p in parlays if p.status == "WON")
+        # ROI must be derived from the same total_won/total_wagered counters the
+        # /balance Discord command reads, not re-derived from bets/parlays here —
+        # a separate recomputation drifted out of sync with the persisted totals
+        # (e.g. legacy rows scoped differently) and was showing -100% ROI for
+        # users total_won already correctly credited chips for.
         wagered = db_user.total_wagered
-        roi = ((won - wagered) / wagered * 100) if wagered else 0.0
+        roi = ((db_user.total_won - wagered) / wagered * 100) if wagered else 0.0
 
     return request.app.state.templates.TemplateResponse("balance.html", {
         "request": request,
@@ -133,6 +190,24 @@ async def my_bets(
                     if mkt:
                         parlay_markets[leg.market_id] = mkt
 
+        # Cashout previews shown before the user confirms (only for PENDING items).
+        settings = await _cashout_settings(db)
+        bet_cashout_preview: dict[int, int] = {}
+        for b in straight_bets:
+            if b.status != "PENDING":
+                continue
+            allowed, amount = await _bet_cashout_preview(db, b, markets_map.get(b.market_id), settings)
+            if allowed:
+                bet_cashout_preview[b.id] = amount
+
+        parlay_cashout_preview: dict[int, int] = {}
+        for p in parlays:
+            if p.status != "PENDING":
+                continue
+            allowed, amount = await _parlay_cashout_preview(p, settings)
+            if allowed:
+                parlay_cashout_preview[p.id] = amount
+
     return request.app.state.templates.TemplateResponse("my_bets.html", {
         "request": request,
         "user": user,
@@ -141,6 +216,8 @@ async def my_bets(
         "markets_map": markets_map,
         "parlay_legs": parlay_legs,
         "parlay_markets": parlay_markets,
+        "bet_cashout_preview": bet_cashout_preview,
+        "parlay_cashout_preview": parlay_cashout_preview,
         "success": success,
         "error": error,
     })
@@ -248,22 +325,11 @@ async def cashout_bet(request: Request, bet_id: int, user: SessionUser = Depends
             return _redirect("/my-bets", error="Bet+not+found+or+not+cashout-eligible.")
 
         market = await db.get(Market, bet.market_id)
-        rate = (market.cashout_rate if market and market.cashout_rate is not None else None)
-        if rate is None:
-            # Use global default
-            row = (await db.execute(
-                __import__("sqlalchemy").text("SELECT value FROM game_settings WHERE key='cashout_rate'")
-            )).fetchone()
-            rate = float(row[0]) if row else 0.65
+        settings = await _cashout_settings(db)
+        allowed, amount = await _bet_cashout_preview(db, bet, market, settings)
+        if not allowed:
+            return _redirect("/my-bets", error="Cashout+is+not+currently+allowed.")
 
-        allowed_row = (await db.execute(
-            __import__("sqlalchemy").text("SELECT value FROM game_settings WHERE key='cashout_allowed'")
-        )).fetchone()
-        if allowed_row and allowed_row[0].lower() == "false":
-            if not market or not market.cashout_allowed:
-                return _redirect("/my-bets", error="Cashout+is+not+currently+allowed.")
-
-        amount = cashout_value(bet.wager, bet.payout_if_win, rate)
         db_user = (await db.execute(select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == user.discord_id))).scalar_one_or_none()
         if db_user:
             db_user.chips += amount
@@ -281,18 +347,11 @@ async def cashout_parlay(request: Request, parlay_id: int, user: SessionUser = D
         if not parlay or parlay.user_id != user.discord_id or parlay.guild_id != _GUILD_ID() or parlay.status != "PENDING":
             return _redirect("/my-bets", error="Parlay+not+found+or+not+cashout-eligible.")
 
-        allowed_row = (await db.execute(
-            __import__("sqlalchemy").text("SELECT value FROM game_settings WHERE key='cashout_allowed'")
-        )).fetchone()
-        if allowed_row and allowed_row[0].lower() == "false":
+        settings = await _cashout_settings(db)
+        allowed, amount = await _parlay_cashout_preview(parlay, settings)
+        if not allowed:
             return _redirect("/my-bets", error="Cashout+is+not+currently+allowed.")
 
-        row = (await db.execute(
-            __import__("sqlalchemy").text("SELECT value FROM game_settings WHERE key='cashout_rate'")
-        )).fetchone()
-        rate = float(row[0]) if row else 0.65
-
-        amount = cashout_value(parlay.total_wager, parlay.total_payout, rate)
         db_user = (await db.execute(select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == user.discord_id))).scalar_one_or_none()
         if db_user:
             db_user.chips += amount
@@ -357,21 +416,21 @@ async def parlay_view(
 
 
 @router.post("/parlay/add/{market_id}")
-async def parlay_add(market_id: int, user: SessionUser = Depends(require_user)):
+async def parlay_add(market_id: int, request: Request, user: SessionUser = Depends(require_user)):
     async with get_db() as db:
         market = await db.get(Market, market_id)
         if not market or market.status != "OPEN":
-            return _redirect("/parlay", error="Market+is+not+open.")
+            return _respond(request, "/parlay", error="Market+is+not+open.")
 
         existing_legs = (await db.execute(
             select(PendingParlayLeg).where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
         )).scalars().all()
 
         if len(existing_legs) >= MAX_PARLAY_LEGS:
-            return _redirect("/parlay", error=f"Maximum+{MAX_PARLAY_LEGS}+legs+reached.")
+            return _respond(request, "/parlay", error=f"Maximum+{MAX_PARLAY_LEGS}+legs+reached.")
 
         if any(l.market_id == market_id for l in existing_legs):
-            return _redirect("/parlay", error="This+market+is+already+in+your+slip.")
+            return _respond(request, "/parlay", error="This+market+is+already+in+your+slip.")
 
         existing_markets = []
         for l in existing_legs:
@@ -379,15 +438,16 @@ async def parlay_add(market_id: int, user: SessionUser = Depends(require_user)):
             if mkt:
                 existing_markets.append(mkt)
 
-        conflict = _parlay_conflict(existing_markets, market)
+        tribute_by_id = await tribute_lookup_for_markets(db, existing_markets + [market])
+        conflict = _parlay_conflict(existing_markets, market, tribute_by_id)
         if conflict:
-            return _redirect(f"/parlay", error=conflict.replace(" ", "+"))
+            return _respond(request, "/parlay", error=conflict.replace(" ", "+"))
 
         leg = PendingParlayLeg(guild_id=_GUILD_ID(), user_id=user.discord_id, market_id=market_id)
         db.add(leg)
         await db.commit()
 
-    return _redirect("/parlay", msg="Market+added+to+parlay+slip.")
+    return _respond(request, "/parlay", msg="Market+added+to+parlay+slip.")
 
 
 @router.post("/parlay/remove/{leg_id}")
@@ -487,15 +547,13 @@ async def parlay_submit(
 @router.get("/tail")
 async def tail_board(
     request: Request,
-    user: SessionUser | None = Depends(optional_user),
+    user: SessionUser = Depends(require_user),
     success: str = "",
     error: str = "",
 ):
     async with get_db() as db:
-        db_user = None
-        if user:
-            db_user = await _get_or_create_user(db, user)
-            await db.commit()
+        db_user = await _get_or_create_user(db, user)
+        await db.commit()
 
         templates_raw = (await db.execute(
             select(ParlayTemplate).where(ParlayTemplate.active == True).order_by(ParlayTemplate.created_at.desc())
@@ -757,3 +815,80 @@ async def tail_member_parlay(
         await db.commit()
 
     return _redirect("/my-bets", msg=f"Parlay+tailed!+Potential+payout:+{total_payout:,}+chips.")
+
+
+def _add_to_slip_response(request: Request, added: int, skipped: int):
+    if added == 0:
+        return _respond(
+            request, "/tail",
+            error="Couldn't+add+any+legs+—+they're+already+in+your+slip+or+conflict+with+what's+there.",
+        )
+    message = f"Added+{added}+leg{'s' if added != 1 else ''}+to+your+parlay+slip."
+    if skipped:
+        message += f"+Skipped+{skipped}+(already+in+slip+or+conflicting)."
+    return _respond(request, "/tail", msg=message)
+
+
+@router.post("/tail/{template_id}/add-to-slip")
+async def tail_template_add_to_slip(
+    template_id: int, request: Request, user: SessionUser = Depends(require_user)
+):
+    """Copy a featured template's legs into the caller's own parlay slip so they
+    can edit it (add/remove legs, change wager) before submitting, instead of
+    only being able to tail it as a fixed package."""
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, template_id)
+        if not tpl or not tpl.active:
+            return _respond(request, "/tail", error="Template+not+found.")
+
+        legs = (await db.execute(
+            select(ParlayTemplateLeg)
+            .where(ParlayTemplateLeg.template_id == template_id)
+            .order_by(ParlayTemplateLeg.sort_order)
+        )).scalars().all()
+
+        tpl_markets = []
+        for leg in legs:
+            mkt = await db.get(Market, leg.market_id)
+            if mkt and mkt.status == "OPEN":
+                tpl_markets.append(mkt)
+        if not tpl_markets:
+            return _respond(request, "/tail", error="No+open+markets+in+this+parlay+to+add.")
+
+        added, skipped = await add_markets_to_pending_slip(
+            db, _GUILD_ID(), user.discord_id, tpl_markets
+        )
+        await db.commit()
+
+    return _add_to_slip_response(request, added, skipped)
+
+
+@router.post("/tail/parlay/{parlay_id}/add-to-slip")
+async def tail_member_parlay_add_to_slip(
+    parlay_id: int, request: Request, user: SessionUser = Depends(require_user)
+):
+    """Copy a public member parlay's legs into the caller's own parlay slip so
+    they can edit it before submitting, instead of only being able to tail it."""
+    async with get_db() as db:
+        source = await db.get(Parlay, parlay_id)
+        if not source or not source.is_public or source.status != "PENDING":
+            return _respond(request, "/tail", error="Parlay+not+found+or+no+longer+available.")
+
+        legs = (await db.execute(
+            select(Bet).where(Bet.parlay_id == parlay_id).order_by(Bet.id)
+        )).scalars().all()
+
+        tpl_markets = []
+        for b in legs:
+            mkt = await db.get(Market, b.market_id)
+            if mkt and mkt.status == "OPEN":
+                tpl_markets.append(mkt)
+        if not tpl_markets:
+            return _respond(request, "/tail", error="No+open+markets+in+this+parlay+to+add.")
+
+        added, skipped = await add_markets_to_pending_slip(
+            db, _GUILD_ID(), user.discord_id, tpl_markets
+        )
+        await db.commit()
+
+    return _add_to_slip_response(request, added, skipped)

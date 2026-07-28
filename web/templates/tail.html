@@ -70,6 +70,9 @@
         <div class="text-dim" style="font-size:0.8rem">Balance: {{ db_user.chips | fmt_chips }} chips</div>
       </div>
     </form>
+    <form method="post" action="/tail/{{ tpl.id }}/add-to-slip" class="mt-1">
+      <button type="submit" class="btn btn-outline btn-full btn-sm">Add to My Slip (edit before betting)</button>
+    </form>
     {% else %}
     <div class="mt-1">
       <a href="/auth/login" class="btn btn-outline btn-full">Login to Tail</a>
@@ -125,6 +128,9 @@
         </div>
         <div class="text-dim" style="font-size:0.8rem">Balance: {{ db_user.chips | fmt_chips }} chips</div>
       </div>
+    </form>
+    <form method="post" action="/tail/parlay/{{ mp.id }}/add-to-slip" class="mt-1">
+      <button type="submit" class="btn btn-outline btn-full btn-sm">Add to My Slip (edit before betting)</button>
     </form>
     {% else %}
     <div class="mt-1">

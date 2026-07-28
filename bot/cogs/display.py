@@ -9,7 +9,7 @@ from discord.ext import commands
 from sqlalchemy import select, func, or_
 
 from bot.database.engine import get_session, get_read_session, get_setting, current_guild_id
-from bot.database.models import Alliance, Bet, BettingPhase, Market, MarketTemplate, Tribute, User
+from bot.database.models import Alliance, Bet, BettingPhase, Market, MarketTemplate, Parlay, Tribute, User
 from bot.imaging.hot_odds import (
     BoardCardData, FeaturedMarket, TributeDetailData,
     render_hot_odds, render_tribute_detail,
@@ -330,6 +330,72 @@ class OddsBoardView(discord.ui.View):
                 pass
 
 
+# Shared across the /leaderboard Discord command, the web dashboard's
+# /leaderboard page, and the Activity's /leaderboard tab, so all three surfaces
+# stay in sync on which categories exist and how each one is computed.
+LEADERBOARD_CATEGORIES = [
+    ("CHIPS", "Most Chips"),
+    ("CHIPS_BET", "Most Chips Bet"),
+    ("BETS_WON", "Most Bets Won"),
+    ("PARLAYS_WON", "Most Parlays Won"),
+    ("PARLAYS_TAILED", "Most Parlays Tailed"),
+]
+
+
+async def _leaderboard_rows(
+    session, guild_id: int, category: str, limit: int
+) -> tuple[str, str, list[tuple[int, int]]]:
+    """Return ``(title, value_kind, rows)`` for a leaderboard category.
+
+    ``value_kind`` is ``"chips"`` or ``"count"`` so callers know how to format
+    the value; ``rows`` is ``[(discord_id, value), ...]`` best-first.
+    """
+    if category == "CHIPS_BET":
+        title, kind = "Most Chips Bet", "chips"
+        result = await session.execute(
+            select(User.discord_id, User.total_wagered)
+            .where(User.guild_id == guild_id, User.total_wagered > 0)
+            .order_by(User.total_wagered.desc())
+            .limit(limit)
+        )
+    elif category == "BETS_WON":
+        title, kind = "Most Bets Won", "count"
+        result = await session.execute(
+            select(Bet.user_id, func.count(Bet.id))
+            .where(Bet.guild_id == guild_id, Bet.status == "WON")
+            .group_by(Bet.user_id)
+            .order_by(func.count(Bet.id).desc())
+            .limit(limit)
+        )
+    elif category == "PARLAYS_WON":
+        title, kind = "Most Parlays Won", "count"
+        result = await session.execute(
+            select(Parlay.user_id, func.count(Parlay.id))
+            .where(Parlay.guild_id == guild_id, Parlay.status == "WON")
+            .group_by(Parlay.user_id)
+            .order_by(func.count(Parlay.id).desc())
+            .limit(limit)
+        )
+    elif category == "PARLAYS_TAILED":
+        title, kind = "Most Parlays Tailed", "count"
+        result = await session.execute(
+            select(Parlay.user_id, func.count(Parlay.id))
+            .where(Parlay.guild_id == guild_id, Parlay.tailed_from_parlay_id.isnot(None))
+            .group_by(Parlay.user_id)
+            .order_by(func.count(Parlay.id).desc())
+            .limit(limit)
+        )
+    else:  # CHIPS
+        title, kind = "Most Chips", "chips"
+        result = await session.execute(
+            select(User.discord_id, User.chips)
+            .where(User.guild_id == guild_id)
+            .order_by(User.chips.desc())
+            .limit(limit)
+        )
+    return title, kind, list(result.all())
+
+
 class DisplayCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -607,36 +673,54 @@ class DisplayCog(commands.Cog):
 
     # ── /leaderboard ──────────────────────────────────────────────────────────
 
-    @app_commands.command(name="leaderboard", description="View the top chip holders")
-    async def leaderboard(self, interaction: discord.Interaction) -> None:
+    _LEADERBOARD_TOP_N = 10
+
+    @app_commands.command(name="leaderboard", description="View the sportsbook leaderboard")
+    @app_commands.describe(category="Which leaderboard to show")
+    @app_commands.choices(category=[
+        app_commands.Choice(name=label, value=value) for value, label in LEADERBOARD_CATEGORIES
+    ])
+    async def leaderboard(
+        self,
+        interaction: discord.Interaction,
+        category: app_commands.Choice[str] | None = None,
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
-        async with get_session() as session:
-            result = await session.execute(
-                select(User)
-                .where(User.guild_id == (current_guild_id()))
-                .order_by(User.chips.desc())
-                .limit(10)
-            )
-            users = result.scalars().all()
+        cat = category.value if category else "CHIPS"
+        gid = current_guild_id()
+        n = self._LEADERBOARD_TOP_N
 
-        if not users:
+        async with get_session() as session:
+            title, kind, rows = await _leaderboard_rows(session, gid, cat, n)
+            fmt = fmt_chips if kind == "chips" else str
+
+            usernames: dict[int, str] = {}
+            ids = {uid for uid, _ in rows}
+            if ids:
+                user_result = await session.execute(
+                    select(User.discord_id, User.username)
+                    .where(User.guild_id == gid, User.discord_id.in_(ids))
+                )
+                usernames = {uid: name for uid, name in user_result.all()}
+
+        if not rows:
             await interaction.followup.send("No players yet.", ephemeral=True)
             return
 
-        embed = discord.Embed(
-            title="🏆 CAPITOL LEADERBOARD — TOP BETTORS",
-            color=0xFFD700,
-        )
-
         medals = ["🥇", "🥈", "🥉"]
         lines = []
-        for i, u in enumerate(users):
+        for i, (user_id, value) in enumerate(rows):
             medal = medals[i] if i < 3 else f"**{i + 1}.**"
-            lines.append(f"{medal} **{u.username}** — {fmt_chips(u.chips)}")
+            name = usernames.get(user_id, "Member")
+            lines.append(f"{medal} **{name}** — {fmt(value)}")
 
-        embed.description = "\n".join(lines)
-        embed.set_footer(text="Balances update in real time.")
+        embed = discord.Embed(
+            title=f"🏆 Sportsbook Leaderboard — {title}",
+            description="\n".join(lines),
+            color=0xFFD700,
+        )
+        embed.set_footer(text="Updates in real time.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 

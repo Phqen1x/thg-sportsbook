@@ -1,4 +1,4 @@
-/* Capitol Sportsbook — Discord Activity (mobile-first dark gold theme) */
+/* Panem Sportsbook — Discord Activity (mobile-first dark gold theme) */
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600;700;800&display=swap');
 
 :root {
@@ -62,6 +62,19 @@ body {
 }
 .tabs a:hover { color: var(--text-white); }
 .tabs a.active { color: var(--header-dark); background: var(--header-gold); }
+
+/* Popup shown next to whichever button triggered a slip action (leg/parlay
+   added) — appended to <body> and positioned via JS so it's never clipped by
+   a scrolling or overflow ancestor. */
+.inline-popup {
+  position: fixed; background: var(--card-bg); border: 1px solid var(--card-border);
+  color: var(--text-white); font-size: .78rem; font-weight: 600; padding: .4rem .65rem;
+  border-radius: var(--radius); box-shadow: 0 6px 16px rgba(0,0,0,.4); max-width: 240px;
+  opacity: 0; transform: translateY(-4px); pointer-events: none;
+  transition: opacity .15s ease, transform .15s ease; z-index: 500;
+}
+.inline-popup.show { opacity: 1; transform: translateY(0); }
+.inline-popup.error { border-color: var(--lost); color: #ffd9d9; }
 .me { display: flex; align-items: center; gap: .5rem; margin-left: auto; text-decoration: none; cursor: pointer; }
 .chips { color: var(--text-gold); font-weight: 700; font-size: .85rem; }
 .avatar { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--card-border); }
@@ -150,6 +163,7 @@ body {
 .admin-form { display: flex; flex-direction: column; gap: .5rem; margin-bottom: .6rem; }
 .admin-market-bar { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .6rem; }
 .card-label { font-size: .7rem; font-weight: 700; color: var(--text-dim); letter-spacing: .06em; margin-bottom: .25rem; }
+.admin-start-game { display: flex; align-items: center; justify-content: space-between; gap: .6rem; margin-bottom: .6rem; border-color: var(--header-gold); flex-wrap: wrap; }
 
 /* ── Buttons / inputs ────────────────────────────────────────────────────── */
 .btn {

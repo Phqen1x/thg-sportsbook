@@ -248,7 +248,7 @@ async def fetch_image_bytes(url: str) -> bytes | None:
         log.warning(f"Blocked face claim fetch to non-HTTPS or private-network URL: {url}")
         return None
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; CapitolSportsbook/1.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; PanemSportsbook/1.0)",
         "Accept": "image/*,*/*",
     }
     try:

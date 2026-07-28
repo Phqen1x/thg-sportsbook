@@ -69,8 +69,6 @@ _TYPE_ORDER: dict[str, int] = {
     # Alliance markets
     "ALLIANCE_VICTOR":           54,
     "ALLIANCE_KILLS_OU":         55,
-    "ALLIANCE_ALL_BLOODBATH":    56,
-    "ALLIANCE_WIPED_BLOODBATH":  56,
     "ALLIANCE_ALL_FINAL_8":      57,
     "ALLIANCE_ONE_FINAL_8":      57,
     "ALLIANCE_ALL_FINAL_5":      57,
@@ -138,8 +136,6 @@ _TYPE_LABELS: dict[str, str] = {
     # Alliance markets
     "ALLIANCE_VICTOR":           "Alliance Victor",
     "ALLIANCE_KILLS_OU":         "Alliance Kills Over/Under",
-    "ALLIANCE_ALL_BLOODBATH":    "Alliance All Bloodbath",
-    "ALLIANCE_WIPED_BLOODBATH":  "Alliance Wiped in Bloodbath",
     "ALLIANCE_ALL_FINAL_8":      "Alliance All Make Final 8",
     "ALLIANCE_ONE_FINAL_8":      "Alliance One Makes Final 8",
     "ALLIANCE_ALL_FINAL_5":      "Alliance All Make Final 5",

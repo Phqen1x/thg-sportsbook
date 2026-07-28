@@ -38,7 +38,7 @@
           <div class="text-dim" style="font-size:0.75rem">
             {{ mkt.type | replace('_', ' ') }}
             {% if ta %} &bull; {{ ta.name }}{% endif %}
-            {% if tb %} vs {{ tb.name }}{% endif %}
+            {% if tb %} {{ pair_word(mkt.type) }} {{ tb.name }}{% endif %}
           </div>
         </td>
         <td class="{% if mkt.odds > 0 %}text-pos{% else %}text-neg{% endif %} font-bold">

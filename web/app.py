@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -88,6 +88,17 @@ def fmt_chips(n: int) -> str:
     return f"{n:,}"
 
 
+# Market types where tribute_a/tribute_b are combined into one joint outcome
+# (e.g. their scores summed) rather than pitted head-to-head — these read as
+# "Tribute A and Tribute B", not "Tribute A vs Tribute B". Keep in sync with
+# the identical set in web/activity/static/app.js.
+COMBINED_PAIR_MARKET_TYPES = {"COMBINED_DISTRICT_SCORE"}
+
+
+def pair_word(market_type: str) -> str:
+    return "and" if market_type in COMBINED_PAIR_MARKET_TYPES else "vs"
+
+
 def _render_activity_index(in_discord: bool) -> HTMLResponse:
     """Serve the SPA shell, injecting a proxy-aware asset base + runtime config.
 
@@ -118,6 +129,7 @@ def create_app() -> FastAPI:
     templates.env.globals["abs"] = abs
     templates.env.globals["static_v"] = _WEB_VERSION
     templates.env.globals["csrf_token"] = lambda req: make_csrf(req.cookies.get(COOKIE, ""))
+    templates.env.globals["pair_word"] = pair_word
 
     app.state.templates = templates
 
@@ -172,10 +184,20 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(401)
     async def auth_redirect(request: Request, exc: HTTPException):
-        # API clients (the Activity) expect JSON; browsers get the login redirect.
+        # API clients (the Activity) expect JSON; browsers get an explicit
+        # "must log in" page rather than being silently bounced into Discord's
+        # OAuth flow, so it's clear *why* they can't see the page's content.
         if request.url.path.startswith("/api/"):
             return JSONResponse({"detail": exc.detail or "Authentication required"}, status_code=401)
-        return RedirectResponse(f"/auth/login")
+        return templates.TemplateResponse(
+            "error.html",
+            {
+                "request": request, "user": None, "code": 401,
+                "message": exc.detail or "You must be logged in to view this page.",
+                "cta_url": "/auth/login", "cta_label": "Log In with Discord",
+            },
+            status_code=401,
+        )
 
     @app.exception_handler(403)
     async def forbidden(request: Request, exc: HTTPException):

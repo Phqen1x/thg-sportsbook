@@ -43,6 +43,16 @@ def _factory_for(path: str) -> async_sessionmaker[AsyncSession]:
 
 @asynccontextmanager
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    # Lazily create/migrate/seed the guild's schema on first touch from this
+    # process, mirroring the bot's own get_session(). Without this, a guild
+    # whose sqlite file was never created by a bot command (nobody has run any
+    # bot command there yet — e.g. the Games haven't been set up) 500s on every
+    # Activity endpoint with "no such table", surfacing as a bare "Internal
+    # Server Error" instead of the tables just... not existing yet.
+    gid = _guild_ctx.get() or config.GUILD_ID
+    if gid:
+        from bot.database.engine import init_db
+        await init_db(gid)
     async with _factory_for(_db_path())() as session:
         yield session
 

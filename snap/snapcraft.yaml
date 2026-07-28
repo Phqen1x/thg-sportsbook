@@ -1,7 +1,7 @@
 name: thg-sportsbook
 base: core24
 version: "0.1.0"
-summary: THG Capitol Sportsbook Discord Bot
+summary: THG Panem Sportsbook Discord Bot
 description: |
   A Discord betting/sportsbook bot for The Hunger Games server simulations.
 

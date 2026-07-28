@@ -1,4 +1,4 @@
-// Capitol Sportsbook — Discord Activity SPA (no-build, vanilla ES module).
+// Panem Sportsbook — Discord Activity SPA (no-build, vanilla ES module).
 // Handles the Embedded App SDK auth handshake, then drives a small hash router
 // over the JSON API in web/routes/activity.py. Identity + admin rights are
 // established server-side; this client only carries the signed bearer token.
@@ -49,6 +49,36 @@ function toast(message, type = "success") {
   t.textContent = message;
   clearTimeout(_toastTimer);
   _toastTimer = setTimeout(() => t.classList.remove("show"), 3500);
+}
+
+// Small popup anchored next to whichever button triggered it — used whenever a
+// leg or whole parlay is added to the slip, so the member gets feedback right
+// where they're looking instead of being redirected to the Parlay tab. Built
+// fresh each time and appended to <body> so it's never clipped by a scrolling/
+// overflow-hidden ancestor (the nav bar, a card list, etc.).
+function notifyNearButton(anchorEl, message, isError = false) {
+  if (!anchorEl || !anchorEl.getBoundingClientRect) return toast(message, isError ? "error" : "success");
+  const bubble = document.createElement("div");
+  bubble.className = "inline-popup" + (isError ? " error" : "");
+  bubble.textContent = message;
+  document.body.appendChild(bubble);
+
+  const anchorRect = anchorEl.getBoundingClientRect();
+  const bubbleRect = bubble.getBoundingClientRect();
+  let left = anchorRect.left + anchorRect.width / 2 - bubbleRect.width / 2;
+  left = Math.max(6, Math.min(left, window.innerWidth - bubbleRect.width - 6));
+  let top = anchorRect.bottom + 6;
+  if (top + bubbleRect.height > window.innerHeight - 6) {
+    top = anchorRect.top - bubbleRect.height - 6;
+  }
+  bubble.style.left = `${left}px`;
+  bubble.style.top = `${top}px`;
+
+  requestAnimationFrame(() => bubble.classList.add("show"));
+  setTimeout(() => {
+    bubble.classList.remove("show");
+    setTimeout(() => bubble.remove(), 200);
+  }, 2600);
 }
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
@@ -154,11 +184,15 @@ async function route() {
 
 // ── Market rendering helpers ───────────────────────────────────────────────────
 
+// Market types where tribute_a/tribute_b are combined into one joint outcome
+// (e.g. their scores summed) rather than pitted head-to-head — keep in sync
+// with COMBINED_PAIR_MARKET_TYPES in web/app.py.
+const COMBINED_PAIR_MARKET_TYPES = new Set(["COMBINED_DISTRICT_SCORE"]);
+
 function marketSubtitle(m) {
-  const bits = [];
-  if (m.tribute_a) bits.push(esc(m.tribute_a));
-  if (m.tribute_b) bits.push(esc(m.tribute_b));
-  return bits.join(" vs ");
+  if (!m.tribute_a || !m.tribute_b) return esc(m.tribute_a || m.tribute_b || "");
+  const joiner = COMBINED_PAIR_MARKET_TYPES.has(m.type) ? "and" : "vs";
+  return `${esc(m.tribute_a)} ${joiner} ${esc(m.tribute_b)}`;
 }
 
 function marketCard(m, { actions = "member" } = {}) {
@@ -262,7 +296,9 @@ async function viewMarkets(view) {
     <div class="list" id="market-list">
       ${allMarkets.length
         ? allMarkets.map((m) => marketCard(m)).join("")
-        : `<div class="empty">No open markets right now.</div>`}
+        : marketsData.phase_name
+          ? `<div class="empty">No open markets right now.</div>`
+          : `<div class="empty">The Games haven't started yet — check back once an admin kicks things off.</div>`}
     </div>
 
     ${templates.length ? `
@@ -323,6 +359,7 @@ function featuredParlayCard(t) {
       <div class="feat-parlay-footer">
         <span class="${oddsClass(t.combined_odds)} feat-parlay-odds">${t.combined_odds == null ? "—" : fmtOdds(t.combined_odds)}</span>
         <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}">Tail this</button>
+        <button class="btn btn-outline btn-sm" data-act="add-slip" data-id="${t.id}">Add to Slip</button>
       </div>
     </div>`;
 }
@@ -334,6 +371,13 @@ function bindFeaturedParlayActions(view) {
       onSubmit: (wager) => api(`/tail/${b.dataset.id}`, { method: "POST", body: { wager } }),
       after: () => { location.hash = "#mybets"; },
     })));
+  view.querySelectorAll('[data-act="add-slip"]').forEach((b) =>
+    b.addEventListener("click", async () => {
+      try {
+        const r = await api(`/tail/${b.dataset.id}/add-to-slip`, { method: "POST" });
+        notifyNearButton(b, r.message);
+      } catch (e) { notifyNearButton(b, e.message, true); }
+    }));
 }
 
 function bindMemberMarketActions(view) {
@@ -343,8 +387,8 @@ function bindMemberMarketActions(view) {
     b.addEventListener("click", async () => {
       try {
         const r = await api(`/parlay/add/${b.dataset.id}`, { method: "POST" });
-        toast(r.message);
-      } catch (e) { toast(e.message, "error"); }
+        notifyNearButton(b, r.message);
+      } catch (e) { notifyNearButton(b, e.message, true); }
     }));
 }
 
@@ -379,15 +423,22 @@ async function viewTributes(view) {
 // ── Views: Leaderboard ─────────────────────────────────────────────────────────
 
 async function viewLeaderboard(view) {
-  const { users } = await api("/leaderboard");
+  const cat = location.hash.split("/")[1] || "CHIPS";
+  const base = location.pathname + location.search;
+  const { users, title, value_kind, categories } = await api(`/leaderboard?category=${encodeURIComponent(cat)}`);
   view.innerHTML = `
+    <div class="subtabs" style="flex-wrap:wrap">
+      ${categories.map((c) => `
+        <a href="${base}#leaderboard/${c.value}" class="${cat === c.value ? "active" : ""}">${esc(c.label)}</a>`).join("")}
+    </div>
+    <h2 class="section-title">${esc(title)}</h2>
     <div class="list leaderboard">
-      ${users.map((u) => `
+      ${users.length ? users.map((u) => `
         <div class="card lb-row ${u.is_me ? "lb-me" : ""}">
           <span class="lb-rank">#${u.rank}</span>
           <span class="lb-name">${esc(u.username)}</span>
-          <span class="lb-chips chips">${fmtChips(u.chips)}</span>
-        </div>`).join("")}
+          <span class="lb-chips chips">${value_kind === "chips" ? fmtChips(u.value) : u.value}</span>
+        </div>`).join("") : `<div class="empty">No players yet.</div>`}
     </div>`;
 }
 
@@ -405,7 +456,7 @@ async function viewMyBets(view) {
         <div class="dim">Wager ${fmtChips(b.wager)} @ ${fmtOdds(b.odds_at_placement)} · win ${fmtChips(b.payout_if_win)}</div>
       </div>
       <span class="status status-${esc(b.status.toLowerCase())}">${esc(b.status)}</span>
-      ${b.status === "PENDING" ? `<button class="btn btn-outline btn-sm" data-act="cashout-bet" data-id="${b.id}">Cash out</button>` : ""}
+      ${b.status === "PENDING" && b.cashout_preview != null ? `<button class="btn btn-outline btn-sm" data-act="cashout-bet" data-id="${b.id}" data-amount="${b.cashout_preview}">Cash out (${fmtChips(b.cashout_preview)})</button>` : ""}
     </div>`).join("");
 
   const parlays = data.parlays.map((p) => `
@@ -418,7 +469,7 @@ async function viewMyBets(view) {
       <ul class="parlay-legs">
         ${p.legs.map((l) => `<li><span class="leg-status status-${esc(l.status.toLowerCase())}">${esc(l.status)}</span> ${esc(mlabel(l.market_id))}</li>`).join("")}
       </ul>
-      ${p.status === "PENDING" ? `<button class="btn btn-outline btn-sm" data-act="cashout-parlay" data-id="${p.id}">Cash out</button>` : ""}
+      ${p.status === "PENDING" && p.cashout_preview != null ? `<button class="btn btn-outline btn-sm" data-act="cashout-parlay" data-id="${p.id}" data-amount="${p.cashout_preview}">Cash out (${fmtChips(p.cashout_preview)})</button>` : ""}
     </div>`).join("");
 
   view.innerHTML = `
@@ -428,9 +479,15 @@ async function viewMyBets(view) {
     <div class="list">${parlays || `<div class="empty">No parlays yet.</div>`}</div>`;
 
   view.querySelectorAll('[data-act="cashout-bet"]').forEach((b) =>
-    b.addEventListener("click", () => doAction(`/cashout/bet/${b.dataset.id}`, "POST")));
+    b.addEventListener("click", () => {
+      if (!confirm(`Cash out this bet for ${fmtChips(b.dataset.amount)} chips?`)) return;
+      doAction(`/cashout/bet/${b.dataset.id}`, "POST");
+    }));
   view.querySelectorAll('[data-act="cashout-parlay"]').forEach((b) =>
-    b.addEventListener("click", () => doAction(`/cashout/parlay/${b.dataset.id}`, "POST")));
+    b.addEventListener("click", () => {
+      if (!confirm(`Cash out this parlay for ${fmtChips(b.dataset.amount)} chips?`)) return;
+      doAction(`/cashout/parlay/${b.dataset.id}`, "POST");
+    }));
 }
 
 // ── Views: Parlay slip ─────────────────────────────────────────────────────────
@@ -500,7 +557,10 @@ async function viewTail(view) {
           <ul class="parlay-legs">
             ${t.legs.map((m) => `<li>${esc(m.label)} <span class="${oddsClass(m.odds)}">${fmtOdds(m.odds)}</span></li>`).join("")}
           </ul>
-          <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}">Tail this</button>
+          <div class="row-buttons">
+            <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}">Tail this</button>
+            <button class="btn btn-outline btn-sm" data-act="add-slip" data-id="${t.id}">Add to Slip</button>
+          </div>
         </div>`).join("") : `<div class="empty">No public parlays to tail right now.</div>`}
     </div>`;
 
@@ -510,6 +570,13 @@ async function viewTail(view) {
       onSubmit: (wager) => api(`/tail/${b.dataset.id}`, { method: "POST", body: { wager } }),
       after: () => { location.hash = "#mybets"; },
     })));
+  view.querySelectorAll('[data-act="add-slip"]').forEach((b) =>
+    b.addEventListener("click", async () => {
+      try {
+        const r = await api(`/tail/${b.dataset.id}/add-to-slip`, { method: "POST" });
+        notifyNearButton(b, r.message);
+      } catch (e) { notifyNearButton(b, e.message, true); }
+    }));
 }
 
 // ── Views: Balance / profile ───────────────────────────────────────────────────
@@ -566,7 +633,16 @@ async function viewBalance(view) {
 async function viewAdmin(view) {
   const sub = (location.hash.split("/")[1]) || "markets";
   const base = location.pathname + location.search;
+  const status = await api("/admin/game/status").catch(() => ({ game_active: true, phase_name: null }));
   view.innerHTML = `
+    ${status.game_active ? "" : `
+    <div class="card admin-start-game">
+      <div>
+        <div class="card-label">The Games haven't started</div>
+        <div class="dim">Starting opens Pre-Games markets and seeds the tailing board.</div>
+      </div>
+      <button class="btn btn-primary" id="admin-start-game">⚡ Start the Games</button>
+    </div>`}
     <div class="subtabs">
       <a href="${base}#admin/markets"  class="${sub === "markets"  ? "active" : ""}">Markets</a>
       <a href="${base}#admin/chips"    class="${sub === "chips"    ? "active" : ""}">Chips</a>
@@ -574,6 +650,13 @@ async function viewAdmin(view) {
       <a href="${base}#admin/banners"  class="${sub === "banners"  ? "active" : ""}">Banners</a>
     </div>
     <div id="admin-body"><div class="loading-inline">Loading…</div></div>`;
+  const startBtn = $("#admin-start-game", view);
+  if (startBtn) {
+    startBtn.addEventListener("click", () => {
+      if (!confirm("Start the Games? This opens Pre-Games markets and seeds the tailing board.")) return;
+      doAction("/admin/game/start", "POST");
+    });
+  }
   const body = $("#admin-body", view);
   if (sub === "chips")    return adminChips(body);
   if (sub === "tributes") return adminTributes(body);

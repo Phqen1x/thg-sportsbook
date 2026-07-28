@@ -9,10 +9,11 @@ from sqlalchemy import func, select, text
 
 from bot.odds.calculator import combined_american
 
-from bot.database.models import Alliance, Bet, BettingPhase, DistrictRecord, Market, ParlayTemplate, ParlayTemplateLeg, Tribute, User
+from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
+from bot.database.models import Alliance, Bet, BettingPhase, DistrictRecord, Market, Parlay, ParlayTemplate, ParlayTemplateLeg, Tribute, User
 from web import discord_api as _discord_api
 from web.database import available_guilds, get_db, get_request_guild
-from web.deps import optional_user
+from web.deps import optional_user, require_user
 from web.session import SessionUser, set_session
 router = APIRouter(tags=["public"])
 
@@ -225,7 +226,7 @@ async def _phase_name(db) -> str | None:
 
 
 @router.get("/")
-async def home(request: Request, user: SessionUser | None = Depends(optional_user)):
+async def home(request: Request, user: SessionUser = Depends(require_user)):
     async with get_db() as db:
         tributes = (await db.execute(
             select(Tribute).where(Tribute.status == "ALIVE").order_by(Tribute.district)
@@ -360,7 +361,7 @@ async def home(request: Request, user: SessionUser | None = Depends(optional_use
 
 
 @router.get("/tributes")
-async def tributes(request: Request, user: SessionUser | None = Depends(optional_user)):
+async def tributes(request: Request, user: SessionUser = Depends(require_user)):
     async with get_db() as db:
         tributes_list = (await db.execute(
             select(Tribute).order_by(Tribute.district, Tribute.gender)
@@ -386,7 +387,7 @@ async def tributes(request: Request, user: SessionUser | None = Depends(optional
 @router.get("/markets")
 async def markets(
     request: Request,
-    user: SessionUser | None = Depends(optional_user),
+    user: SessionUser = Depends(require_user),
     status: str = "open",
     type_filter: str = "",
 ):
@@ -491,19 +492,41 @@ async def markets(
 
 
 @router.get("/leaderboard")
-async def leaderboard(request: Request, user: SessionUser | None = Depends(optional_user)):
+async def leaderboard(
+    request: Request,
+    user: SessionUser = Depends(require_user),
+    category: str = "CHIPS",
+):
+    if category not in dict(LEADERBOARD_CATEGORIES):
+        category = "CHIPS"
+    gid = get_request_guild()
+
     async with get_db() as db:
-        users = (await db.execute(
-            select(User)
-            .where(User.guild_id == get_request_guild())
-            .order_by(User.chips.desc())
-            .limit(100)
-        )).scalars().all()
+        title, kind, rows = await _leaderboard_rows(db, gid, category, 100)
+
+        usernames: dict[int, str] = {}
+        ids = {uid for uid, _ in rows}
+        if ids:
+            user_result = await db.execute(
+                select(User.discord_id, User.username).where(
+                    User.guild_id == gid, User.discord_id.in_(ids)
+                )
+            )
+            usernames = {uid: name for uid, name in user_result.all()}
+
+    rows_out = [
+        {"rank": i + 1, "username": usernames.get(uid, "Member"), "value": value}
+        for i, (uid, value) in enumerate(rows)
+    ]
 
     return request.app.state.templates.TemplateResponse("leaderboard.html", {
         "request": request,
         "user": user,
-        "users": users,
+        "rows": rows_out,
+        "category": category,
+        "title": title,
+        "value_kind": kind,
+        "categories": LEADERBOARD_CATEGORIES,
     })
 
 

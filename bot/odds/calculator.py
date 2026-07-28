@@ -76,6 +76,36 @@ def cashout_value(original_wager: int, payout_if_win: int, rate: float) -> int:
     return max(1, round(original_wager + profit * rate))
 
 
+def resolve_cashout(
+    *,
+    wager: int,
+    payout_if_win: int,
+    global_allowed: bool,
+    global_rate: float,
+    item_allowed: bool | None = None,
+    item_rate: float | None = None,
+    type_allowed: bool | None = None,
+    type_rate: float | None = None,
+) -> tuple[bool, int]:
+    """Resolve cashout eligibility + amount via item -> type -> global precedence.
+
+    ``item_*`` is the most specific override (a single Market or Parlay row);
+    ``type_*`` is the market-type-level override (unused for parlays, which have
+    no type tier). Returns ``(allowed, amount)`` — amount is 0 when not allowed.
+    """
+    if item_allowed is not None:
+        allowed = item_allowed
+        rate = item_rate if item_rate is not None else global_rate
+    elif type_allowed is not None:
+        allowed = type_allowed
+        rate = type_rate if type_rate is not None else global_rate
+    else:
+        allowed = global_allowed
+        rate = global_rate
+    amount = cashout_value(wager, payout_if_win, rate) if allowed else 0
+    return allowed, amount
+
+
 def implied_probability(odds: int) -> float:
     dec = american_to_decimal(odds)
     return 1.0 / dec

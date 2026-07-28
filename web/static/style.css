@@ -1,4 +1,4 @@
-/* ── Capitol Sportsbook — Dark Gold Theme ─────────────────────────────────── */
+/* ── Panem Sportsbook — Dark Gold Theme ─────────────────────────────────── */
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600;700;800&display=swap');
 
 :root {
@@ -95,6 +95,29 @@ a:hover { color: var(--header-gold); }
 .nav-links a:hover, .nav-links a.active { color: var(--text-white); }
 .nav-links a.active { color: var(--header-gold); }
 .nav-admin { color: var(--header-gold) !important; }
+
+/* Popup shown next to whichever button triggered a slip action (leg/parlay
+   added) — appended to <body> and positioned via JS so it's never clipped by
+   the nav bar's overflow or a scrolling ancestor. */
+.inline-popup {
+  position: fixed;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  color: var(--text-white);
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.45rem 0.7rem;
+  border-radius: var(--radius);
+  box-shadow: 0 6px 16px rgba(0,0,0,0.4);
+  max-width: 260px;
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  z-index: 500;
+}
+.inline-popup.show { opacity: 1; transform: translateY(0); }
+.inline-popup.error { border-color: var(--lost); color: var(--lost); }
 
 .nav-user {
   display: flex;

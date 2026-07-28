@@ -5,6 +5,6 @@
 <div class="error-page">
   <div class="error-code">{{ code }}</div>
   <div class="error-message">{{ message }}</div>
-  <a href="/" class="btn btn-primary mt-2">Return Home</a>
+  <a href="{{ cta_url or '/' }}" class="btn btn-primary mt-2">{{ cta_label or 'Return Home' }}</a>
 </div>
 {% endblock %}

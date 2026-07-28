@@ -252,7 +252,7 @@ Respond as a JSON array (no other text):
 [
   {{
     "name": "short evocative title (max 60 chars)",
-    "description": "2–3 sentences, max 280 chars. Lead with a hook that frames the narrative angle, use one or two specific stats or lore facts as EVIDENCE, and close with the punchy reason to bet it. Do NOT just recite data — argue from it. The reader should feel convinced, not informed.",
+    "description": "1–2 tight sentences, max 160 chars, so it fits on a preview card. Lead with a hook that frames the angle, use ONE specific stat or lore fact as EVIDENCE, and close with the punchy reason to bet it. Argue from the data, don't recite it.",
     "tier": "SAFE" | "BALANCED" | "LONGSHOT",
     "market_ids": [<integer IDs only, from the list above>]
   }}
@@ -324,6 +324,32 @@ def _build_district_record_lines(records: list[dict[str, Any]]) -> str:
             f"bb_kills={bb_kills} | kill_rec={kill_rec} | avg_ts={avg_ts}"
         )
     return "\n".join(lines) or "(no district records)"
+
+
+# The tail board shows the description in a two-line field.  Small local models
+# routinely blow past the length cap in the prompt, so we trim in code to the
+# last complete sentence that still fits, keeping the copy readable instead of
+# stopping mid-word.  260 chars sits safely inside the board's ~2-line budget.
+_DESC_MAX_CHARS = 260
+
+
+def _fit_description(text: str) -> str:
+    """Collapse whitespace and trim a description to fit the board's 2-line field.
+
+    Prefers to end on a sentence boundary within the budget; if the first
+    sentence is longer than the budget, falls back to a word boundary + ellipsis
+    so the text never ends mid-word.
+    """
+    text = " ".join((text or "").split())
+    if len(text) <= _DESC_MAX_CHARS:
+        return text
+    window = text[:_DESC_MAX_CHARS]
+    cut = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
+    if window[-1:] in ".!?":
+        cut = max(cut, len(window) - 1)
+    if cut >= 80:
+        return window[: cut + 1].rstrip()
+    return window.rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
 
 
 def _repair_truncated_array(text: str) -> Any:
@@ -444,7 +470,7 @@ async def generate_ai_parlays(
             continue
         results.append({
             "name": str(item.get("name", "AI Parlay"))[:100],
-            "description": str(item.get("description", ""))[:500],
+            "description": _fit_description(str(item.get("description", ""))),
             "tier": tier,
             "market_ids": mids,
         })
@@ -478,15 +504,38 @@ are always BACKING them to succeed — write with that confidence.
 Rules:
 - Use ONLY the market IDs from the provided list. Every leg is about this one
   subject — you cannot reference any other district or tribute.
-- Pick 3 to 6 legs that tell a single, connected story, all pulling in the same
-  direction (the subject thriving). Never frame it as the subject failing.
+- LEG COUNT: aim for 4 or 5 legs that tell a single, connected story, all pulling
+  in the same direction (the subject thriving). Use fewer than 4 ONLY when the
+  market list genuinely can't support a richer story. A 3-leg parlay should be
+  the exception, never your default. Never frame it as the subject failing.
 - VARIETY: prefer legs of DIFFERENT market types (mix survival, advancement,
-  kills, placement, training). Do not stack three near-identical bets.
+  kills, placement, training). You may repeat a market type when each leg is
+  about a DIFFERENT tribute (e.g. two tributes both surviving the bloodbath),
+  but never stack the same bet on the same tribute.
 - Frame the whole parlay around THIS angle: {angle}. Let that angle drive both
   which legs you pick and how you pitch it.
 - ORIGINAL NAME: give it a distinctive, specific title tied to the angle and the
   actual tributes/district. Do NOT reuse generic templates — avoid the words
   "Silent", "Ascent", "Domination", "Triumph", and "Reign".
+- TITLE MUST MATCH THE LEGS: the title and description may only reference what
+  your chosen legs actually bet on. Every market you are shown fits the angle
+  "{angle}", so lean into that — but never name an event (a bloodbath, a final-8
+  run, a kill count) unless a leg in this parlay actually bets on it.
+- NAME EVERY TRIBUTE INVOLVED: if your legs bet on more than one tribute, the
+  title must credit all of them (e.g. "Torque & Fizzeé's Blood Harvest") or name
+  the district — never headline one tribute while other legs feature another.
+- NO DISTRICT/INDIVIDUAL OVERLAP: never combine a whole-district or whole-alliance
+  market with the individual-tribute version of the SAME event (e.g. do not pair
+  "D10 Both Make Final 8" with "D10M Makes Final 8" — the district bet is already
+  implied by the individuals). This includes victors: never pair a "district wins"
+  bet with a specific tribute of that district winning — the district victory is
+  guaranteed once the tribute wins. Pick one or the other, not both.
+- ONE WINNER PER FIELD: only one tribute can get the first kill, the most kills,
+  or win the games. Never bet two different tributes for the same one-of-the-field
+  outcome (e.g. two "gets first kill" legs) — they can't both happen.
+- ONE LINE PER STAT: never stack two over/under lines on the same tribute's stat
+  (e.g. "over 0.5 kills" AND "over 1.5 kills" for the same tribute) — the higher
+  line already implies the lower, so the second leg is dead weight. Pick one.
 - Write like a sharp analyst selling a pick: a hook (why this angle is
   compelling), one or two specific stats or lore facts as EVIDENCE, then a
   punchy closer. Vary your sentence rhythm; do not just list the data.
@@ -497,7 +546,7 @@ Rules:
 Respond with a SINGLE JSON object only — no markdown fences, no prose outside
 the JSON:
 {{"name": "short evocative title, max 60 chars",
-  "description": "2-3 sentences, max 280 chars: hook -> evidence -> closer",
+  "description": "1-2 tight sentences, max 160 chars: hook + one stat/lore fact + why to tail. Must fit on a preview card, so keep it short.",
   "market_ids": [integer IDs from the list above]}}
 """
 
@@ -524,8 +573,9 @@ Format: D# | name | gender | age | kills | training_score | vet/rookie | debilit
 
 === TASK ===
 Build one {target_tier}-leaning parlay for {subject_label}, framed around the
-angle above, using 3-6 of the markets. Mix market types and give it an original
-title. Return the single JSON object described in the system message.
+angle above, using 4-5 of the markets (3 only if the list can't support more).
+Mix market types and give it an original title. Return the single JSON object
+described in the system message.
 """
 
 
@@ -559,7 +609,7 @@ def _parse_subject_parlay(
         return None
     return {
         "name": str(data.get("name", "AI Parlay"))[:100],
-        "description": str(data.get("description", ""))[:500],
+        "description": _fit_description(str(data.get("description", ""))),
         "market_ids": mids[:6],
         "subject_label": subject_label,
     }
