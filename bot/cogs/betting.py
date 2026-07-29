@@ -34,6 +34,16 @@ PARLAY_PAYOUT_CAP = 10_000_000
 # Minimum chips a member may withdraw or deposit in a single panars exchange.
 EXCHANGE_MIN = 5000
 
+BETTING_PAUSED_MSG = (
+    "🛑 Betting is currently paused by an admin. Try again once it's resumed."
+)
+
+
+async def _betting_paused() -> bool:
+    raw = await get_setting("betting_paused")
+    return json.loads(raw) if raw else False
+
+
 _MAKES_MILESTONES = {"MAKES_FINAL_8", "MAKES_FINAL_5"}
 _ALL_MILESTONES = {
     "MAKES_FINAL_8", "MISSES_FINAL_8",
@@ -1258,6 +1268,8 @@ async def _tail_submit(
     parlay was built off another member's board listing (never a template), so the
     original poster can be notified when it resolves — see `_check_parlay`.
     """
+    if await _betting_paused():
+        return BETTING_PAUSED_MSG, None
     if user.chips < wager:
         return f"Insufficient chips. You have **{fmt_chips(user.chips)}**.", None
     err, markets = await _validate_tail_markets(session, user.discord_id, market_ids, user.guild_id)
@@ -1686,6 +1698,10 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
 
+        if await _betting_paused():
+            await interaction.followup.send(BETTING_PAUSED_MSG, ephemeral=True)
+            return
+
         if market_id is None:
             await interaction.followup.send(
                 "Pick a market from the `market_id` autocomplete list — use `subject_type` / "
@@ -1924,6 +1940,10 @@ class BettingCog(commands.Cog):
         name: app_commands.Range[str, 1, 80] | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
+            return
+
+        if await _betting_paused():
+            await interaction.followup.send(BETTING_PAUSED_MSG, ephemeral=True)
             return
 
         async with get_session() as session:

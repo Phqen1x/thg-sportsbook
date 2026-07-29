@@ -16,8 +16,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import func, select, text
 
 from bot.cogs.betting import (
-    _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
-    MAX_PARLAY_LEGS, PARLAY_PAYOUT_CAP,
+    _betting_paused, _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
+    BETTING_PAUSED_MSG, MAX_PARLAY_LEGS, PARLAY_PAYOUT_CAP,
 )
 from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
 from bot.database.models import (
@@ -455,6 +455,8 @@ async def place_bet(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if await _betting_paused():
+        raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
         market = await db.get(Market, market_id)
@@ -655,6 +657,8 @@ async def parlay_submit(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if await _betting_paused():
+        raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
         db_user = await _get_or_create_user(db, user)
@@ -797,6 +801,8 @@ async def tail_parlay(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if await _betting_paused():
+        raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
         tpl = await db.get(ParlayTemplate, template_id)

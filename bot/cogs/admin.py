@@ -8671,6 +8671,37 @@ class AdminCog(commands.Cog):
             "All tributes, bets, parlays, and markets have been reset.", ephemeral=True
         )
 
+    @game.command(
+        name="pause_betting",
+        description="Pause or resume placing bets and submitting parlays sportswide",
+    )
+    @app_commands.describe(state="Pause or resume betting")
+    @app_commands.choices(
+        state=[
+            app_commands.Choice(name="Pause betting", value="pause"),
+            app_commands.Choice(name="Resume betting", value="resume"),
+        ]
+    )
+    @is_admin()
+    async def game_pause_betting(
+        self, interaction: discord.Interaction, state: app_commands.Choice[str]
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        paused = state.value == "pause"
+        await set_setting("betting_paused", paused)
+        if paused:
+            await interaction.followup.send(
+                "🛑 Betting is now **paused**. Members can't place bets or submit parlays "
+                "(including tails) until you run `/game pause_betting resume`.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "✅ Betting has been **resumed**. Members can place bets and submit parlays again.",
+                ephemeral=True,
+            )
+
     # ── PRE-BUILT PARLAY COMMANDS ─────────────────────────────────────────────
 
     async def _template_markets(self, session, template_id: int):

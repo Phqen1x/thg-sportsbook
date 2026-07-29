@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select, text
 
 from bot.cogs.betting import (
-    _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
+    _betting_paused, _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
     PARLAY_PAYOUT_CAP, MAX_PARLAY_LEGS,
 )
 from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
@@ -74,6 +74,9 @@ async def _get_or_create_user(db, session_user: SessionUser) -> User:
         db.add(u)
         await db.flush()
     return u
+
+
+_PAUSED_ERROR = "Betting+is+currently+paused+by+an+admin.+Try+again+once+its+resumed."
 
 
 def _redirect(url: str, msg: str = "", error: str = "") -> RedirectResponse:
@@ -274,6 +277,8 @@ async def place_bet(
 ):
     if wager < 1:
         return _redirect(f"/bet/{market_id}", error="Wager+must+be+at+least+1+chip.")
+    if await _betting_paused():
+        return _redirect(f"/bet/{market_id}", error=_PAUSED_ERROR)
 
     async with get_db() as db:
         market = await db.get(Market, market_id)
@@ -480,6 +485,8 @@ async def parlay_submit(
 ):
     if wager < 1:
         return _redirect("/parlay", error="Wager+must+be+at+least+1+chip.")
+    if await _betting_paused():
+        return _redirect("/parlay", error=_PAUSED_ERROR)
 
     async with get_db() as db:
         db_user = await _get_or_create_user(db, user)
@@ -689,6 +696,8 @@ async def tail_parlay(
 ):
     if wager < 1:
         return _redirect("/tail", error="Wager+must+be+at+least+1+chip.")
+    if await _betting_paused():
+        return _redirect("/tail", error=_PAUSED_ERROR)
 
     async with get_db() as db:
         tpl = await db.get(ParlayTemplate, template_id)
@@ -758,6 +767,8 @@ async def tail_member_parlay(
 ):
     if wager < 1:
         return _redirect("/tail", error="Wager+must+be+at+least+1+chip.")
+    if await _betting_paused():
+        return _redirect("/tail", error=_PAUSED_ERROR)
 
     async with get_db() as db:
         source = await db.get(Parlay, parlay_id)
