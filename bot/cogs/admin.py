@@ -1053,11 +1053,14 @@ async def _kill_quality_for_victim(session, victim: Tribute) -> float:
     Reflects the victim's win odds relative to the field: killing a favourite is
     worth more than killing a long-shot. Prefers the victim's live "to win"
     market odds (what bettors actually saw); falls back to computed win odds.
-    Call after the victim's status has been set to DEAD so the alive count is the
-    surviving field; the victim is added back in for the field-average baseline.
+    The victim is excluded explicitly (rather than relying on their status
+    already being DEAD) since sessions run with autoflush=False — a pending
+    status="DEAD" write isn't visible to this query until flushed.
     """
     alive_count = await session.scalar(
-        select(func.count()).select_from(Tribute).where(Tribute.status == "ALIVE")
+        select(func.count()).select_from(Tribute).where(
+            Tribute.status == "ALIVE", Tribute.id != victim.id
+        )
     )
     field_size = (alive_count or 0) + 1  # surviving field + the victim themselves
 
@@ -5116,11 +5119,14 @@ class AdminCog(commands.Cog):
                         line = kou.ou_line if kou.ou_line is not None else 0.5
                         if killer.kills > line:
                             await _resolve_market(session, kou, kou.ou_side == "OVER")
-            # Placement = one more than the number of tributes still alive. This
-            # tribute has already been marked DEAD above, so the ALIVE query
-            # excludes them; every survivor outlasts this tribute.
+            # Placement = one more than the number of OTHER tributes still alive
+            # — every survivor outlasts this tribute. Sessions here run with
+            # autoflush=False, so the pending status="DEAD" write above hasn't
+            # hit the DB yet; excluding this tribute's id explicitly (rather than
+            # relying on the flush) keeps the first kill landing on the correct
+            # last-place number instead of one past it.
             alive_result = await session.execute(
-                select(Tribute).where(Tribute.status == "ALIVE")
+                select(Tribute).where(Tribute.status == "ALIVE", Tribute.id != t.id)
             )
             alive_remaining = len(alive_result.scalars().all())
             t.placement = alive_remaining + 1
@@ -7782,7 +7788,16 @@ class AdminCog(commands.Cog):
                 # ── Phase-gated open/close pass ───────────────────────────────
                 # After resolutions, re-gate every still-live market: markets
                 # whose type is available in this phase open, the rest close.
-                # Resolved markets are skipped (no longer OPEN/CLOSED).
+                # Resolved markets are skipped (no longer OPEN/CLOSED) — but
+                # sessions here run with autoflush=False, so the RESOLVED writes
+                # from the auto-resolutions above (bloodbath survivor/killed,
+                # milestones, etc.) aren't visible to a fresh query until
+                # flushed. Without this, the SELECT below still sees their old
+                # OPEN/CLOSED status at the SQL level and hands back the same
+                # (already-mutated-to-RESOLVED) ORM objects, which then get
+                # flipped straight back to OPEN by the loop below — the market
+                # pays out correctly but ends up looking open again.
+                await session.flush()
                 allowed_types = _open_types_for_phase(new_phase.name)
                 gate_result = await session.execute(
                     select(Market).where(Market.status.in_(["OPEN", "CLOSED"]))
