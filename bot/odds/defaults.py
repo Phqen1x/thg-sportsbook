@@ -988,6 +988,33 @@ def district_default_odds(
     return DEFAULT_FALLBACK_ODDS
 
 
+def pre_reaping_district_odds(
+    district_records: "dict[int, DistrictRecord]",
+) -> dict[int, int]:
+    """Opening DISTRICT_VICTOR odds for all 12 districts before any tribute has
+    been reaped — there's no roster or training score to price from yet, so
+    this is the only district-market pricing path driven purely by each
+    district's historical reputation rather than the current field.
+
+    Each district starts from a flat 1/12 field share, nudged by
+    ``reputation_factor`` (bounded to ±10% per district at the reputation
+    extremes), then the 12 shares are renormalized back to a probability
+    distribution so the field still sums to ~100% before conversion.
+    """
+    baseline = 1.0 / 12
+    raw = {
+        d: baseline * reputation_factor(
+            district_records[d].reputation if d in district_records else None
+        )
+        for d in range(1, 13)
+    }
+    total = sum(raw.values()) or 1.0
+    return {
+        d: prob_to_american(max(0.01, min(0.99, p / total)))
+        for d, p in raw.items()
+    }
+
+
 def alliance_default_odds(
     market_type: str,
     alliance_members: list["Tribute"],

@@ -396,8 +396,9 @@ def _training_score_conflict(existing_markets: list[Market], new_mkt: Market) ->
 
     A tribute has a single training score, so on the SAME tribute we reject two
     exact-score bets, an exact-score bet the over/under leg would contradict, and
-    any over+under pair. Across DIFFERENT tributes we reject two exact-score bets
-    on the same score value (only one tribute can land that exact number)."""
+    any over+under pair. Different tributes CAN land the exact same training
+    score, so two exact-score bets naming the same value for different tributes
+    are allowed to coexist."""
     if new_mkt.type not in _TRAINING_TYPES:
         return None
     for m in existing_markets:
@@ -435,16 +436,6 @@ def _training_score_conflict(existing_markets: list[Market], new_mkt: Market) ->
                     "You can't parlay an over and an under training-score bet on "
                     "the same tribute."
                 )
-        elif (
-            m.type == _TRAINING_EXACT
-            and new_mkt.type == _TRAINING_EXACT
-            and m.placement_num is not None
-            and m.placement_num == new_mkt.placement_num
-        ):
-            return (
-                f"You can't parlay two bets on tributes scoring exactly "
-                f"{new_mkt.placement_num} in training — pick a different score for one of them."
-            )
     return None
 
 
@@ -2213,7 +2204,7 @@ class BettingCog(commands.Cog):
     ) -> discord.abc.Messageable | None:
         """Resolve the withdraw/deposit admin channel, or None.
 
-        Checks per-guild setting first (set via `/admin settings withdraw_channel`),
+        Checks per-guild setting first (set via `/settings withdraw_channel`),
         then falls back to the WITHDRAW_CHANNEL_ID env var.
         """
         if interaction.guild is None:
@@ -2312,7 +2303,7 @@ class BettingCog(commands.Cog):
             "the chips:\n"
             f"`/admin1 award-deprive citizen:{member.mention} operation:Deprive "
             f"resource:Panars amount:{amount}`\n"
-            f"`/admin settings chips_give user:{member.mention} amount:{amount}`"
+            f"`/settings chips_give user:{member.mention} amount:{amount}`"
         )
 
         await interaction.followup.send(

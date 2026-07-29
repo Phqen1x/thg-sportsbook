@@ -18,6 +18,9 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const fmtChips = (n) => Number(n ?? 0).toLocaleString("en-US");
 const fmtOdds = (n) => (n == null ? "—" : n >= 0 ? `+${n}` : `${n}`);
 const oddsClass = (n) => (n == null ? "" : n >= 0 ? "odds-pos" : "odds-neg");
+const decFromOdds = (odds) => (odds >= 0 ? odds / 100 + 1 : 100 / Math.abs(odds) + 1);
+const payoutForWager = (wager, odds) => Math.max(wager, Math.round(wager * decFromOdds(odds)));
+const PARLAY_PAYOUT_CAP = 10_000_000; // keep in sync with bot/cogs/betting.py
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -345,6 +348,10 @@ async function viewMarkets(view) {
     }));
 }
 
+function tailPath(t) {
+  return t.kind === "member" ? `/tail/parlay/${t.id}` : `/tail/${t.id}`;
+}
+
 function featuredParlayCard(t) {
   return `
     <div class="feat-parlay-card card">
@@ -358,8 +365,8 @@ function featuredParlayCard(t) {
       </ul>
       <div class="feat-parlay-footer">
         <span class="${oddsClass(t.combined_odds)} feat-parlay-odds">${t.combined_odds == null ? "—" : fmtOdds(t.combined_odds)}</span>
-        <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}">Tail this</button>
-        <button class="btn btn-outline btn-sm" data-act="add-slip" data-id="${t.id}">Add to Slip</button>
+        <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}" data-kind="${esc(t.kind || "template")}" data-odds="${t.combined_odds ?? ""}">Tail this</button>
+        <button class="btn btn-outline btn-sm" data-act="add-slip" data-id="${t.id}" data-kind="${esc(t.kind || "template")}">Add to Slip</button>
       </div>
     </div>`;
 }
@@ -368,13 +375,14 @@ function bindFeaturedParlayActions(view) {
   view.querySelectorAll('[data-act="tail"]').forEach((b) =>
     b.addEventListener("click", () => openWagerModal({
       title: "Tail Parlay",
-      onSubmit: (wager) => api(`/tail/${b.dataset.id}`, { method: "POST", body: { wager } }),
+      odds: b.dataset.odds !== "" ? Number(b.dataset.odds) : null,
+      onSubmit: (wager) => api(tailPath(b.dataset), { method: "POST", body: { wager } }),
       after: () => { location.hash = "#mybets"; },
     })));
   view.querySelectorAll('[data-act="add-slip"]').forEach((b) =>
     b.addEventListener("click", async () => {
       try {
-        const r = await api(`/tail/${b.dataset.id}/add-to-slip`, { method: "POST" });
+        const r = await api(`${tailPath(b.dataset)}/add-to-slip`, { method: "POST" });
         notifyNearButton(b, r.message);
       } catch (e) { notifyNearButton(b, e.message, true); }
     }));
@@ -514,6 +522,7 @@ async function viewParlay(view) {
       ${legs.length >= 2 ? `
         <div class="card parlay-submit">
           <input id="parlay-wager" type="number" min="1" placeholder="Wager (chips)" class="input">
+          <div class="modal-payout dim" id="parlay-payout"></div>
           <label class="checkbox"><input type="checkbox" id="parlay-public"> List on tail board</label>
           <div class="row-buttons">
             <button class="btn btn-primary" id="parlay-go">Submit Parlay</button>
@@ -526,6 +535,14 @@ async function viewParlay(view) {
     b.addEventListener("click", () => doAction(`/parlay/remove/${b.dataset.id}`, "POST")));
   const clear = $("#parlay-clear", view);
   if (clear) clear.addEventListener("click", () => doAction("/parlay/clear", "POST"));
+  const wagerEl = $("#parlay-wager", view);
+  if (wagerEl && data.combined_odds != null) {
+    wagerEl.addEventListener("input", () => {
+      const w = Number(wagerEl.value) || 0;
+      const payout = Math.min(payoutForWager(w, data.combined_odds), PARLAY_PAYOUT_CAP);
+      $("#parlay-payout", view).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
+    });
+  }
   const go = $("#parlay-go", view);
   if (go) go.addEventListener("click", async () => {
     const wager = Number($("#parlay-wager", view).value);
@@ -558,8 +575,8 @@ async function viewTail(view) {
             ${t.legs.map((m) => `<li>${esc(m.label)} <span class="${oddsClass(m.odds)}">${fmtOdds(m.odds)}</span></li>`).join("")}
           </ul>
           <div class="row-buttons">
-            <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}">Tail this</button>
-            <button class="btn btn-outline btn-sm" data-act="add-slip" data-id="${t.id}">Add to Slip</button>
+            <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}" data-kind="${esc(t.kind || "template")}" data-odds="${t.combined_odds ?? ""}">Tail this</button>
+            <button class="btn btn-outline btn-sm" data-act="add-slip" data-id="${t.id}" data-kind="${esc(t.kind || "template")}">Add to Slip</button>
           </div>
         </div>`).join("") : `<div class="empty">No public parlays to tail right now.</div>`}
     </div>`;
@@ -567,13 +584,14 @@ async function viewTail(view) {
   view.querySelectorAll('[data-act="tail"]').forEach((b) =>
     b.addEventListener("click", () => openWagerModal({
       title: "Tail Parlay",
-      onSubmit: (wager) => api(`/tail/${b.dataset.id}`, { method: "POST", body: { wager } }),
+      odds: b.dataset.odds !== "" ? Number(b.dataset.odds) : null,
+      onSubmit: (wager) => api(tailPath(b.dataset), { method: "POST", body: { wager } }),
       after: () => { location.hash = "#mybets"; },
     })));
   view.querySelectorAll('[data-act="add-slip"]').forEach((b) =>
     b.addEventListener("click", async () => {
       try {
-        const r = await api(`/tail/${b.dataset.id}/add-to-slip`, { method: "POST" });
+        const r = await api(`${tailPath(b.dataset)}/add-to-slip`, { method: "POST" });
         notifyNearButton(b, r.message);
       } catch (e) { notifyNearButton(b, e.message, true); }
     }));
@@ -880,10 +898,9 @@ async function openBetModal(marketId) {
       <button class="btn btn-outline" id="bet-cancel">Cancel</button>
     </div>`);
   const wagerEl = $("#bet-wager", overlay);
-  const dec = m.odds >= 0 ? m.odds / 100 + 1 : 100 / Math.abs(m.odds) + 1;
   wagerEl.addEventListener("input", () => {
     const w = Number(wagerEl.value) || 0;
-    $("#bet-payout", overlay).textContent = w ? `Win ${fmtChips(Math.max(w, Math.round(w * dec)))} chips` : "";
+    $("#bet-payout", overlay).textContent = w ? `Win ${fmtChips(payoutForWager(w, m.odds))} chips` : "";
   });
   $("#bet-cancel", overlay).addEventListener("click", () => overlay.remove());
   $("#bet-go", overlay).addEventListener("click", async () => {
@@ -898,18 +915,27 @@ async function openBetModal(marketId) {
   });
 }
 
-function openWagerModal({ title, onSubmit, after }) {
+function openWagerModal({ title, odds, onSubmit, after }) {
   const overlay = modal(`
     <h3>${esc(title)}</h3>
     <div class="dim">Balance ${fmtChips(ME.chips)}</div>
     <input id="w-wager" class="input" type="number" min="1" placeholder="Wager (chips)">
+    <div class="modal-payout dim" id="w-payout"></div>
     <div class="row-buttons">
       <button class="btn btn-primary" id="w-go">Confirm</button>
       <button class="btn btn-outline" id="w-cancel">Cancel</button>
     </div>`);
+  const wagerEl = $("#w-wager", overlay);
+  if (odds != null) {
+    wagerEl.addEventListener("input", () => {
+      const w = Number(wagerEl.value) || 0;
+      const payout = Math.min(payoutForWager(w, odds), PARLAY_PAYOUT_CAP);
+      $("#w-payout", overlay).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
+    });
+  }
   $("#w-cancel", overlay).addEventListener("click", () => overlay.remove());
   $("#w-go", overlay).addEventListener("click", async () => {
-    const wager = Number($("#w-wager", overlay).value);
+    const wager = Number(wagerEl.value);
     if (!wager || wager < 1) return toast("Enter a wager of at least 1 chip.", "error");
     try {
       const r = await onSubmit(wager);

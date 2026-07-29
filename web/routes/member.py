@@ -24,6 +24,21 @@ router = APIRouter(tags=["member"])
 _GUILD_ID = get_request_guild
 
 
+async def _paused() -> bool:
+    """Wrap _betting_paused() with the guild-context bind it needs.
+
+    _betting_paused() reaches the DB through bot.database.engine (get_setting ->
+    get_session()), which resolves the active guild from *its own* contextvar —
+    separate from web/database.py's request-guild context that the rest of this
+    module uses. Without binding it first, current_guild_id() reads 0 and
+    get_session() raises "No guild context set", which isn't caught by the form
+    routes' redirect-on-error handling and surfaces as a bare 500 instead of the
+    intended paused-betting message."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    return await _betting_paused()
+
+
 async def _cashout_settings(db) -> tuple[bool, float, dict]:
     """Global cashout settings, shared by the bet/parlay cashout preview + POST routes."""
     row = (await db.execute(text("SELECT value FROM game_settings WHERE key='cashout_allowed'"))).fetchone()
@@ -277,7 +292,7 @@ async def place_bet(
 ):
     if wager < 1:
         return _redirect(f"/bet/{market_id}", error="Wager+must+be+at+least+1+chip.")
-    if await _betting_paused():
+    if await _paused():
         return _redirect(f"/bet/{market_id}", error=_PAUSED_ERROR)
 
     async with get_db() as db:
@@ -485,7 +500,7 @@ async def parlay_submit(
 ):
     if wager < 1:
         return _redirect("/parlay", error="Wager+must+be+at+least+1+chip.")
-    if await _betting_paused():
+    if await _paused():
         return _redirect("/parlay", error=_PAUSED_ERROR)
 
     async with get_db() as db:
@@ -696,7 +711,7 @@ async def tail_parlay(
 ):
     if wager < 1:
         return _redirect("/tail", error="Wager+must+be+at+least+1+chip.")
-    if await _betting_paused():
+    if await _paused():
         return _redirect("/tail", error=_PAUSED_ERROR)
 
     async with get_db() as db:
@@ -767,7 +782,7 @@ async def tail_member_parlay(
 ):
     if wager < 1:
         return _redirect("/tail", error="Wager+must+be+at+least+1+chip.")
-    if await _betting_paused():
+    if await _paused():
         return _redirect("/tail", error=_PAUSED_ERROR)
 
     async with get_db() as db:

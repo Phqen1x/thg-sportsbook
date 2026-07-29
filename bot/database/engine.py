@@ -341,6 +341,20 @@ async def _migrate_schema() -> None:
             "SELECT COUNT(*) FROM betting_phases"
         ))).scalar()
         if phase_rows:
+            # Add the Pre-Reaping phase (District Victor only, before any
+            # tribute is reaped) to legacy DBs that predate it. Sorts before
+            # every other phase so /game start's "lowest sort_order" pick
+            # lands here first without disturbing the existing phase order.
+            prereaping_count = (await conn.execute(text(
+                "SELECT COUNT(*) FROM betting_phases WHERE name = 'Pre-Reaping'"
+            ))).scalar()
+            if prereaping_count == 0:
+                await conn.execute(text(
+                    "INSERT OR IGNORE INTO betting_phases (name, description, sort_order) "
+                    "VALUES ('Pre-Reaping', 'Only District Victor markets are open — betting "
+                    "before any tribute is reaped', -1)"
+                ))
+
             # Add Final 8 / Final 5 phases to legacy DBs that predate them.
             final8_count = (await conn.execute(text(
                 "SELECT COUNT(*) FROM betting_phases WHERE name = 'Final 8'"
@@ -681,6 +695,7 @@ async def _seed_defaults() -> None:
         )
         if phase_count == 0:
             default_phases = [
+                ("Pre-Reaping",      "Only District Victor markets are open — betting before any tribute is reaped", -1),
                 ("Pre-Games",        "Only District Victor and tribute score markets are open", 0),
                 ("Bloodbath",        "The initial cornucopia bloodbath — bloodbath markets open", 1),
                 ("Arena",            "The arena opens — all remaining markets go live",           2),

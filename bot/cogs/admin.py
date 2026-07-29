@@ -15,7 +15,13 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import func, or_, select
 
-from bot.database.engine import get_session, get_read_session, set_setting, get_setting, current_guild_id
+from bot.database.engine import (
+    get_session,
+    get_read_session,
+    set_setting,
+    get_setting,
+    current_guild_id,
+)
 from bot.database.models import (
     Alliance,
     Bet,
@@ -64,6 +70,7 @@ from bot.odds.defaults import (
     game_default_odds,
     kill_boost_dr_factor,
     kill_quality_multiplier,
+    pre_reaping_district_odds,
     prior_experience_factor,
     reputation_factor,
     SADE_CHAMPION_FACTOR,
@@ -85,9 +92,14 @@ from bot.imaging.bet_slip import (
 from bot.utils.checks import is_admin
 from bot.utils.formatters import fmt_chips, fmt_odds, safe_defer
 from bot.utils.market_view import MarketPageView, MarketTypePageView, sort_markets
+
 # Leg-compatibility validation lives in the betting cog; reused here so admin and
 # auto-generated parlays obey the same conflict rules as member-built ones.
-from bot.cogs.betting import _parlay_conflict, tribute_lookup_for_markets, PARLAY_PAYOUT_CAP
+from bot.cogs.betting import (
+    _parlay_conflict,
+    tribute_lookup_for_markets,
+    PARLAY_PAYOUT_CAP,
+)
 
 log = logging.getLogger("capitol.admin")
 
@@ -111,7 +123,9 @@ async def _collect_notifications() -> AsyncGenerator[list[dict], None]:
 async def _send_resolution_dms(bot: commands.Bot, notifications: list[dict]) -> None:
     for notif in notifications:
         try:
-            user = bot.get_user(notif["user_id"]) or await bot.fetch_user(notif["user_id"])
+            user = bot.get_user(notif["user_id"]) or await bot.fetch_user(
+                notif["user_id"]
+            )
             if user is None:
                 continue
             status = notif["status"]
@@ -149,7 +163,11 @@ async def _send_resolution_dms(bot: commands.Bot, notifications: list[dict]) -> 
                     for i, leg in enumerate(notif["legs"])
                 ]
                 buf = await render_async(
-                    render_parlay_result_slip, legs, notif["wager"], notif["payout"], status
+                    render_parlay_result_slip,
+                    legs,
+                    notif["wager"],
+                    notif["payout"],
+                    status,
                 )
                 file = buf_to_discord_file(buf, "parlay_result.png")
                 if status == "WON":
@@ -169,7 +187,9 @@ async def _send_resolution_dms(bot: commands.Bot, notifications: list[dict]) -> 
                     msg += f"\n(Tailed from **{poster_username}**'s board listing.)"
                 await user.send(content=msg, file=file)
             elif notif["type"] == "tail_notify":
-                verb = {"WON": "won", "LOST": "lost", "VOIDED": "been voided"}.get(status, status.lower())
+                verb = {"WON": "won", "LOST": "lost", "VOIDED": "been voided"}.get(
+                    status, status.lower()
+                )
                 msg = (
                     f"**{notif['tailer_username']}** tailed your Parlay #{notif['parlay_id']} "
                     f"off the board — it just **{verb}**."
@@ -185,7 +205,9 @@ MARKET_TYPES = [
     app_commands.Choice(name="Tribute Wins (Victor)", value="TRIBUTE_WINS"),
     app_commands.Choice(name="Tribute Placement (Exact)", value="TRIBUTE_PLACEMENT"),
     app_commands.Choice(name="Tribute Top-N Finish", value="TRIBUTE_TOP_N"),
-    app_commands.Choice(name="Tribute Runner-Up (2nd Place)", value="TRIBUTE_RUNNER_UP"),
+    app_commands.Choice(
+        name="Tribute Runner-Up (2nd Place)", value="TRIBUTE_RUNNER_UP"
+    ),
     app_commands.Choice(name="First Tribute to Die", value="FIRST_TRIBUTE_TO_DIE"),
     app_commands.Choice(name="Top Killer", value="TRIBUTE_KILLS"),
     app_commands.Choice(name="Kill Event (A kills B)", value="KILL_EVENT"),
@@ -193,7 +215,9 @@ MARKET_TYPES = [
     app_commands.Choice(name="First Blood", value="FIRST_BLOOD"),
     app_commands.Choice(name="Bloodbath Survivor", value="BLOODBATH_SURVIVOR"),
     app_commands.Choice(name="Killed in Bloodbath", value="TRIBUTE_KILLED_BLOODBATH"),
-    app_commands.Choice(name="First in Alliance to Die", value="FIRST_IN_ALLIANCE_DEATH"),
+    app_commands.Choice(
+        name="First in Alliance to Die", value="FIRST_IN_ALLIANCE_DEATH"
+    ),
     app_commands.Choice(name="Highest Training Score", value="HIGHEST_TRAINING_SCORE"),
     app_commands.Choice(name="Lowest Training Score", value="LOWEST_TRAINING_SCORE"),
     app_commands.Choice(name="Kills Over/Under", value="KILLS_OU"),
@@ -210,13 +234,19 @@ MARKET_TYPES = [
     app_commands.Choice(name="Training Score Over/Under", value="TRAINING_SCORE_OU"),
     # ── Game-level prop markets ────────────────────────────────────────────────
     app_commands.Choice(name="Bloodbath Kills Over/Under", value="BLOODBATH_KILLS_OU"),
-    app_commands.Choice(name="Bloodbath Deaths Over/Under", value="BLOODBATH_DEATHS_OU"),
+    app_commands.Choice(
+        name="Bloodbath Deaths Over/Under", value="BLOODBATH_DEATHS_OU"
+    ),
     app_commands.Choice(name="Exact Bloodbath Deaths", value="EXACT_BLOODBATH_DEATHS"),
-    app_commands.Choice(name="Bloodbath Contains No Deaths", value="BLOODBATH_NO_DEATHS"),
+    app_commands.Choice(
+        name="Bloodbath Contains No Deaths", value="BLOODBATH_NO_DEATHS"
+    ),
     app_commands.Choice(
         name="Any Tribute Records 2+ BB Kills", value="ANY_BB_DOUBLE_KILL"
     ),
-    app_commands.Choice(name="Arena Trap Deaths Over/Under", value="ARENA_TRAP_DEATHS_OU"),
+    app_commands.Choice(
+        name="Arena Trap Deaths Over/Under", value="ARENA_TRAP_DEATHS_OU"
+    ),
     app_commands.Choice(
         name="Arena Environmental Deaths Over/Under", value="ARENA_ENV_DEATHS_OU"
     ),
@@ -289,9 +319,7 @@ MARKET_TYPES = [
         name="First Alliance to be Wiped", value="FIRST_ALLIANCE_WIPED"
     ),
     app_commands.Choice(name="Alliance Gets Most Kills", value="ALLIANCE_MOST_KILLS"),
-    app_commands.Choice(
-        name="Alliance Exact Kill Count", value="EXACT_ALLIANCE_KILLS"
-    ),
+    app_commands.Choice(name="Alliance Exact Kill Count", value="EXACT_ALLIANCE_KILLS"),
     app_commands.Choice(
         name="Alliance Produces Runner-Up (2nd Place)", value="ALLIANCE_RUNNER_UP"
     ),
@@ -345,15 +373,18 @@ _BLOODBATH_RESOLVE_TYPES = {"BLOODBATH_SURVIVOR"}
 _BLOODBATH_VOID_TYPES = {"FIRST_BLOOD"}
 
 # ── Phase-gated market availability ───────────────────────────────────────────
-# Markets open progressively as the Games advance. During Pre-Games the District
-# and individual-Tribute victor moneylines plus the training-score / scouting
-# props are live. Bloodbath opens every market type except the pre-game-exclusive
-# props/scores and all alliance-level markets (see _BLOODBATH_OPEN_TYPES below,
-# computed after _ALLIANCE_MARKET_TYPES is defined) — alliance markets stay closed
-# until Arena. Bloodbath markets resolve the instant Arena begins (see
-# game_set_phase), and every market type is open from Arena onward — including
-# through Sponsors Open/Closing, which only affect funding-modifier strength
-# (_set_sponsor_state), never which types are open.
+# Markets open progressively as the Games advance. Pre-Reaping — before any
+# tribute has been reaped — only District Victor is live, since it's the one
+# market type that needs no tribute roster to price or bet on. During Pre-Games
+# the District and individual-Tribute victor moneylines plus the training-score
+# / scouting props are live. Bloodbath opens every market type except the
+# pre-game-exclusive props/scores and all alliance-level markets (see
+# _BLOODBATH_OPEN_TYPES below, computed after _ALLIANCE_MARKET_TYPES is defined)
+# — alliance markets stay closed until Arena. Bloodbath markets resolve the
+# instant Arena begins (see game_set_phase), and every market type is open from
+# Arena onward — including through Sponsors Open/Closing, which only affect
+# funding-modifier strength (_set_sponsor_state), never which types are open.
+_PREREAPING_OPEN_TYPES = {"DISTRICT_VICTOR"}
 _PREGAMES_OPEN_TYPES = _PREGAMES_PROP_TYPES | {
     "HIGHEST_TRAINING_SCORE",
     "LOWEST_TRAINING_SCORE",
@@ -369,6 +400,8 @@ def _open_types_for_phase(phase_name: str | None) -> set[str] | None:
     Returns ``None`` when there is no type restriction — every market is open
     (Arena onward, including the sponsor-open, sponsor-closing, and final phases).
     """
+    if phase_name == "Pre-Reaping":
+        return _PREREAPING_OPEN_TYPES
     if phase_name == "Pre-Games":
         return _PREGAMES_OPEN_TYPES
     if phase_name == "Bloodbath":
@@ -376,7 +409,9 @@ def _open_types_for_phase(phase_name: str | None) -> set[str] | None:
     return None
 
 
-def _market_should_open(market: "Market", phase_id: int | None, allowed: set[str] | None) -> bool:
+def _market_should_open(
+    market: "Market", phase_id: int | None, allowed: set[str] | None
+) -> bool:
     """Whether ``market`` should be OPEN in the phase identified by ``phase_id``.
 
     A market pinned to an explicit phase opens only in that phase; otherwise it is
@@ -385,6 +420,23 @@ def _market_should_open(market: "Market", phase_id: int | None, allowed: set[str
     if market.phase_id is not None:
         return market.phase_id == phase_id
     return allowed is None or market.type in allowed
+
+
+async def _pregames_phase_id(session) -> int | None:
+    """The "Pre-Games" phase's id, looked up by name rather than sort_order.
+
+    Pre-Games-exclusive markets (training-score props, ARENA_TYPE, etc.) are
+    stamped with this so they open/close on that specific phase and never
+    reopen once every type is unrestricted from Arena onward (see
+    _market_should_open). This must NOT be "the lowest sort_order phase" —
+    Pre-Reaping now sorts before Pre-Games as the opening phase, so that query
+    would stamp these props to the wrong phase.
+    """
+    result = await session.execute(
+        select(BettingPhase).where(BettingPhase.name == "Pre-Games").limit(1)
+    )
+    phase = result.scalars().first()
+    return phase.id if phase else None
 
 
 async def _set_sponsor_state(session, state: str | None) -> None:
@@ -396,6 +448,7 @@ async def _set_sponsor_state(session, state: str | None) -> None:
         row.value = json.dumps(state)
     else:
         session.add(GameSetting(key="sponsor_state", value=json.dumps(state)))
+
 
 # District-level market types
 _DISTRICT_MARKET_TYPES = {
@@ -469,6 +522,7 @@ DIFFICULTY_ODDS: dict[str, int] = {
     "VERY_HARD": +700,
     "LONGSHOT": +1500,
 }
+
 
 # AI-generated parlays are labelled by their actual combined American odds:
 #   Safe     : combined < +500
@@ -1058,9 +1112,9 @@ async def _kill_quality_for_victim(session, victim: Tribute) -> float:
     status="DEAD" write isn't visible to this query until flushed.
     """
     alive_count = await session.scalar(
-        select(func.count()).select_from(Tribute).where(
-            Tribute.status == "ALIVE", Tribute.id != victim.id
-        )
+        select(func.count())
+        .select_from(Tribute)
+        .where(Tribute.status == "ALIVE", Tribute.id != victim.id)
     )
     field_size = (alive_count or 0) + 1  # surviving field + the victim themselves
 
@@ -1250,7 +1304,9 @@ async def _recalculate_markets(session) -> None:
     sponsor_state_row = await session.get(GameSetting, "sponsor_state")
     sponsor_state = json.loads(sponsor_state_row.value) if sponsor_state_row else None
     age_row = await session.get(GameSetting, "victor_avg_age")
-    global_age_neutral = float(json.loads(age_row.value)) if age_row else float(AGE_NEUTRAL)
+    global_age_neutral = (
+        float(json.loads(age_row.value)) if age_row else float(AGE_NEUTRAL)
+    )
     dr_map = {r.district: r for r in all_dr}
     # Manually-set district reputation factor (applies to both win and kill markets)
     dist_rep_factor: dict[int, float] = {
@@ -1260,7 +1316,11 @@ async def _recalculate_markets(session) -> None:
     # District funding level factor (applies to both win and kill markets).
     # Scaled by the sponsorship-window state.
     dist_funding_factor: dict[int, float] = {
-        d: funding_factor(dr_map[d].funding_level, sponsor_state) if d in dr_map else 1.0
+        d: (
+            funding_factor(dr_map[d].funding_level, sponsor_state)
+            if d in dr_map
+            else 1.0
+        )
         for d in range(1, 13)
     }
 
@@ -1291,9 +1351,28 @@ async def _recalculate_markets(session) -> None:
         )
         arena_pref = _arena_preference_factor(dr_map.get(t.district), arena_type)
         solo_win_factors[t.id] = (
-            own * seniority * age * hist_win * arena_pref * rep * fund * kboost * prior_exp * sade_champ
+            own
+            * seniority
+            * age
+            * hist_win
+            * arena_pref
+            * rep
+            * fund
+            * kboost
+            * prior_exp
+            * sade_champ
         )
-        solo_kill_factors[t.id] = own * seniority * age * hist_kill * rep * fund * kboost * prior_exp * sade_champ
+        solo_kill_factors[t.id] = (
+            own
+            * seniority
+            * age
+            * hist_kill
+            * rep
+            * fund
+            * kboost
+            * prior_exp
+            * sade_champ
+        )
 
     # The field-average circumstantial strength is the neutral benchmark each ally
     # is judged against. An ally exactly at the average neither helps nor hurts.
@@ -1382,7 +1461,7 @@ async def _recalculate_markets(session) -> None:
             # drive a tribute to the rail. relative=1 (average) stays 1; extremes
             # are pulled toward 1.
             relative = raw_factor / max(field_avg_factor, 0.01)
-            mfactor = relative ** MODIFIER_TEMPER
+            mfactor = relative**MODIFIER_TEMPER
             # Resolve historical average training score for this tribute's district/gender
             # so pregame training markets (HIGHEST_TRAINING_SCORE, etc.) can differentiate
             # districts before actual scores are revealed.
@@ -1427,6 +1506,13 @@ async def _recalculate_markets(session) -> None:
         if d is None:
             continue
         d_tributes = [t for t in all_tributes if t.district == d]
+        if market.type == "DISTRICT_VICTOR" and not d_tributes:
+            # Pre-Reaping: no tribute in this district yet, so there's no
+            # roster to price from — keep pricing off historical reputation
+            # (e.g. an admin adjusting DistrictRecord.reputation pre-reaping)
+            # instead of collapsing to the flat no-data fallback.
+            market.odds = pre_reaping_district_odds(dr_map)[d]
+            continue
         market.odds = district_default_odds(
             market.type,
             d_tributes,
@@ -1493,25 +1579,31 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
         if result is None:
             bet.status = "VOIDED"
             _ur = await session.execute(
-                select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id)
+                select(User).where(
+                    User.guild_id == bet.guild_id, User.discord_id == bet.user_id
+                )
             )
             user = _ur.scalar_one_or_none()
             if user:
                 user.chips += bet.wager
             if buf is not None and bet.parlay_id is None:
-                buf.append({
-                    "type": "straight",
-                    "user_id": bet.user_id,
-                    "status": "VOIDED",
-                    "market_label": market.label,
-                    "odds": bet.odds_at_placement,
-                    "wager": bet.wager,
-                    "payout": bet.wager,
-                })
+                buf.append(
+                    {
+                        "type": "straight",
+                        "user_id": bet.user_id,
+                        "status": "VOIDED",
+                        "market_label": market.label,
+                        "odds": bet.odds_at_placement,
+                        "wager": bet.wager,
+                        "payout": bet.wager,
+                    }
+                )
         elif result is True and bet.parlay_id is None:
             bet.status = "WON"
             _ur = await session.execute(
-                select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id)
+                select(User).where(
+                    User.guild_id == bet.guild_id, User.discord_id == bet.user_id
+                )
             )
             user = _ur.scalar_one_or_none()
             if user:
@@ -1519,27 +1611,31 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                 user.total_won += bet.payout_if_win
             credits_issued += bet.payout_if_win
             if buf is not None:
-                buf.append({
-                    "type": "straight",
-                    "user_id": bet.user_id,
-                    "status": "WON",
-                    "market_label": market.label,
-                    "odds": bet.odds_at_placement,
-                    "wager": bet.wager,
-                    "payout": bet.payout_if_win,
-                })
+                buf.append(
+                    {
+                        "type": "straight",
+                        "user_id": bet.user_id,
+                        "status": "WON",
+                        "market_label": market.label,
+                        "odds": bet.odds_at_placement,
+                        "wager": bet.wager,
+                        "payout": bet.payout_if_win,
+                    }
+                )
         elif result is False and bet.parlay_id is None:
             bet.status = "LOST"
             if buf is not None:
-                buf.append({
-                    "type": "straight",
-                    "user_id": bet.user_id,
-                    "status": "LOST",
-                    "market_label": market.label,
-                    "odds": bet.odds_at_placement,
-                    "wager": bet.wager,
-                    "payout": 0,
-                })
+                buf.append(
+                    {
+                        "type": "straight",
+                        "user_id": bet.user_id,
+                        "status": "LOST",
+                        "market_label": market.label,
+                        "odds": bet.odds_at_placement,
+                        "wager": bet.wager,
+                        "payout": 0,
+                    }
+                )
         elif bet.parlay_id is not None:
             bet.status = (
                 "WON" if result is True else ("VOIDED" if result is None else "LOST")
@@ -1768,6 +1864,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     # theme_key is int for tribute/alliance/district/veterans/kill_leaders,
     # tuple[int,int] for cross_district and rival_alliances.
     from itertools import combinations as _combinations
+
     groupings: list[tuple[str, object, list[Market]]] = []
 
     # Tribute-centric: every market where this tribute appears on either side
@@ -1783,20 +1880,26 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
 
     # Alliance-centric: every market touching any member of this alliance
     for aid, member_ids in alliance_members.items():
-        mkts = _dedup_markets([
-            m for m in open_markets
-            if m.tribute_a_id in member_ids or m.tribute_b_id in member_ids
-        ])
+        mkts = _dedup_markets(
+            [
+                m
+                for m in open_markets
+                if m.tribute_a_id in member_ids or m.tribute_b_id in member_ids
+            ]
+        )
         if len(mkts) >= _MIN_PARLAY_LEGS:
             groupings.append(("alliance", aid, mkts))
 
     # District-centric: every market touching any tribute from this district
     for district in districts:
         dist_tids = {t.id for t in tributes_map.values() if t.district == district}
-        mkts = _dedup_markets([
-            m for m in open_markets
-            if m.tribute_a_id in dist_tids or m.tribute_b_id in dist_tids
-        ])
+        mkts = _dedup_markets(
+            [
+                m
+                for m in open_markets
+                if m.tribute_a_id in dist_tids or m.tribute_b_id in dist_tids
+            ]
+        )
         if len(mkts) >= _MIN_PARLAY_LEGS:
             groupings.append(("district", district, mkts))
 
@@ -1806,10 +1909,14 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     for d1, d2 in _combinations(district_list, 2):
         d1_tids = {t.id for t in tributes_map.values() if t.district == d1}
         d2_tids = {t.id for t in tributes_map.values() if t.district == d2}
-        mkts = _dedup_markets([
-            m for m in open_markets
-            if m.tribute_a_id in d1_tids | d2_tids or m.tribute_b_id in d1_tids | d2_tids
-        ])
+        mkts = _dedup_markets(
+            [
+                m
+                for m in open_markets
+                if m.tribute_a_id in d1_tids | d2_tids
+                or m.tribute_b_id in d1_tids | d2_tids
+            ]
+        )
         if len(mkts) >= _MIN_PARLAY_LEGS:
             groupings.append(("cross_district", (d1, d2), mkts))
 
@@ -1818,30 +1925,42 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     for a1, a2 in _combinations(aid_list, 2):
         a1_tids = alliance_members.get(a1, set())
         a2_tids = alliance_members.get(a2, set())
-        mkts = _dedup_markets([
-            m for m in open_markets
-            if m.tribute_a_id in a1_tids | a2_tids or m.tribute_b_id in a1_tids | a2_tids
-        ])
+        mkts = _dedup_markets(
+            [
+                m
+                for m in open_markets
+                if m.tribute_a_id in a1_tids | a2_tids
+                or m.tribute_b_id in a1_tids | a2_tids
+            ]
+        )
         if len(mkts) >= _MIN_PARLAY_LEGS:
             groupings.append(("rival_alliances", (a1, a2), mkts))
 
     # Veterans: tributes with prior-game experience — the returning-class narrative.
-    vet_tids = {t.id for t in tributes_map.values() if t.times_played and t.times_played >= 1}
+    vet_tids = {
+        t.id for t in tributes_map.values() if t.times_played and t.times_played >= 1
+    }
     if vet_tids:
-        mkts = _dedup_markets([
-            m for m in open_markets
-            if m.tribute_a_id in vet_tids or m.tribute_b_id in vet_tids
-        ])
+        mkts = _dedup_markets(
+            [
+                m
+                for m in open_markets
+                if m.tribute_a_id in vet_tids or m.tribute_b_id in vet_tids
+            ]
+        )
         if len(mkts) >= _MIN_PARLAY_LEGS:
             groupings.append(("veterans", 0, mkts))
 
     # Kill leaders: current-game tributes with 2+ kills — the bloodbath narrative.
     killer_tids = {t.id for t in tributes_map.values() if t.kills >= 2}
     if killer_tids:
-        mkts = _dedup_markets([
-            m for m in open_markets
-            if m.tribute_a_id in killer_tids or m.tribute_b_id in killer_tids
-        ])
+        mkts = _dedup_markets(
+            [
+                m
+                for m in open_markets
+                if m.tribute_a_id in killer_tids or m.tribute_b_id in killer_tids
+            ]
+        )
         if len(mkts) >= _MIN_PARLAY_LEGS:
             groupings.append(("kill_leaders", 0, mkts))
 
@@ -1853,28 +1972,34 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     n_each = count // 3
     rem = count % 3
     tier_allocations: list[tuple[str, int, int, int]] = [
-        ("SAFE",     n_each + (1 if rem >= 1 else 0), 2, 4),
+        ("SAFE", n_each + (1 if rem >= 1 else 0), 2, 4),
         ("BALANCED", n_each + (1 if rem >= 2 else 0), 4, 6),
-        ("LONGSHOT", n_each,                           6, 8),
+        ("LONGSHOT", n_each, 6, 8),
     ]
 
     # Hard cap: at most 1 tribute-centric parlay regardless of count.
     # Creative themes (cross_district, rival_alliances, veterans, kill_leaders)
     # always have priority; tribute is last resort only.
     import math as _math
+
     max_tribute = max(1, count // 5)
     tribute_count = 0
     used_tribute_keys: set[int] = set()
 
-    TierEntry = tuple[str, object, list[Market], str]  # theme_type, theme_key, legs, tier_name
+    TierEntry = tuple[
+        str, object, list[Market], str
+    ]  # theme_type, theme_key, legs, tier_name
     selected: list[TierEntry] = []
     used_leg_sets: set[frozenset[int]] = set()
 
     _CREATIVE_THEMES = {"cross_district", "rival_alliances", "veterans", "kill_leaders"}
     _THEME_PRIORITY = {
-        "cross_district": 0, "rival_alliances": 0,
-        "veterans": 1, "kill_leaders": 1,
-        "alliance": 2, "district": 2,
+        "cross_district": 0,
+        "rival_alliances": 0,
+        "veterans": 1,
+        "kill_leaders": 1,
+        "alliance": 2,
+        "district": 2,
         "tribute": 3,
     }
 
@@ -1890,7 +2015,9 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             for theme_type, theme_key, mkts in groupings:
                 if not _tribute_allowed(theme_type, theme_key):
                     continue
-                legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map)
+                legs = _pick_themed_legs(
+                    mkts, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map
+                )
                 if len(legs) >= min_l:
                     leg_key = frozenset(l.id for l in legs)
                     if leg_key not in used_leg_sets:
@@ -1902,8 +2029,11 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                     if not _tribute_allowed(theme_type, theme_key):
                         continue
                     legs = _pick_themed_legs(
-                        mkts, max_legs=_MAX_PARLAY_LEGS, min_legs=_MIN_PARLAY_LEGS,
-                        worst_odds_first=True, tribute_by_id=tributes_map,
+                        mkts,
+                        max_legs=_MAX_PARLAY_LEGS,
+                        min_legs=_MIN_PARLAY_LEGS,
+                        worst_odds_first=True,
+                        tribute_by_id=tributes_map,
                     )
                     if len(legs) >= _MIN_PARLAY_LEGS:
                         leg_key = frozenset(l.id for l in legs)
@@ -1918,7 +2048,9 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                         assert isinstance(theme_key, int)
                         if theme_key in used_tribute_keys:
                             continue
-                    legs = _pick_themed_legs(mkts, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map)
+                    legs = _pick_themed_legs(
+                        mkts, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map
+                    )
                     if len(legs) >= min_l:
                         leg_key = frozenset(l.id for l in legs)
                         if leg_key not in used_leg_sets:
@@ -1954,19 +2086,29 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             dr = district_records.get(t.district)
             parts: list[str] = []
             if t.sade_champion:
-                parts.append(f"{fname} has already worn the victor's crown — SADE experience the odds can't capture")
+                parts.append(
+                    f"{fname} has already worn the victor's crown — SADE experience the odds can't capture"
+                )
             if t.times_played and t.times_played >= 2:
                 parts.append(f"{fname} has {t.times_played} prior games of experience")
             elif t.times_played == 1:
-                parts.append(f"{fname} isn't new to this — one prior game under their belt")
+                parts.append(
+                    f"{fname} isn't new to this — one prior game under their belt"
+                )
             if t.training_score and t.training_score >= 9:
-                parts.append(f"a training score of {t.training_score} puts them in elite territory")
+                parts.append(
+                    f"a training score of {t.training_score} puts them in elite territory"
+                )
             elif t.training_score:
                 parts.append(f"training score: {t.training_score}")
             if t.kills and t.kills >= 3:
-                parts.append(f"{t.kills} kills already makes {fname} one of the most dangerous in the arena")
+                parts.append(
+                    f"{t.kills} kills already makes {fname} one of the most dangerous in the arena"
+                )
             elif t.kills:
-                parts.append(f"{t.kills} {'kill' if t.kills == 1 else 'kills'} this game")
+                parts.append(
+                    f"{t.kills} {'kill' if t.kills == 1 else 'kills'} this game"
+                )
             if t.alliance_id and t.alliance_id in alliance_names:
                 parts.append(f"running with {alliance_names[t.alliance_id]}")
             if dr and dr.wins:
@@ -1974,7 +2116,11 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                     f"District {t.district} has {dr.wins} all-time "
                     f"{'victory' if dr.wins == 1 else 'victories'}"
                 )
-            desc = ". ".join(parts).capitalize() + "." if parts else f"Everything riding on {fname}."
+            desc = (
+                ". ".join(parts).capitalize() + "."
+                if parts
+                else f"Everything riding on {fname}."
+            )
             if t.sade_champion:
                 name = f"{fname}: Double Victor"
             elif t.times_played and t.times_played >= 2:
@@ -1997,7 +2143,9 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             champs = [t for t in members if t.sade_champion]
             parts = [f"{names_str} march under the {aname} banner"]
             if champs:
-                parts.append(f"{champs[0].name.split()[0]} is a former SADE victor — the experience shows")
+                parts.append(
+                    f"{champs[0].name.split()[0]} is a former SADE victor — the experience shows"
+                )
             if combined_kills:
                 parts.append(
                     f"{combined_kills} combined {'kill' if combined_kills == 1 else 'kills'} between them"
@@ -2008,13 +2156,19 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                     f"with prior arena experience"
                 )
             # District record flavor for the alliance's home districts
-            alliance_districts = {tributes_map[tid].district for tid in member_tids if tid in tributes_map}
+            alliance_districts = {
+                tributes_map[tid].district for tid in member_tids if tid in tributes_map
+            }
             for d in sorted(alliance_districts)[:2]:
                 dr = district_records.get(d)
                 if dr and dr.wins:
-                    parts.append(f"District {d} has sent {dr.wins} victor{'s' if dr.wins != 1 else ''} before")
+                    parts.append(
+                        f"District {d} has sent {dr.wins} victor{'s' if dr.wins != 1 else ''} before"
+                    )
                 elif dr and dr.top8_finishes:
-                    parts.append(f"District {d} has {dr.top8_finishes} historical top-8 finishes")
+                    parts.append(
+                        f"District {d} has {dr.top8_finishes} historical top-8 finishes"
+                    )
             desc = ". ".join(parts).capitalize() + "."
             # Name varies by alliance strength
             top_score = max((t.training_score or 0) for t in members) if members else 0
@@ -2031,19 +2185,29 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             assert isinstance(theme_key, int)
             dr = district_records.get(theme_key)
             dist_tids = {t.id for t in tributes_map.values() if t.district == theme_key}
-            dist_tributes = [tributes_map[tid] for tid in dist_tids if tid in tributes_map]
+            dist_tributes = [
+                tributes_map[tid] for tid in dist_tids if tid in tributes_map
+            ]
             score_count = sum(1 for t in dist_tributes if t.training_score)
             score_sum = sum(t.training_score or 0 for t in dist_tributes)
             avg_score = score_sum // score_count if score_count else None
             parts = []
             if dr and dr.wins and dr.wins >= 3:
-                parts.append(f"District {theme_key} has {dr.wins} all-time victories — this is what a dynasty looks like")
+                parts.append(
+                    f"District {theme_key} has {dr.wins} all-time victories — this is what a dynasty looks like"
+                )
             elif dr and dr.wins:
-                parts.append(f"District {theme_key} has tasted victory before — {dr.wins} time{'s' if dr.wins != 1 else ''}")
+                parts.append(
+                    f"District {theme_key} has tasted victory before — {dr.wins} time{'s' if dr.wins != 1 else ''}"
+                )
             else:
-                parts.append(f"District {theme_key} is hungry and has everything to prove")
+                parts.append(
+                    f"District {theme_key} is hungry and has everything to prove"
+                )
             if dr and dr.top5_finishes:
-                parts.append(f"{dr.top5_finishes} top-5 finishes in the historical record")
+                parts.append(
+                    f"{dr.top5_finishes} top-5 finishes in the historical record"
+                )
             elif dr and dr.top8_finishes:
                 parts.append(f"{dr.top8_finishes} top-8 finishes historically")
             if dr and dr.total_kills:
@@ -2051,9 +2215,13 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             if avg_score:
                 parts.append(f"current tributes average a {avg_score} training score")
             if dr and dr.reputation and dr.reputation <= 2:
-                parts.append("one of Panem's most feared districts — the Capitol watches closely")
+                parts.append(
+                    "one of Panem's most feared districts — the Capitol watches closely"
+                )
             elif dr and dr.funding_level in ("rich", "well_funded"):
-                parts.append(f"Capitol funding gives District {theme_key} an edge in preparation")
+                parts.append(
+                    f"Capitol funding gives District {theme_key} an edge in preparation"
+                )
             desc = ". ".join(parts).capitalize() + "."
             if dr and dr.wins and dr.wins >= 3:
                 name = f"District {theme_key}: Dynasty"
@@ -2075,7 +2243,9 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             d2_tributes = [tributes_map[tid] for tid in d2_tids if tid in tributes_map]
             d1_kills = sum(t.kills for t in d1_tributes)
             d2_kills = sum(t.kills for t in d2_tributes)
-            parts = [f"Districts {d1} and {d2} collide — back them both and let the arena decide"]
+            parts = [
+                f"Districts {d1} and {d2} collide — back them both and let the arena decide"
+            ]
             if dr1 and dr1.wins and dr2 and dr2.wins:
                 parts.append(
                     f"District {d1} carries {dr1.wins} historical {'win' if dr1.wins == 1 else 'wins'}, "
@@ -2093,11 +2263,15 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                 )
             combined_kills = d1_kills + d2_kills
             if combined_kills:
-                parts.append(f"{combined_kills} kills between these two districts so far this game")
+                parts.append(
+                    f"{combined_kills} kills between these two districts so far this game"
+                )
             if dr1 and dr1.avg_placement and dr2 and dr2.avg_placement:
                 better_d = d1 if dr1.avg_placement <= dr2.avg_placement else d2
                 better_avg = min(dr1.avg_placement, dr2.avg_placement)
-                parts.append(f"District {better_d} averages a placement of {better_avg} historically")
+                parts.append(
+                    f"District {better_d} averages a placement of {better_avg} historically"
+                )
             desc = ". ".join(parts).capitalize() + "."
             d1_wins = dr1.wins or 0 if dr1 else 0
             d2_wins = dr2.wins or 0 if dr2 else 0
@@ -2113,37 +2287,60 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             a1, a2 = theme_key
             a1_name = alliance_names.get(a1, f"Alliance {a1}")
             a2_name = alliance_names.get(a2, f"Alliance {a2}")
-            a1_members = [tributes_map[tid] for tid in alliance_members.get(a1, set()) if tid in tributes_map]
-            a2_members = [tributes_map[tid] for tid in alliance_members.get(a2, set()) if tid in tributes_map]
+            a1_members = [
+                tributes_map[tid]
+                for tid in alliance_members.get(a1, set())
+                if tid in tributes_map
+            ]
+            a2_members = [
+                tributes_map[tid]
+                for tid in alliance_members.get(a2, set())
+                if tid in tributes_map
+            ]
             a1_kills = sum(t.kills for t in a1_members)
             a2_kills = sum(t.kills for t in a2_members)
             a1_vets = [t for t in a1_members if t.times_played]
             a2_vets = [t for t in a2_members if t.times_played]
-            a1_top_score = max((t.training_score or 0) for t in a1_members) if a1_members else 0
-            a2_top_score = max((t.training_score or 0) for t in a2_members) if a2_members else 0
-            parts = [f"{a1_name} and {a2_name} are the last two alliances standing — these bets span them both"]
+            a1_top_score = (
+                max((t.training_score or 0) for t in a1_members) if a1_members else 0
+            )
+            a2_top_score = (
+                max((t.training_score or 0) for t in a2_members) if a2_members else 0
+            )
+            parts = [
+                f"{a1_name} and {a2_name} are the last two alliances standing — these bets span them both"
+            ]
             if a1_kills or a2_kills:
                 stronger = a1_name if a1_kills >= a2_kills else a2_name
                 parts.append(f"{stronger} leads the body count so far")
             if a1_vets or a2_vets:
                 total_vets = len(a1_vets) + len(a2_vets)
-                parts.append(f"{total_vets} veteran{'s' if total_vets != 1 else ''} across both alliances bring prior-game experience")
+                parts.append(
+                    f"{total_vets} veteran{'s' if total_vets != 1 else ''} across both alliances bring prior-game experience"
+                )
             if a1_top_score and a2_top_score:
                 elite = a1_name if a1_top_score >= a2_top_score else a2_name
                 parts.append(f"{elite} fields the higher-trained tributes")
             # District record flavor
             all_member_districts = {
                 tributes_map[tid].district
-                for tids in [alliance_members.get(a1, set()), alliance_members.get(a2, set())]
-                for tid in tids if tid in tributes_map
+                for tids in [
+                    alliance_members.get(a1, set()),
+                    alliance_members.get(a2, set()),
+                ]
+                for tid in tids
+                if tid in tributes_map
             }
             win_districts = [
-                d for d in sorted(all_member_districts)
+                d
+                for d in sorted(all_member_districts)
                 if district_records.get(d) and district_records[d].wins
             ]
             if win_districts:
                 d = win_districts[0]
-                parts.append(f"District {d} has {district_records[d].wins} all-time {'victory' if district_records[d].wins == 1 else 'victories'} backing this fight")
+                parts.append(
+                    f"District {d} has {district_records[d].wins} all-time {'victory' if district_records[d].wins == 1 else 'victories'} backing this fight"
+                )
             desc = ". ".join(parts).capitalize() + "."
             combined_kills = a1_kills + a2_kills
             if combined_kills >= 4:
@@ -2155,24 +2352,41 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
 
         elif theme_type == "veterans":
             vet_list = sorted(
-                [t for t in tributes_map.values() if t.times_played and t.times_played >= 1],
+                [
+                    t
+                    for t in tributes_map.values()
+                    if t.times_played and t.times_played >= 1
+                ],
                 key=lambda t: (-(t.times_played or 0), -(t.training_score or 0)),
             )
             vet_names = " & ".join(t.name.split()[0] for t in vet_list[:3])
             combined_kills = sum(t.kills for t in vet_list)
             champs = [t for t in vet_list if t.sade_champion]
             best_placement = min(
-                (t.highest_placement for t in vet_list if t.highest_placement), default=None
+                (t.highest_placement for t in vet_list if t.highest_placement),
+                default=None,
             )
-            parts = [f"{vet_names} have been here before — arena experience money can't buy"]
+            parts = [
+                f"{vet_names} have been here before — arena experience money can't buy"
+            ]
             if champs:
-                parts.append(f"{champs[0].name.split()[0]} is a former victor walking in with a target on their back")
+                parts.append(
+                    f"{champs[0].name.split()[0]} is a former victor walking in with a target on their back"
+                )
             if best_placement:
-                parts.append(f"best prior finish among the group: {best_placement}{_ordinal(best_placement)} place")
+                parts.append(
+                    f"best prior finish among the group: {best_placement}{_ordinal(best_placement)} place"
+                )
             if combined_kills:
-                parts.append(f"{combined_kills} kills already this game across the returning class")
+                parts.append(
+                    f"{combined_kills} kills already this game across the returning class"
+                )
             # Alliance context for vets
-            vet_alliances = {alliance_names[t.alliance_id] for t in vet_list if t.alliance_id and t.alliance_id in alliance_names}
+            vet_alliances = {
+                alliance_names[t.alliance_id]
+                for t in vet_list
+                if t.alliance_id and t.alliance_id in alliance_names
+            }
             if vet_alliances:
                 parts.append(f"running with: {', '.join(sorted(vet_alliances))}")
             desc = ". ".join(parts).capitalize() + "."
@@ -2193,7 +2407,9 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             )
             killer_names = " & ".join(t.name.split()[0] for t in killers[:3])
             total_kills = sum(t.kills for t in killers)
-            parts = [f"{killer_names} have already drawn blood — these are the arena's most dangerous tributes"]
+            parts = [
+                f"{killer_names} have already drawn blood — these are the arena's most dangerous tributes"
+            ]
             top_killer = killers[0] if killers else None
             if top_killer:
                 dr = district_records.get(top_killer.district)
@@ -2202,7 +2418,8 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                     + (
                         f", representing District {top_killer.district} "
                         f"({dr.total_kills or 0} all-time kills from that district)"
-                        if dr and dr.total_kills else ""
+                        if dr and dr.total_kills
+                        else ""
                     )
                 )
             if len(killers) >= 2:
@@ -2210,7 +2427,8 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
             # Alliance context
             killer_alliances = {
                 alliance_names[t.alliance_id]
-                for t in killers if t.alliance_id and t.alliance_id in alliance_names
+                for t in killers
+                if t.alliance_id and t.alliance_id in alliance_names
             }
             if killer_alliances:
                 parts.append(f"hunting under: {', '.join(sorted(killer_alliances))}")
@@ -2223,14 +2441,19 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                 name = "The Killers' Column"
 
         tpl = ParlayTemplate(
-            name=name, description=desc, source="AUTO",
-            difficulty=difficulty, phase_id=phase_id,
+            name=name,
+            description=desc,
+            source="AUTO",
+            difficulty=difficulty,
+            phase_id=phase_id,
             active=True,
         )
         session.add(tpl)
         await session.flush()
         for i, m in enumerate(legs):
-            session.add(ParlayTemplateLeg(template_id=tpl.id, market_id=m.id, sort_order=i))
+            session.add(
+                ParlayTemplateLeg(template_id=tpl.id, market_id=m.id, sort_order=i)
+            )
         created += 1
 
     return created
@@ -2300,40 +2523,61 @@ _ANGLE_THEMES: dict[str, dict] = {
     "BLOODBATH": {
         "angle": "surviving the opening bloodbath and the early-arena chaos",
         "types": {
-            "BLOODBATH_SURVIVOR", "DISTRICT_BOTH_BLOODBATH",
-            "FIRST_BLOOD", "BLOODBATH_KILLS_OU",
+            "BLOODBATH_SURVIVOR",
+            "DISTRICT_BOTH_BLOODBATH",
+            "FIRST_BLOOD",
+            "BLOODBATH_KILLS_OU",
         },
     },
     "FINALS": {
         "angle": "late-game endurance, grinding into the final 8 and final 5",
         "types": {
-            "MAKES_FINAL_8", "MAKES_FINAL_5",
-            "DISTRICT_BOTH_FINAL_8", "DISTRICT_ONE_FINAL_8",
-            "DISTRICT_BOTH_FINAL_5", "DISTRICT_ONE_FINAL_5",
-            "ALLIANCE_ALL_FINAL_8", "ALLIANCE_ONE_FINAL_8",
-            "ALLIANCE_ALL_FINAL_5", "ALLIANCE_ONE_FINAL_5",
+            "MAKES_FINAL_8",
+            "MAKES_FINAL_5",
+            "DISTRICT_BOTH_FINAL_8",
+            "DISTRICT_ONE_FINAL_8",
+            "DISTRICT_BOTH_FINAL_5",
+            "DISTRICT_ONE_FINAL_5",
+            "ALLIANCE_ALL_FINAL_8",
+            "ALLIANCE_ONE_FINAL_8",
+            "ALLIANCE_ALL_FINAL_5",
+            "ALLIANCE_ONE_FINAL_5",
         },
     },
     "KILLS": {
         "angle": "raw aggression and stacking up kills",
         "types": {
-            "TRIBUTE_KILLS", "KILLS_OU", "KILL_EVENT", "DISTRICT_KILLS_OU",
-            "DISTRICT_PARTNER_KILL", "ALLIANCE_MOST_KILLS", "ALLIANCE_KILLS_OU",
+            "TRIBUTE_KILLS",
+            "KILLS_OU",
+            "KILL_EVENT",
+            "DISTRICT_KILLS_OU",
+            "DISTRICT_PARTNER_KILL",
+            "ALLIANCE_MOST_KILLS",
+            "ALLIANCE_KILLS_OU",
         },
     },
     "TRAINING": {
         "angle": "training-score pedigree and Career-style polish",
         "types": {
-            "HIGHEST_TRAINING_SCORE", "TRAINING_SCORE_OU",
-            "DISTRICT_HIGHEST_SCORE", "COMBINED_DISTRICT_SCORE",
+            "HIGHEST_TRAINING_SCORE",
+            "TRAINING_SCORE_OU",
+            "DISTRICT_HIGHEST_SCORE",
+            "COMBINED_DISTRICT_SCORE",
         },
     },
     "VICTORY": {
         "angle": "a deep run at the crown and a high placement ceiling",
         "types": {
-            "TRIBUTE_WINS", "TRIBUTE_TOP_N", "TRIBUTE_RUNNER_UP", "TRIBUTE_PLACEMENT",
-            "PLACEMENT_OU", "DISTRICT_VICTOR", "ALLIANCE_VICTOR", "ALLIANCE_RUNNER_UP",
-            "PARTNER_PLACE_HIGHER", "PARTNER_SCORE_HIGHER",
+            "TRIBUTE_WINS",
+            "TRIBUTE_TOP_N",
+            "TRIBUTE_RUNNER_UP",
+            "TRIBUTE_PLACEMENT",
+            "PLACEMENT_OU",
+            "DISTRICT_VICTOR",
+            "ALLIANCE_VICTOR",
+            "ALLIANCE_RUNNER_UP",
+            "PARTNER_PLACE_HIGHER",
+            "PARTNER_SCORE_HIGHER",
         },
     },
 }
@@ -2374,7 +2618,8 @@ def _assign_theme(markets, used_themes: set[str]):
             buckets.setdefault(theme, []).append(m)
 
     candidates = [
-        theme for theme, ms in buckets.items()
+        theme
+        for theme, ms in buckets.items()
         if len(ms) >= 3 and len({m.type for m in ms}) >= 2
     ]
     if candidates:
@@ -2390,29 +2635,60 @@ def _assign_theme(markets, used_themes: set[str]):
 
     return random.choice(_FREE_ANGLES), markets
 
+
 # Market types whose outcome is unambiguously GOOD for the subject tribute /
 # district / alliance (they advance, survive, win, out-perform).
 _POS_MARKET_TYPES = {
-    "TRIBUTE_WINS", "TRIBUTE_TOP_N", "TRIBUTE_RUNNER_UP", "HIGHEST_TRAINING_SCORE",
-    "TRIBUTE_KILLS", "KILL_EVENT", "FIRST_BLOOD", "BLOODBATH_SURVIVOR",
-    "MAKES_FINAL_8", "MAKES_FINAL_5", "PARTNER_SCORE_HIGHER", "PARTNER_PLACE_HIGHER",
-    "DISTRICT_VICTOR", "DISTRICT_HIGHEST_SCORE", "DISTRICT_BOTH_BLOODBATH",
-    "DISTRICT_BOTH_FINAL_8", "DISTRICT_ONE_FINAL_8", "DISTRICT_BOTH_FINAL_5",
-    "DISTRICT_ONE_FINAL_5", "ALLIANCE_VICTOR",
-    "ALLIANCE_ALL_FINAL_8", "ALLIANCE_ONE_FINAL_8", "ALLIANCE_ALL_FINAL_5",
-    "ALLIANCE_ONE_FINAL_5", "ALLIANCE_MOST_KILLS", "ALLIANCE_RUNNER_UP",
+    "TRIBUTE_WINS",
+    "TRIBUTE_TOP_N",
+    "TRIBUTE_RUNNER_UP",
+    "HIGHEST_TRAINING_SCORE",
+    "TRIBUTE_KILLS",
+    "KILL_EVENT",
+    "FIRST_BLOOD",
+    "BLOODBATH_SURVIVOR",
+    "MAKES_FINAL_8",
+    "MAKES_FINAL_5",
+    "PARTNER_SCORE_HIGHER",
+    "PARTNER_PLACE_HIGHER",
+    "DISTRICT_VICTOR",
+    "DISTRICT_HIGHEST_SCORE",
+    "DISTRICT_BOTH_BLOODBATH",
+    "DISTRICT_BOTH_FINAL_8",
+    "DISTRICT_ONE_FINAL_8",
+    "DISTRICT_BOTH_FINAL_5",
+    "DISTRICT_ONE_FINAL_5",
+    "ALLIANCE_VICTOR",
+    "ALLIANCE_ALL_FINAL_8",
+    "ALLIANCE_ONE_FINAL_8",
+    "ALLIANCE_ALL_FINAL_5",
+    "ALLIANCE_ONE_FINAL_5",
+    "ALLIANCE_MOST_KILLS",
+    "ALLIANCE_RUNNER_UP",
 }
 # Market types whose outcome is unambiguously BAD for the subject (they die,
 # are eliminated, get wiped, under-perform).
 _NEG_MARKET_TYPES = {
-    "FIRST_TRIBUTE_TO_DIE", "LOWEST_TRAINING_SCORE", "DEATH_CAUSE",
-    "TRIBUTE_KILLED_BLOODBATH", "FIRST_IN_ALLIANCE_DEATH", "MISSES_FINAL_8",
-    "MISSES_FINAL_5", "PARTNER_SCORE_LOWER", "PARTNER_PLACE_LOWER",
-    "FIRST_DISTRICT_WIPE", "DISTRICT_WIPED_BLOODBATH",
+    "FIRST_TRIBUTE_TO_DIE",
+    "LOWEST_TRAINING_SCORE",
+    "DEATH_CAUSE",
+    "TRIBUTE_KILLED_BLOODBATH",
+    "FIRST_IN_ALLIANCE_DEATH",
+    "MISSES_FINAL_8",
+    "MISSES_FINAL_5",
+    "PARTNER_SCORE_LOWER",
+    "PARTNER_PLACE_LOWER",
+    "FIRST_DISTRICT_WIPE",
+    "DISTRICT_WIPED_BLOODBATH",
     "FIRST_ALLIANCE_WIPED",
 }
 # Over/Under types where OVER is the "doing well" side (more kills, higher score).
-_OU_OVER_IS_GOOD = {"KILLS_OU", "DISTRICT_KILLS_OU", "ALLIANCE_KILLS_OU", "TRAINING_SCORE_OU"}
+_OU_OVER_IS_GOOD = {
+    "KILLS_OU",
+    "DISTRICT_KILLS_OU",
+    "ALLIANCE_KILLS_OU",
+    "TRAINING_SCORE_OU",
+}
 
 
 def _market_polarity(m, subject_district, tribute_by_id) -> str:
@@ -2432,18 +2708,36 @@ def _market_polarity(m, subject_district, tribute_by_id) -> str:
     elif t in _NEG_MARKET_TYPES:
         base = "NEG"
     elif t in _OU_OVER_IS_GOOD:
-        base = "POS" if m.ou_side == "OVER" else "NEG" if m.ou_side == "UNDER" else "NEUTRAL"
+        base = (
+            "POS"
+            if m.ou_side == "OVER"
+            else "NEG" if m.ou_side == "UNDER" else "NEUTRAL"
+        )
     elif t == "PLACEMENT_OU":  # lower placement number is better
-        base = "POS" if m.ou_side == "UNDER" else "NEG" if m.ou_side == "OVER" else "NEUTRAL"
+        base = (
+            "POS"
+            if m.ou_side == "UNDER"
+            else "NEG" if m.ou_side == "OVER" else "NEUTRAL"
+        )
     elif t == "TRIBUTE_PLACEMENT":  # exact finish; top-8 is good
         base = "POS" if (m.placement_num or 99) <= 8 else "NEG"
     else:
         base = "NEUTRAL"
 
-    if base in ("POS", "NEG") and subject_district is not None and m.tribute_a_id and m.tribute_b_id:
+    if (
+        base in ("POS", "NEG")
+        and subject_district is not None
+        and m.tribute_a_id
+        and m.tribute_b_id
+    ):
         ta = tribute_by_id.get(m.tribute_a_id)
         tb = tribute_by_id.get(m.tribute_b_id)
-        if ta and tb and tb.district == subject_district and ta.district != subject_district:
+        if (
+            ta
+            and tb
+            and tb.district == subject_district
+            and ta.district != subject_district
+        ):
             base = "NEG" if base == "POS" else "POS"
     return base
 
@@ -2534,8 +2828,11 @@ def _drop_redundant_aggregates(leg_ids, market_by_id, tribute_by_id):
         event = _AGGREGATE_EVENT.get(m.type)
         if event is not None and m.placement_num is not None:
             covered = (
-                (m.type.startswith("DISTRICT_") and (event, m.placement_num) in indiv_district)
-                or (m.type.startswith("ALLIANCE_") and (event, m.placement_num) in indiv_alliance)
+                m.type.startswith("DISTRICT_")
+                and (event, m.placement_num) in indiv_district
+            ) or (
+                m.type.startswith("ALLIANCE_")
+                and (event, m.placement_num) in indiv_alliance
             )
             if covered:
                 log.debug("Dropping redundant aggregate leg %d (%s)", mid, m.type)
@@ -2676,7 +2973,11 @@ def _drop_duplicate_one_of_field_legs(leg_ids, market_by_id):
     kept: list[int] = []
     for mid in leg_ids:
         m = market_by_id.get(mid)
-        if m is not None and m.type in _ONE_OF_FIELD_TYPES and keeper.get(m.type) != mid:
+        if (
+            m is not None
+            and m.type in _ONE_OF_FIELD_TYPES
+            and keeper.get(m.type) != mid
+        ):
             log.debug("Dropping duplicate one-of-field leg %d (%s)", mid, m.type)
             continue
         kept.append(mid)
@@ -2721,13 +3022,17 @@ def _drop_duplicate_district_score_legs(leg_ids, market_by_id):
         ):
             pair = frozenset((m.tribute_a_id, m.tribute_b_id))
             if keeper.get(pair) != mid:
-                log.debug("Dropping duplicate district-score leg %d (pair %s)", mid, pair)
+                log.debug(
+                    "Dropping duplicate district-score leg %d (pair %s)", mid, pair
+                )
                 continue
         kept.append(mid)
     return kept
 
 
-_DISTRICT_SCORE_FLOOR = 2  # lowest possible combined training score; see COMBINED_DISTRICT_SCORE creation
+_DISTRICT_SCORE_FLOOR = (
+    2  # lowest possible combined training score; see COMBINED_DISTRICT_SCORE creation
+)
 
 
 def _drop_district_score_floor_vs_highest_legs(leg_ids, market_by_id, tribute_by_id):
@@ -2736,6 +3041,7 @@ def _drop_district_score_floor_vs_highest_legs(leg_ids, market_by_id, tribute_by
     bet are both in the leg set — the lowest possible total can't also be the
     highest, so keep whichever leg has the better odds and drop the other.
     """
+
     def _district_of(m):
         if m.tribute_a_id is None:
             return None
@@ -2748,7 +3054,10 @@ def _drop_district_score_floor_vs_highest_legs(leg_ids, market_by_id, tribute_by
         m = market_by_id.get(mid)
         if m is None:
             continue
-        if m.type == "COMBINED_DISTRICT_SCORE" and m.placement_num == _DISTRICT_SCORE_FLOOR:
+        if (
+            m.type == "COMBINED_DISTRICT_SCORE"
+            and m.placement_num == _DISTRICT_SCORE_FLOOR
+        ):
             d = _district_of(m)
             if d is not None:
                 floor_by_district[d] = mid
@@ -2761,11 +3070,14 @@ def _drop_district_score_floor_vs_highest_legs(leg_ids, market_by_id, tribute_by
         if highest_mid is None:
             continue
         loser = (
-            floor_mid if market_by_id[floor_mid].odds > market_by_id[highest_mid].odds
+            floor_mid
+            if market_by_id[floor_mid].odds > market_by_id[highest_mid].odds
             else highest_mid
         )
         log.debug(
-            "Dropping district-score-floor/highest conflict leg %d (district %d)", loser, d
+            "Dropping district-score-floor/highest conflict leg %d (district %d)",
+            loser,
+            d,
         )
         drop.add(loser)
 
@@ -2818,14 +3130,26 @@ def _drop_redundant_kill_legs(leg_ids, market_by_id, tribute_by_id):
         if m.type == "KILLS_OU" and m.ou_side == "OVER" and m.tribute_a_id:
             of = _kill_over_floor(m)
             if of is not None and len(victims.get(m.tribute_a_id, ())) >= of:
-                log.debug("Dropping redundant kills-over leg %d (guaranteed by victims)", mid)
+                log.debug(
+                    "Dropping redundant kills-over leg %d (guaranteed by victims)", mid
+                )
                 drop.add(mid)
-        elif m.ou_side == "OVER" and m.ou_line is not None and m.placement_num is not None:
+        elif (
+            m.ou_side == "OVER"
+            and m.ou_line is not None
+            and m.placement_num is not None
+        ):
             need = int(math.floor(m.ou_line)) + 1
-            if m.type == "DISTRICT_KILLS_OU" and district_sum.get(m.placement_num, 0) >= need:
+            if (
+                m.type == "DISTRICT_KILLS_OU"
+                and district_sum.get(m.placement_num, 0) >= need
+            ):
                 log.debug("Dropping redundant district kills-over leg %d", mid)
                 drop.add(mid)
-            elif m.type == "ALLIANCE_KILLS_OU" and alliance_sum.get(m.placement_num, 0) >= need:
+            elif (
+                m.type == "ALLIANCE_KILLS_OU"
+                and alliance_sum.get(m.placement_num, 0) >= need
+            ):
                 log.debug("Dropping redundant alliance kills-over leg %d", mid)
                 drop.add(mid)
 
@@ -2842,7 +3166,9 @@ def _join_names(names: list[str]) -> str:
     return ", ".join(names[:-1]) + f" & {names[-1]}"
 
 
-def _ensure_title_names_all_tributes(name, leg_ids, market_by_id, tribute_by_id, subject_label):
+def _ensure_title_names_all_tributes(
+    name, leg_ids, market_by_id, tribute_by_id, subject_label
+):
     """Rewrite a title that headlines only one of several tributes it bets on.
 
     When a district-scoped parlay's legs back two or more of that district's
@@ -2901,7 +3227,7 @@ def _ensure_title_names_all_tributes(name, leg_ids, market_by_id, tribute_by_id,
     for tok in name_tokens(mentioned[0]):
         hit = re.search(rf"\b{re.escape(tok)}\b", name, re.IGNORECASE)
         if hit:
-            return (name[: hit.start()] + joined + name[hit.end():]).strip()
+            return (name[: hit.start()] + joined + name[hit.end() :]).strip()
     return name
 
 
@@ -2945,9 +3271,14 @@ async def _try_generate_ai_parlays(
         from bot import config as _cfg
         from bot.lemonade import LemonadeClient, generate_ai_parlays_for_subjects
 
-        client = LemonadeClient(base_url=_cfg.LEMONADE_BASE_URL, model=_cfg.LEMONADE_MODEL)
+        client = LemonadeClient(
+            base_url=_cfg.LEMONADE_BASE_URL, model=_cfg.LEMONADE_MODEL
+        )
         if not await client.health():
-            log.debug("Lemonade not reachable at %s; skipping AI parlays", _cfg.LEMONADE_BASE_URL)
+            log.debug(
+                "Lemonade not reachable at %s; skipping AI parlays",
+                _cfg.LEMONADE_BASE_URL,
+            )
             return 0
 
         lore_text: str = json.loads(lore_raw)
@@ -2983,7 +3314,8 @@ async def _try_generate_ai_parlays(
         for (kind, ident), ms in bundles.items():
             subj_district = ident if kind == "D" else None
             kept = [
-                m for m in ms
+                m
+                for m in ms
                 if _market_polarity(m, subj_district, tribute_by_id) != "NEG"
             ]
             if len(kept) >= 3:
@@ -3012,28 +3344,37 @@ async def _try_generate_ai_parlays(
             if kind == "D":
                 label = f"District {ident}"
                 subj_tributes = alive_by_district.get(ident, [])
-                recs = [record_by_district[ident]] if ident in record_by_district else []
+                recs = (
+                    [record_by_district[ident]] if ident in record_by_district else []
+                )
             else:  # alliance
                 a = alliance_by_id.get(ident)
                 label = f"Alliance: {a.name}" if a else f"Alliance {ident}"
                 subj_tributes = [
-                    t for t in all_tributes
+                    t
+                    for t in all_tributes
                     if t.alliance_id == ident and t.status == "ALIVE"
                 ]
                 member_districts = {t.district for t in subj_tributes}
                 recs = [
                     record_by_district[d]
-                    for d in sorted(member_districts) if d in record_by_district
+                    for d in sorted(member_districts)
+                    if d in record_by_district
                 ]
-            subjects.append({
-                "subject_label": label,
-                "lore": lore_text,
-                "markets": [{"id": m.id, "label": m.label, "odds": m.odds} for m in shown_markets],
-                "tributes": [_tribute_payload(t) for t in subj_tributes],
-                "district_records": [_district_record_payload(dr) for dr in recs],
-                "target_tier": tiers[idx % len(tiers)],
-                "angle": angle_text,
-            })
+            subjects.append(
+                {
+                    "subject_label": label,
+                    "lore": lore_text,
+                    "markets": [
+                        {"id": m.id, "label": m.label, "odds": m.odds}
+                        for m in shown_markets
+                    ],
+                    "tributes": [_tribute_payload(t) for t in subj_tributes],
+                    "district_records": [_district_record_payload(dr) for dr in recs],
+                    "target_tier": tiers[idx % len(tiers)],
+                    "angle": angle_text,
+                }
+            )
 
         if not subjects:
             log.debug("No subjects with >= 3 open markets; skipping AI parlays")
@@ -3076,7 +3417,9 @@ async def _try_generate_ai_parlays(
             leg_ids = _drop_nested_placement_legs(leg_ids, market_by_id)
             leg_ids = _drop_duplicate_one_of_field_legs(leg_ids, market_by_id)
             leg_ids = _drop_duplicate_district_score_legs(leg_ids, market_by_id)
-            leg_ids = _drop_district_score_floor_vs_highest_legs(leg_ids, market_by_id, tribute_by_id)
+            leg_ids = _drop_district_score_floor_vs_highest_legs(
+                leg_ids, market_by_id, tribute_by_id
+            )
             leg_ids = _drop_redundant_kill_legs(leg_ids, market_by_id, tribute_by_id)
             if len(leg_ids) < 3:
                 log.warning(
@@ -3087,16 +3430,25 @@ async def _try_generate_ai_parlays(
             # Rewrite the title if it headlines only one of several tributes the
             # (now-final) legs actually back.
             final_name = _ensure_title_names_all_tributes(
-                sug["name"], leg_ids, market_by_id, tribute_by_id,
+                sug["name"],
+                leg_ids,
+                market_by_id,
+                tribute_by_id,
                 sug.get("subject_label", ""),
             )
             # Tier is assigned in code from true combined odds — the model is
             # never trusted to do the odds arithmetic.
             leg_odds = [market_odds[mid] for mid in leg_ids if mid in market_odds]
-            tier = classify_parlay_tier(combined_american(leg_odds)) if leg_odds else "BALANCED"
+            tier = (
+                classify_parlay_tier(combined_american(leg_odds))
+                if leg_odds
+                else "BALANCED"
+            )
             tpl = ParlayTemplate(
                 name=final_name,
-                description=sug["description"] if _AI_PARLAY_DESCRIPTIONS_ENABLED else "",
+                description=(
+                    sug["description"] if _AI_PARLAY_DESCRIPTIONS_ENABLED else ""
+                ),
                 source="AUTO",
                 difficulty=tier,
                 phase_id=phase_id,
@@ -3105,9 +3457,13 @@ async def _try_generate_ai_parlays(
             session.add(tpl)
             await session.flush()
             for order, mid in enumerate(leg_ids):
-                session.add(ParlayTemplateLeg(
-                    template_id=tpl.id, market_id=mid, sort_order=order,
-                ))
+                session.add(
+                    ParlayTemplateLeg(
+                        template_id=tpl.id,
+                        market_id=mid,
+                        sort_order=order,
+                    )
+                )
             created += 1
             if created >= count:
                 break
@@ -3116,7 +3472,9 @@ async def _try_generate_ai_parlays(
         return created
 
     except Exception:
-        log.exception("AI parlay generation failed; caller may fall back to algorithmic")
+        log.exception(
+            "AI parlay generation failed; caller may fall back to algorithmic"
+        )
         return 0
 
 
@@ -3142,13 +3500,15 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
                 )
             )
             tailer = _tur.scalar_one_or_none()
-            notifs.append({
-                "type": "tail_notify",
-                "user_id": parlay.tailed_from_user_id,
-                "status": owner_notif["status"],
-                "tailer_username": tailer.username if tailer else "A member",
-                "parlay_id": parlay.tailed_from_parlay_id,
-            })
+            notifs.append(
+                {
+                    "type": "tail_notify",
+                    "user_id": parlay.tailed_from_user_id,
+                    "status": owner_notif["status"],
+                    "tailer_username": tailer.username if tailer else "A member",
+                    "parlay_id": parlay.tailed_from_parlay_id,
+                }
+            )
             _pour = await session.execute(
                 select(User).where(
                     User.guild_id == parlay.guild_id,
@@ -3156,7 +3516,9 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
                 )
             )
             poster = _pour.scalar_one_or_none()
-            owner_notif["original_poster_username"] = poster.username if poster else "a member"
+            owner_notif["original_poster_username"] = (
+                poster.username if poster else "a member"
+            )
         return notifs
 
     leg_result = await session.execute(select(Bet).where(Bet.parlay_id == parlay_id))
@@ -3167,19 +3529,23 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
         leg_data = []
         for leg in legs:
             mkt = await session.get(Market, leg.market_id)
-            leg_data.append({
-                "market_label": mkt.label if mkt else f"Market #{leg.market_id}",
-                "odds": leg.odds_at_placement,
-                "status": leg.status,
-            })
-        return await _finalize({
-            "type": "parlay",
-            "user_id": parlay.user_id,
-            "status": "LOST",
-            "wager": parlay.total_wager,
-            "payout": 0,
-            "legs": leg_data,
-        })
+            leg_data.append(
+                {
+                    "market_label": mkt.label if mkt else f"Market #{leg.market_id}",
+                    "odds": leg.odds_at_placement,
+                    "status": leg.status,
+                }
+            )
+        return await _finalize(
+            {
+                "type": "parlay",
+                "user_id": parlay.user_id,
+                "status": "LOST",
+                "wager": parlay.total_wager,
+                "payout": 0,
+                "legs": leg_data,
+            }
+        )
     if any(s == "PENDING" for s in statuses):
         active_legs = [l for l in legs if l.status != "VOIDED"]
         if len(active_legs) < len(legs):
@@ -3191,7 +3557,9 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
     if all(l.status == "WON" for l in active_legs):
         parlay.status = "WON"
         _pur = await session.execute(
-            select(User).where(User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id)
+            select(User).where(
+                User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id
+            )
         )
         user = _pur.scalar_one_or_none()
         if user:
@@ -3200,23 +3568,29 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
         leg_data = []
         for leg in legs:
             mkt = await session.get(Market, leg.market_id)
-            leg_data.append({
-                "market_label": mkt.label if mkt else f"Market #{leg.market_id}",
-                "odds": leg.odds_at_placement,
-                "status": leg.status,
-            })
-        return await _finalize({
-            "type": "parlay",
-            "user_id": parlay.user_id,
-            "status": "WON",
-            "wager": parlay.total_wager,
-            "payout": parlay.total_payout,
-            "legs": leg_data,
-        })
+            leg_data.append(
+                {
+                    "market_label": mkt.label if mkt else f"Market #{leg.market_id}",
+                    "odds": leg.odds_at_placement,
+                    "status": leg.status,
+                }
+            )
+        return await _finalize(
+            {
+                "type": "parlay",
+                "user_id": parlay.user_id,
+                "status": "WON",
+                "wager": parlay.total_wager,
+                "payout": parlay.total_payout,
+                "legs": leg_data,
+            }
+        )
     elif all(l.status == "VOIDED" for l in legs):
         parlay.status = "WON"
         _pur = await session.execute(
-            select(User).where(User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id)
+            select(User).where(
+                User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id
+            )
         )
         user = _pur.scalar_one_or_none()
         if user:
@@ -3224,19 +3598,23 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
         leg_data = []
         for leg in legs:
             mkt = await session.get(Market, leg.market_id)
-            leg_data.append({
-                "market_label": mkt.label if mkt else f"Market #{leg.market_id}",
-                "odds": leg.odds_at_placement,
-                "status": leg.status,
-            })
-        return await _finalize({
-            "type": "parlay",
-            "user_id": parlay.user_id,
-            "status": "VOIDED",
-            "wager": parlay.total_wager,
-            "payout": parlay.total_wager,
-            "legs": leg_data,
-        })
+            leg_data.append(
+                {
+                    "market_label": mkt.label if mkt else f"Market #{leg.market_id}",
+                    "odds": leg.odds_at_placement,
+                    "status": leg.status,
+                }
+            )
+        return await _finalize(
+            {
+                "type": "parlay",
+                "user_id": parlay.user_id,
+                "status": "VOIDED",
+                "wager": parlay.total_wager,
+                "payout": parlay.total_wager,
+                "legs": leg_data,
+            }
+        )
     return []
 
 
@@ -3285,7 +3663,9 @@ async def _unresolve_market(
             bet.status = "PENDING"
         elif bet.status == "WON":
             _ur = await session.execute(
-                select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id)
+                select(User).where(
+                    User.guild_id == bet.guild_id, User.discord_id == bet.user_id
+                )
             )
             user = _ur.scalar_one_or_none()
             if user:
@@ -3297,7 +3677,9 @@ async def _unresolve_market(
             bet.status = "PENDING"
         elif bet.status == "VOIDED":
             _ur = await session.execute(
-                select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id)
+                select(User).where(
+                    User.guild_id == bet.guild_id, User.discord_id == bet.user_id
+                )
             )
             user = _ur.scalar_one_or_none()
             if user:
@@ -3392,9 +3774,7 @@ async def _resolve_placement_markets(session) -> dict:
         elif t.placement is None:
             skipped += 1  # still alive / undecided — leave open
         else:
-            await _resolve_market(
-                session, m, _placement_market_result(m, t.placement)
-            )
+            await _resolve_market(session, m, _placement_market_result(m, t.placement))
             resolved += 1
     return {"resolved": resolved, "skipped": skipped}
 
@@ -3513,11 +3893,7 @@ async def _auto_create_tribute_markets(
     """Creates all standard markets when a tribute is added. Returns count created."""
 
     # Pre-Games phase ID — stamped on training-score markets so phase-gating works
-    pre_phase_result = await session.execute(
-        select(BettingPhase).order_by(BettingPhase.sort_order).limit(1)
-    )
-    pre_phase_obj = pre_phase_result.scalars().first()
-    pre_phase_id = pre_phase_obj.id if pre_phase_obj else None
+    pre_phase_id = await _pregames_phase_id(session)
 
     # Historical training score average for this tribute's district/gender
     dr_result = await session.execute(
@@ -3601,7 +3977,9 @@ async def _auto_create_tribute_markets(
             created += _add("KILLS_OU", new_tribute, ou_line=line, ou_side=side)
 
     for side in ["OVER", "UNDER"]:
-        created += _add("PLACEMENT_OU", new_tribute, ou_line=PLACEMENT_OU_LINE, ou_side=side)
+        created += _add(
+            "PLACEMENT_OU", new_tribute, ou_line=PLACEMENT_OU_LINE, ou_side=side
+        )
 
     # ── Milestone markets (auto-resolve when respective phase begins) ──────────
     for mtype in (
@@ -3632,8 +4010,12 @@ async def _auto_create_tribute_markets(
             phase_id=pre_phase_id,
         )
 
-    created += _add("HIGHEST_TRAINING_SCORE", new_tribute, phase_id=pre_phase_id, h_avg=hist_avg)
-    created += _add("LOWEST_TRAINING_SCORE", new_tribute, phase_id=pre_phase_id, h_avg=hist_avg)
+    created += _add(
+        "HIGHEST_TRAINING_SCORE", new_tribute, phase_id=pre_phase_id, h_avg=hist_avg
+    )
+    created += _add(
+        "LOWEST_TRAINING_SCORE", new_tribute, phase_id=pre_phase_id, h_avg=hist_avg
+    )
 
     # ── Kill-event pairs ──────────────────────────────────────────────────────
     others = [t for t in all_tributes if t.id != new_tribute.id]
@@ -3694,7 +4076,16 @@ async def _auto_create_tribute_markets(
             session.add(m)
             return 1
 
-        created += _add_district("DISTRICT_VICTOR")
+        # DISTRICT_VICTOR is seeded for all 12 districts at /game start (Pre-
+        # Reaping, before any tribute exists) — only create it here if that
+        # seed is somehow missing, to avoid a second market for the district.
+        dv_exists = await session.execute(
+            select(Market).where(
+                Market.type == "DISTRICT_VICTOR", Market.placement_num == d
+            ).limit(1)
+        )
+        if dv_exists.scalars().first() is None:
+            created += _add_district("DISTRICT_VICTOR")
         for line in [0.5, 1.5, 2.5]:
             for side in ["OVER", "UNDER"]:
                 created += _add_district(
@@ -3743,11 +4134,7 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
     dr_result = await session.execute(select(DistrictRecord))
     dr_map = {r.district: r for r in dr_result.scalars().all()}
 
-    pre_phase_result = await session.execute(
-        select(BettingPhase).order_by(BettingPhase.sort_order).limit(1)
-    )
-    pre_phase_obj = pre_phase_result.scalars().first()
-    pre_phase_id = pre_phase_obj.id if pre_phase_obj else None
+    pre_phase_id = await _pregames_phase_id(session)
 
     # ── Build existing-market key sets ─────────────────────────────────────────
     # simple: (type, tribute_a_id) — single-tribute, no extra params
@@ -3798,8 +4185,10 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
                     )
                 )
         elif m.type in (
-            "PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER",
-            "PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER",
+            "PARTNER_SCORE_HIGHER",
+            "PARTNER_SCORE_LOWER",
+            "PARTNER_PLACE_HIGHER",
+            "PARTNER_PLACE_LOWER",
         ):
             if ta is not None and tb is not None:
                 existing_keyed.add((m.type, ta, tb))
@@ -3874,9 +4263,14 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
         phase_id: int | None = None,
     ) -> None:
         d_tributes = [t for t in all_tributes if t.district == district]
-        odds = district_default_odds(
-            type_, d_tributes, all_tributes, ou_line=ou_line, ou_side=ou_side
-        )
+        if type_ == "DISTRICT_VICTOR" and not d_tributes:
+            # No tribute has been reaped into this district yet (Pre-Reaping) —
+            # price from historical reputation instead of the empty live roster.
+            odds = pre_reaping_district_odds(dr_map)[district]
+        else:
+            odds = district_default_odds(
+                type_, d_tributes, all_tributes, ou_line=ou_line, ou_side=ou_side
+            )
         label = _build_label(type_, None, None, None, district, None, ou_line, ou_side)
         session.add(
             Market(
@@ -3924,6 +4318,19 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
             )
         )
         created_counts[type_] = created_counts.get(type_, 0) + 1
+
+    # ── Pre-Reaping district markets ──────────────────────────────────────────
+    # DISTRICT_VICTOR needs no tribute roster to exist — it's the one market
+    # type live during Pre-Reaping, before any tribute has been reaped. Seed all
+    # 12 up front so they're ready the instant /game start runs; _make_district
+    # above prices from DistrictRecord.reputation when a district has no
+    # tributes yet, and _recalculate_markets reprices from the live roster the
+    # moment real tributes land, same as any other district market.
+    for _pr_d in range(1, 13):
+        _pr_key = ("DISTRICT_VICTOR", _pr_d, None, None)
+        if _pr_key not in existing_district:
+            _make_district("DISTRICT_VICTOR", _pr_d)
+            existing_district.add(_pr_key)
 
     # ── Per-tribute markets ────────────────────────────────────────────────────
     _PREGAMES_SIMPLE = {"HIGHEST_TRAINING_SCORE", "LOWEST_TRAINING_SCORE"}
@@ -4034,10 +4441,8 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
                     _make(mtype, subj, trib_b=partner)
                     existing_keyed.add(key)
 
-        if ("DISTRICT_VICTOR", d, None, None) not in existing_district:
-            _make_district("DISTRICT_VICTOR", d)
-            existing_district.add(("DISTRICT_VICTOR", d, None, None))
-
+        # DISTRICT_VICTOR itself is seeded for all 12 districts up front, above
+        # (Pre-Reaping district markets) — nothing to do for it here.
         for line in [0.5, 1.5, 2.5]:
             for side in ["OVER", "UNDER"]:
                 key = ("DISTRICT_KILLS_OU", d, line, side)
@@ -4115,8 +4520,9 @@ async def _start_game() -> dict:
     """Shared game-start logic behind both the ``/game start`` Discord command
     and the web Activity's admin "Start Game" action, so the two stay in sync
     instead of drifting. Always begins in the lowest sort_order phase
-    (Pre-Games), seeds ARENA_TYPE prop markets, backfills anything voided by a
-    prior game cycle, and opens whatever the opening phase allows.
+    (Pre-Reaping — District Victor only, before any tribute is reaped), seeds
+    ARENA_TYPE prop markets, backfills anything voided by a prior game cycle,
+    and opens whatever the opening phase allows.
 
     Returns ``{"error": "already_active"}`` if a game is already running, else
     ``{"opened": int, "phase_name": str | None, "auto_parlays": int}``.
@@ -4126,7 +4532,7 @@ async def _start_game() -> dict:
         return {"error": "already_active"}
 
     async with get_session() as session:
-        # Always start in the first phase (lowest sort_order = Pre-Games)
+        # Always start in the first phase (lowest sort_order = Pre-Reaping)
         phase_result = await session.execute(
             select(BettingPhase).order_by(BettingPhase.sort_order).limit(1)
         )
@@ -4134,7 +4540,10 @@ async def _start_game() -> dict:
         pre_phase_id = pre_phase.id if pre_phase else None
         pre_phase_name = pre_phase.name if pre_phase else None
 
-        # Create ARENA_TYPE prop markets for this game (idempotent)
+        # Create ARENA_TYPE prop markets for this game (idempotent). Pinned to
+        # the Pre-Games phase specifically (not the opening phase above) since
+        # it's a Pre-Games-exclusive prop — see _pregames_phase_id.
+        pregames_phase_id = await _pregames_phase_id(session)
         art_row = await session.get(GameSetting, "arena_artificial_count")
         nat_row = await session.get(GameSetting, "arena_natural_count")
         art_count = int(json.loads(art_row.value)) if art_row else 0
@@ -4165,7 +4574,7 @@ async def _start_game() -> dict:
                         label=arena_label,
                         tribute_a_id=None,
                         cause=arena_cause,
-                        phase_id=pre_phase_id,
+                        phase_id=pregames_phase_id,
                         odds=arena_odds,
                         status="CLOSED",
                     )
@@ -4174,6 +4583,12 @@ async def _start_game() -> dict:
         # Recreate any per-tribute markets that were resolved (voided) in a
         # prior game cycle — backfill skips resolved rows, so they're gone now.
         await _backfill_missing_markets(session)
+
+        # Sessions here run with autoflush=False, so the district-victor rows
+        # _backfill_missing_markets just added (Pre-Reaping, before any tribute
+        # exists) aren't visible to the CLOSED-market SELECT below until
+        # flushed — without this they'd stay CLOSED despite being brand new.
+        await session.flush()
 
         # Open only the markets available in the opening phase (Pre-Games:
         # District Victor + training-score/scouting props). Everything else
@@ -4192,10 +4607,9 @@ async def _start_game() -> dict:
         await _set_sponsor_state(session, None)
 
         # Seed the tailing board with three featured parlays for this phase.
-        auto_made = (
-            await _try_generate_ai_parlays(session, pre_phase_id)
-            or await _generate_auto_parlays(session, pre_phase_id)
-        )
+        auto_made = await _try_generate_ai_parlays(
+            session, pre_phase_id
+        ) or await _generate_auto_parlays(session, pre_phase_id)
 
     await set_setting("game_active", True)
     if pre_phase_id is not None:
@@ -4544,11 +4958,55 @@ class HistoryPageView(discord.ui.View):
                 pass
 
 
+class AnnouncementModal(discord.ui.Modal, title="Gamemaker Announcement"):
+    message_input = discord.ui.TextInput(
+        label="Announcement",
+        style=discord.TextStyle.paragraph,
+        placeholder="Enter the announcement text...",
+        required=True,
+        max_length=4000,
+    )
+
+    def __init__(self, role: discord.Role | None) -> None:
+        super().__init__()
+        self.role = role
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot import config as cfg
+        from bot.database.engine import get_guild_setting
+
+        embed = discord.Embed(
+            title="📢 GAMEMAKER ANNOUNCEMENT",
+            description=self.message_input.value,
+            color=0xC9A227,
+        )
+        embed.set_footer(text="Panem Sportsbook — May the odds be ever in your favor.")
+        content = self.role.mention if self.role else None
+
+        channel_id = None
+        if interaction.guild_id:
+            raw = await get_guild_setting(current_guild_id(), "announcement_channel_id")
+            if raw:
+                channel_id = json.loads(raw)
+        if channel_id is None:
+            channel_id = cfg.ANNOUNCEMENT_CHANNEL_ID
+
+        if channel_id:
+            channel = interaction.guild.get_channel(channel_id)
+            if channel:
+                await channel.send(content=content, embed=embed)
+                await interaction.followup.send("Announcement posted.", ephemeral=True)
+                return
+
+        await interaction.followup.send(content=content, embed=embed, ephemeral=True)
+
+
 # ── AdminCog ──────────────────────────────────────────────────────────────────
 
 
 _ADMIN_PERMS = discord.Permissions(administrator=True)
-
 
 
 class AdminCog(commands.Cog):
@@ -4739,7 +5197,9 @@ class AdminCog(commands.Cog):
             current_phase_id = json.loads(phase_raw.value) if phase_raw else None
             if current_phase_id is not None:
                 current_phase = await session.get(BettingPhase, current_phase_id)
-                allowed = _open_types_for_phase(current_phase.name if current_phase else None)
+                allowed = _open_types_for_phase(
+                    current_phase.name if current_phase else None
+                )
                 closed_result = await session.execute(
                     select(Market).where(Market.status == "CLOSED")
                 )
@@ -4749,7 +5209,9 @@ class AdminCog(commands.Cog):
 
             tid = tribute.id
             _age_row = await session.get(GameSetting, "victor_avg_age")
-            _age_neutral = float(json.loads(_age_row.value)) if _age_row else float(AGE_NEUTRAL)
+            _age_neutral = (
+                float(json.loads(_age_row.value)) if _age_row else float(AGE_NEUTRAL)
+            )
 
         embed = discord.Embed(
             title="Tribute Added",
@@ -4765,14 +5227,18 @@ class AdminCog(commands.Cog):
         embed.add_field(name="Markets Created", value=str(market_count), inline=False)
         if times_played > 0:
             pexp = prior_experience_factor(times_played, highest_placement)
-            place_str = f", best placement: {highest_placement}" if highest_placement else ""
+            place_str = (
+                f", best placement: {highest_placement}" if highest_placement else ""
+            )
             embed.add_field(
                 name="Prior Experience",
                 value=f"{times_played}× played{place_str}  (×{pexp:.3f})",
                 inline=False,
             )
         if sade_participant:
-            champ_str = f" + Champion  (×{SADE_CHAMPION_FACTOR})" if sade_champion else ""
+            champ_str = (
+                f" + Champion  (×{SADE_CHAMPION_FACTOR})" if sade_champion else ""
+            )
             embed.add_field(
                 name="SADE",
                 value=f"Participant{champ_str}",
@@ -4851,9 +5317,7 @@ class AdminCog(commands.Cog):
             if name:
                 t.name = name
             if district and district != t.district:
-                roster = list(
-                    (await session.execute(select(Tribute))).scalars().all()
-                )
+                roster = list((await session.execute(select(Tribute))).scalars().all())
                 slot_error = _district_slot_error(
                     roster, district, t.display_gender, exclude_id=t.id
                 )
@@ -5006,7 +5470,9 @@ class AdminCog(commands.Cog):
             # Resolve HIGHEST/LOWEST training score + DISTRICT_HIGHEST_SCORE markets
             # once every tribute who can still be scored has a score (dead,
             # never-scored tributes count as null and don't block this).
-            r, c = await _resolve_score_completion_markets(session, all_tributes, tribute_map)
+            r, c = await _resolve_score_completion_markets(
+                session, all_tributes, tribute_map
+            )
             markets_resolved += r
             chips_issued += c
 
@@ -5100,7 +5566,9 @@ class AdminCog(commands.Cog):
                         select(func.max(DistrictRecord.kill_record))
                     )
                     dr = kill_boost_dr_factor(killer.kills, nkr)
-                    killer.kill_boost = (killer.kill_boost or 0.0) + max(0.0, kill_boost_factor - 1.0) * dr
+                    killer.kill_boost = (killer.kill_boost or 0.0) + max(
+                        0.0, kill_boost_factor - 1.0
+                    ) * dr
                     killer.kills += 1
                     if in_bloodbath:
                         killer.bloodbath_kills += 1
@@ -5154,9 +5622,9 @@ class AdminCog(commands.Cog):
 
             # FIRST_TRIBUTE_TO_DIE: resolve if no other tribute has died yet
             prev_deaths = await session.scalar(
-                select(func.count()).select_from(Tribute).where(
-                    Tribute.placement.isnot(None), Tribute.id != dead_id
-                )
+                select(func.count())
+                .select_from(Tribute)
+                .where(Tribute.placement.isnot(None), Tribute.id != dead_id)
             )
             if prev_deaths == 0:
                 ftd_result = await session.execute(
@@ -5203,12 +5671,20 @@ class AdminCog(commands.Cog):
                     )
                 elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
                     # Resolve now only if the partner's placement is already known.
-                    partner = await session.get(Tribute, mkt.tribute_b_id) if mkt.tribute_b_id else None
+                    partner = (
+                        await session.get(Tribute, mkt.tribute_b_id)
+                        if mkt.tribute_b_id
+                        else None
+                    )
                     if partner and partner.placement is not None:
                         if mkt.type == "PARTNER_PLACE_HIGHER":
-                            await _resolve_market(session, mkt, t.placement < partner.placement)
+                            await _resolve_market(
+                                session, mkt, t.placement < partner.placement
+                            )
                         else:
-                            await _resolve_market(session, mkt, t.placement > partner.placement)
+                            await _resolve_market(
+                                session, mkt, t.placement > partner.placement
+                            )
                     # else: leave open — partner not yet placed
                 elif mkt.type == "TRIBUTE_KILLS":
                     # "Most kills" is undecided until the Games end — a dead tribute
@@ -5228,12 +5704,20 @@ class AdminCog(commands.Cog):
                     await _resolve_market(session, mkt, None)
                 elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
                     # tribute_b (the partner) just died — resolve if tribute_a placement is known.
-                    ta_obj = await session.get(Tribute, mkt.tribute_a_id) if mkt.tribute_a_id else None
+                    ta_obj = (
+                        await session.get(Tribute, mkt.tribute_a_id)
+                        if mkt.tribute_a_id
+                        else None
+                    )
                     if ta_obj and ta_obj.placement is not None:
                         if mkt.type == "PARTNER_PLACE_HIGHER":
-                            await _resolve_market(session, mkt, ta_obj.placement < t.placement)
+                            await _resolve_market(
+                                session, mkt, ta_obj.placement < t.placement
+                            )
                         else:
-                            await _resolve_market(session, mkt, ta_obj.placement > t.placement)
+                            await _resolve_market(
+                                session, mkt, ta_obj.placement > t.placement
+                            )
                     # else: leave open — tribute_a not yet placed
                 else:
                     result = (mkt.tribute_a_id == killer_id) if killer_id else False
@@ -5247,15 +5731,12 @@ class AdminCog(commands.Cog):
             dist_members = dist_mbr_res.scalars().all()
             # Count alive members excluding the tribute that just died
             dist_alive_after = sum(
-                1 for ti in dist_members
-                if ti.id != dead_id and ti.status == "ALIVE"
+                1 for ti in dist_members if ti.id != dead_id and ti.status == "ALIVE"
             )
             # DISTRICT_BOTH_*: impossible the moment any district member dies → FALSE
             dist_both_q = await session.execute(
                 select(Market).where(
-                    Market.type.in_(
-                        ["DISTRICT_BOTH_FINAL_8", "DISTRICT_BOTH_FINAL_5"]
-                    ),
+                    Market.type.in_(["DISTRICT_BOTH_FINAL_8", "DISTRICT_BOTH_FINAL_5"]),
                     Market.placement_num == t_district,
                     Market.status.in_(["OPEN", "CLOSED"]),
                 )
@@ -5278,7 +5759,9 @@ class AdminCog(commands.Cog):
 
                 # FIRST_DISTRICT_WIPE: first district to be completely eliminated wins
                 already_wiped = await session.scalar(
-                    select(func.count()).select_from(Market).where(
+                    select(func.count())
+                    .select_from(Market)
+                    .where(
                         Market.type == "FIRST_DISTRICT_WIPE",
                         Market.status == "RESOLVED",
                     )
@@ -5291,7 +5774,9 @@ class AdminCog(commands.Cog):
                         )
                     )
                     for mkt in fdw_result.scalars().all():
-                        await _resolve_market(session, mkt, mkt.placement_num == t_district)
+                        await _resolve_market(
+                            session, mkt, mkt.placement_num == t_district
+                        )
 
             # ── Early-resolve alliance milestone markets ───────────────────────
             t_alliance_id = t.alliance_id
@@ -5301,7 +5786,8 @@ class AdminCog(commands.Cog):
                 )
                 ally_members = ally_mbr_res.scalars().all()
                 ally_alive_after = sum(
-                    1 for ti in ally_members
+                    1
+                    for ti in ally_members
                     if ti.id != dead_id and ti.status == "ALIVE"
                 )
                 # ALLIANCE_ALL_*: impossible the moment any alliance member dies → FALSE
@@ -5332,7 +5818,9 @@ class AdminCog(commands.Cog):
 
                 # FIRST_IN_ALLIANCE_DEATH: resolve if no other member of this alliance has died
                 prev_alliance_deaths = await session.scalar(
-                    select(func.count()).select_from(Tribute).where(
+                    select(func.count())
+                    .select_from(Tribute)
+                    .where(
                         Tribute.alliance_id == t_alliance_id,
                         Tribute.placement.isnot(None),
                         Tribute.id != dead_id,
@@ -5352,7 +5840,9 @@ class AdminCog(commands.Cog):
                 # FIRST_ALLIANCE_WIPED: first alliance to reach ≤1 surviving members wins
                 if ally_alive_after <= 1:
                     already_wiped = await session.scalar(
-                        select(func.count()).select_from(Market).where(
+                        select(func.count())
+                        .select_from(Market)
+                        .where(
                             Market.type == "FIRST_ALLIANCE_WIPED",
                             Market.status == "RESOLVED",
                         )
@@ -5452,7 +5942,9 @@ class AdminCog(commands.Cog):
             dist_mbr_res = await session.execute(
                 select(Tribute).where(Tribute.district == t_district)
             )
-            dist_others = [ti for ti in dist_mbr_res.scalars().all() if ti.id != dead_id]
+            dist_others = [
+                ti for ti in dist_mbr_res.scalars().all() if ti.id != dead_id
+            ]
             other_dist_dead = sum(1 for ti in dist_others if ti.status == "DEAD")
             other_dist_alive = sum(1 for ti in dist_others if ti.status == "ALIVE")
             # BOTH markets: only revert if T was the sole dead member (after unkill all alive)
@@ -5489,7 +5981,9 @@ class AdminCog(commands.Cog):
                 ally_mbr_res = await session.execute(
                     select(Tribute).where(Tribute.alliance_id == t_alliance_id)
                 )
-                ally_others = [ti for ti in ally_mbr_res.scalars().all() if ti.id != dead_id]
+                ally_others = [
+                    ti for ti in ally_mbr_res.scalars().all() if ti.id != dead_id
+                ]
                 other_ally_dead = sum(1 for ti in ally_others if ti.status == "DEAD")
                 other_ally_alive = sum(1 for ti in ally_others if ti.status == "ALIVE")
                 if other_ally_dead == 0:
@@ -5730,21 +6224,28 @@ class AdminCog(commands.Cog):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @tribute.command(name="import_template", description="Download the JSON template for mass tribute import")
+    @tribute.command(
+        name="import_template",
+        description="Download the JSON template for mass tribute import",
+    )
     @is_admin()
     async def tribute_import_template(self, interaction: discord.Interaction) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         import io, os
+
         template_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "data", "tributes_template.json",
+            "data",
+            "tributes_template.json",
         )
         try:
             with open(template_path, "rb") as f:
                 buf = io.BytesIO(f.read())
         except FileNotFoundError:
-            await interaction.followup.send("Template file not found on server.", ephemeral=True)
+            await interaction.followup.send(
+                "Template file not found on server.", ephemeral=True
+            )
             return
         await interaction.followup.send(
             "Fill in this template and upload it with `/tribute mass_import`.",
@@ -5752,8 +6253,12 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @tribute.command(name="mass_import", description="Bulk-add tributes from a JSON file")
-    @app_commands.describe(file="JSON file containing tribute data (get the template with /tribute import_template)")
+    @tribute.command(
+        name="mass_import", description="Bulk-add tributes from a JSON file"
+    )
+    @app_commands.describe(
+        file="JSON file containing tribute data (get the template with /tribute import_template)"
+    )
     @is_admin()
     async def tribute_mass_import(
         self,
@@ -5764,17 +6269,23 @@ class AdminCog(commands.Cog):
             return
 
         if not file.filename.endswith(".json"):
-            await interaction.followup.send("File must be a `.json` file.", ephemeral=True)
+            await interaction.followup.send(
+                "File must be a `.json` file.", ephemeral=True
+            )
             return
         if file.size > 512_000:
-            await interaction.followup.send("File is too large (max 512 KB).", ephemeral=True)
+            await interaction.followup.send(
+                "File is too large (max 512 KB).", ephemeral=True
+            )
             return
 
         try:
             raw = await file.read()
             data = json.loads(raw)
         except Exception as exc:
-            await interaction.followup.send(f"Failed to parse JSON: {exc}", ephemeral=True)
+            await interaction.followup.send(
+                f"Failed to parse JSON: {exc}", ephemeral=True
+            )
             return
 
         if not isinstance(data, list):
@@ -5798,14 +6309,18 @@ class AdminCog(commands.Cog):
             gender = entry.get("gender")
 
             if not name or not isinstance(name, str) or not name.strip():
-                errors.append(f"Row {row}: 'name' is required and must be a non-empty string")
+                errors.append(
+                    f"Row {row}: 'name' is required and must be a non-empty string"
+                )
                 continue
             name = name.strip()
             if not isinstance(district, int) or not (1 <= district <= 12):
-                errors.append(f"Row {row} ({name!r}): 'district' must be an integer 1–12")
+                errors.append(
+                    f"Row {row} ({name!r}): 'district' must be an integer 1–12"
+                )
                 continue
             if gender not in ("M", "F"):
-                errors.append(f"Row {row} ({name!r}): 'gender' must be \"M\" or \"F\"")
+                errors.append(f'Row {row} ({name!r}): \'gender\' must be "M" or "F"')
                 continue
 
             age = entry.get("age")
@@ -5816,7 +6331,9 @@ class AdminCog(commands.Cog):
                 continue
 
             score = entry.get("training_score")
-            if score is not None and (not isinstance(score, int) or not (1 <= score <= 12)):
+            if score is not None and (
+                not isinstance(score, int) or not (1 <= score <= 12)
+            ):
                 errors.append(
                     f"Row {row} ({name!r}): 'training_score' must be an integer 1–12 or null"
                 )
@@ -5824,23 +6341,31 @@ class AdminCog(commands.Cog):
 
             face_claim = entry.get("face_claim")
             if face_claim is not None and not isinstance(face_claim, str):
-                errors.append(f"Row {row} ({name!r}): 'face_claim' must be a string URL or null")
+                errors.append(
+                    f"Row {row} ({name!r}): 'face_claim' must be a string URL or null"
+                )
                 continue
 
             seniority_date = entry.get("seniority_date")
             if seniority_date is not None:
                 if not isinstance(seniority_date, str):
-                    errors.append(f"Row {row} ({name!r}): 'seniority_date' must be a string (YYYY-MM-DD) or null")
+                    errors.append(
+                        f"Row {row} ({name!r}): 'seniority_date' must be a string (YYYY-MM-DD) or null"
+                    )
                     continue
                 try:
                     datetime.strptime(seniority_date, "%Y-%m-%d")
                 except ValueError:
-                    errors.append(f"Row {row} ({name!r}): 'seniority_date' must be in YYYY-MM-DD format")
+                    errors.append(
+                        f"Row {row} ({name!r}): 'seniority_date' must be in YYYY-MM-DD format"
+                    )
                     continue
 
             imp_times_played = entry.get("times_played", 0)
             if not isinstance(imp_times_played, int) or imp_times_played < 0:
-                errors.append(f"Row {row} ({name!r}): 'times_played' must be a non-negative integer or omitted")
+                errors.append(
+                    f"Row {row} ({name!r}): 'times_played' must be a non-negative integer or omitted"
+                )
                 continue
 
             imp_highest_placement = entry.get("highest_placement")
@@ -5848,7 +6373,9 @@ class AdminCog(commands.Cog):
                 not isinstance(imp_highest_placement, int)
                 or not (2 <= imp_highest_placement <= 24)
             ):
-                errors.append(f"Row {row} ({name!r}): 'highest_placement' must be an integer 2–24 or null")
+                errors.append(
+                    f"Row {row} ({name!r}): 'highest_placement' must be an integer 2–24 or null"
+                )
                 continue
 
             if entry.get("sade_champion"):
@@ -5857,7 +6384,9 @@ class AdminCog(commands.Cog):
             valid_entries.append(entry)
 
         if sade_champions_in_batch > 1:
-            errors.append("Batch contains more than one sade_champion — at most one is allowed.")
+            errors.append(
+                "Batch contains more than one sade_champion — at most one is allowed."
+            )
 
         if errors:
             error_text = "\n".join(errors[:20])
@@ -5870,7 +6399,9 @@ class AdminCog(commands.Cog):
             return
 
         if not valid_entries:
-            await interaction.followup.send("No tribute entries found in the file.", ephemeral=True)
+            await interaction.followup.send(
+                "No tribute entries found in the file.", ephemeral=True
+            )
             return
 
         added_labels: list[str] = []
@@ -5963,7 +6494,9 @@ class AdminCog(commands.Cog):
 
                 all_result = await session.execute(select(Tribute))
                 all_tributes = all_result.scalars().all()
-                market_count = await _auto_create_tribute_markets(session, tribute, all_tributes)
+                market_count = await _auto_create_tribute_markets(
+                    session, tribute, all_tributes
+                )
                 total_markets += market_count
 
                 label = name
@@ -5978,7 +6511,9 @@ class AdminCog(commands.Cog):
             current_phase_id = json.loads(phase_raw.value) if phase_raw else None
             if current_phase_id is not None:
                 current_phase = await session.get(BettingPhase, current_phase_id)
-                allowed = _open_types_for_phase(current_phase.name if current_phase else None)
+                allowed = _open_types_for_phase(
+                    current_phase.name if current_phase else None
+                )
                 closed_result = await session.execute(
                     select(Market).where(Market.status == "CLOSED")
                 )
@@ -5986,7 +6521,9 @@ class AdminCog(commands.Cog):
                     if _market_should_open(m, current_phase_id, allowed):
                         m.status = "OPEN"
 
-        lines = [f"**{len(added_labels)}** tribute(s) added, **{total_markets}** markets created."]
+        lines = [
+            f"**{len(added_labels)}** tribute(s) added, **{total_markets}** markets created."
+        ]
         if added_labels:
             bullet_block = "\n".join(f"• {lbl}" for lbl in added_labels)
             lines.append(f"\n**Added:**\n{bullet_block}")
@@ -6003,10 +6540,13 @@ class AdminCog(commands.Cog):
         description="Download the current roster as a JSON template for mass score import",
     )
     @is_admin()
-    async def tribute_score_import_template(self, interaction: discord.Interaction) -> None:
+    async def tribute_score_import_template(
+        self, interaction: discord.Interaction
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         import io
+
         async with get_read_session() as session:
             result = await session.execute(
                 select(Tribute).order_by(Tribute.district, Tribute.gender)
@@ -6014,7 +6554,8 @@ class AdminCog(commands.Cog):
             tributes = result.scalars().all()
         if not tributes:
             await interaction.followup.send(
-                "No tributes exist yet — add tributes before importing scores.", ephemeral=True
+                "No tributes exist yet — add tributes before importing scores.",
+                ephemeral=True,
             )
             return
         template = [
@@ -6052,22 +6593,29 @@ class AdminCog(commands.Cog):
             return
 
         if not file.filename.endswith(".json"):
-            await interaction.followup.send("File must be a `.json` file.", ephemeral=True)
+            await interaction.followup.send(
+                "File must be a `.json` file.", ephemeral=True
+            )
             return
         if file.size > 512_000:
-            await interaction.followup.send("File is too large (max 512 KB).", ephemeral=True)
+            await interaction.followup.send(
+                "File is too large (max 512 KB).", ephemeral=True
+            )
             return
 
         try:
             raw = await file.read()
             data = json.loads(raw)
         except Exception as exc:
-            await interaction.followup.send(f"Failed to parse JSON: {exc}", ephemeral=True)
+            await interaction.followup.send(
+                f"Failed to parse JSON: {exc}", ephemeral=True
+            )
             return
 
         if not isinstance(data, list):
             await interaction.followup.send(
-                "JSON must be a list (`[...]`) of tribute score objects.", ephemeral=True
+                "JSON must be a list (`[...]`) of tribute score objects.",
+                ephemeral=True,
             )
             return
 
@@ -6083,21 +6631,29 @@ class AdminCog(commands.Cog):
 
             tribute_id = entry.get("tribute_id")
             if not isinstance(tribute_id, int) or isinstance(tribute_id, bool):
-                errors.append(f"Row {row}: 'tribute_id' is required and must be an integer")
+                errors.append(
+                    f"Row {row}: 'tribute_id' is required and must be an integer"
+                )
                 continue
 
             score = entry.get("score")
             if score is None:
                 continue  # unfilled row — skip silently, not an error
 
-            if not isinstance(score, int) or isinstance(score, bool) or not (1 <= score <= 12):
+            if (
+                not isinstance(score, int)
+                or isinstance(score, bool)
+                or not (1 <= score <= 12)
+            ):
                 errors.append(
                     f"Row {row} (tribute #{tribute_id}): 'score' must be an integer 1–12 or null"
                 )
                 continue
 
             if tribute_id in seen_ids:
-                errors.append(f"Row {row}: tribute #{tribute_id} appears more than once in this file")
+                errors.append(
+                    f"Row {row}: tribute #{tribute_id} appears more than once in this file"
+                )
                 continue
             seen_ids.add(tribute_id)
             updates[tribute_id] = score
@@ -6114,7 +6670,8 @@ class AdminCog(commands.Cog):
 
         if not updates:
             await interaction.followup.send(
-                "No scores to import — every row was null or the file was empty.", ephemeral=True
+                "No scores to import — every row was null or the file was empty.",
+                ephemeral=True,
             )
             return
 
@@ -6199,7 +6756,9 @@ class AdminCog(commands.Cog):
                             Market.tribute_a_id.in_(updated_ids),
                             Market.tribute_b_id.in_(updated_ids),
                         ),
-                        Market.type.in_(["PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER"]),
+                        Market.type.in_(
+                            ["PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER"]
+                        ),
                         Market.status.in_(["OPEN", "CLOSED"]),
                     )
                 )
@@ -6224,7 +6783,9 @@ class AdminCog(commands.Cog):
                 # Resolve HIGHEST/LOWEST training score + DISTRICT_HIGHEST_SCORE markets
                 # once every tribute who can still be scored has a score (dead,
                 # never-scored tributes count as null and don't block this).
-                r, c = await _resolve_score_completion_markets(session, all_tributes, tribute_map)
+                r, c = await _resolve_score_completion_markets(
+                    session, all_tributes, tribute_map
+                )
                 markets_resolved += r
                 chips_issued += c
 
@@ -6412,7 +6973,14 @@ class AdminCog(commands.Cog):
                     ou_side=side_val,
                 )
                 label = _build_label(
-                    market_type, None, None, None, placement_num, None, ou_line, side_val
+                    market_type,
+                    None,
+                    None,
+                    None,
+                    placement_num,
+                    None,
+                    ou_line,
+                    side_val,
                 )
                 mkt = Market(
                     type=market_type,
@@ -6655,7 +7223,9 @@ class AdminCog(commands.Cog):
         name="clear-override",
         description="Remove manual odds override(s) and let the model reprice. Omit market to clear all.",
     )
-    @app_commands.describe(market_id="Market to clear (leave blank to clear all overrides)")
+    @app_commands.describe(
+        market_id="Market to clear (leave blank to clear all overrides)"
+    )
     @app_commands.autocomplete(market_id=overridden_market_autocomplete)
     @is_admin()
     async def market_clear_override(
@@ -6877,7 +7447,9 @@ class AdminCog(commands.Cog):
             result = await session.execute(query)
             count = 0
             for m in result.scalars().all():
-                if filter_phase_id is None or _market_should_open(m, filter_phase_id, allowed):
+                if filter_phase_id is None or _market_should_open(
+                    m, filter_phase_id, allowed
+                ):
                     m.status = "OPEN"
                     count += 1
 
@@ -7242,7 +7814,13 @@ class AdminCog(commands.Cog):
                 if val is not None:
                     arena_mkt_result = await session.execute(
                         select(Market).where(
-                            Market.type.in_(["ARENA_TYPE", "ARENA_IS_NATURAL", "ARENA_IS_ARTIFICIAL"]),
+                            Market.type.in_(
+                                [
+                                    "ARENA_TYPE",
+                                    "ARENA_IS_NATURAL",
+                                    "ARENA_IS_ARTIFICIAL",
+                                ]
+                            ),
                             Market.status.in_(["OPEN", "CLOSED"]),
                         )
                     )
@@ -7259,7 +7837,11 @@ class AdminCog(commands.Cog):
             _notif_buffer.reset(_arena_token)
         await _send_resolution_dms(self.bot, _arena_notifs)
         label = arena_type.name.split("—")[0].strip()
-        extra = f" Resolved arena-type markets ({resolved_count} bet(s) settled)." if resolved_count else ""
+        extra = (
+            f" Resolved arena-type markets ({resolved_count} bet(s) settled)."
+            if resolved_count
+            else ""
+        )
         await interaction.followup.send(
             f"Arena type set to **{label}**. Death-cause market odds recalculated.{extra}",
             ephemeral=True,
@@ -7273,7 +7855,10 @@ class AdminCog(commands.Cog):
     @app_commands.autocomplete(phase_id=phase_autocomplete)
     @is_admin()
     async def game_set_phase(
-        self, interaction: discord.Interaction, phase_id: str, confirm: str | None = None
+        self,
+        interaction: discord.Interaction,
+        phase_id: str,
+        confirm: str | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
@@ -7427,9 +8012,7 @@ class AdminCog(commands.Cog):
                             )
                         dwb_count += 1
                     if dwb_count:
-                        auto_resolved.append(
-                            f"{dwb_count} District Wiped in Bloodbath"
-                        )
+                        auto_resolved.append(f"{dwb_count} District Wiped in Bloodbath")
 
                     # Resolve BLOODBATH_KILLS_OU: sum kills scored during Bloodbath
                     bb_kills_total = sum(t.bloodbath_kills for t in all_tributes)
@@ -7472,18 +8055,27 @@ class AdminCog(commands.Cog):
                     # Bloodbath death-count props: deaths = tributes who died during bloodbath
                     bb_dead_count = len(all_tributes) - len(alive_ids)
                     for bb_type, mkts_sql in [
-                        ("BLOODBATH_NO_DEATHS", select(Market).where(
-                            Market.type == "BLOODBATH_NO_DEATHS",
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )),
-                        ("BLOODBATH_DEATHS_OU", select(Market).where(
-                            Market.type == "BLOODBATH_DEATHS_OU",
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )),
-                        ("EXACT_BLOODBATH_DEATHS", select(Market).where(
-                            Market.type == "EXACT_BLOODBATH_DEATHS",
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )),
+                        (
+                            "BLOODBATH_NO_DEATHS",
+                            select(Market).where(
+                                Market.type == "BLOODBATH_NO_DEATHS",
+                                Market.status.in_(["OPEN", "CLOSED"]),
+                            ),
+                        ),
+                        (
+                            "BLOODBATH_DEATHS_OU",
+                            select(Market).where(
+                                Market.type == "BLOODBATH_DEATHS_OU",
+                                Market.status.in_(["OPEN", "CLOSED"]),
+                            ),
+                        ),
+                        (
+                            "EXACT_BLOODBATH_DEATHS",
+                            select(Market).where(
+                                Market.type == "EXACT_BLOODBATH_DEATHS",
+                                Market.status.in_(["OPEN", "CLOSED"]),
+                            ),
+                        ),
                     ]:
                         bbd_result = await session.execute(mkts_sql)
                         bbd_mkts = bbd_result.scalars().all()
@@ -7501,7 +8093,9 @@ class AdminCog(commands.Cog):
                                 result = bb_dead_count == (mkt.placement_num or -1)
                             await _resolve_market(session, mkt, result)
                         if bbd_mkts:
-                            auto_resolved.append(f"{len(bbd_mkts)} {bb_type.replace('_', ' ').title()}")
+                            auto_resolved.append(
+                                f"{len(bbd_mkts)} {bb_type.replace('_', ' ').title()}"
+                            )
 
                     # ANY_BB_DOUBLE_KILL: did any tribute rack up 2+ kills during
                     # the Bloodbath specifically.
@@ -7522,7 +8116,11 @@ class AdminCog(commands.Cog):
 
                 # Pre-Games props (training scores, arena type, etc.) resolve when
                 # the Bloodbath begins — i.e. when Pre-Games ends.
-                if old_phase and old_phase.name == "Pre-Games" and old_phase.id != new_phase_id:
+                if (
+                    old_phase
+                    and old_phase.name == "Pre-Games"
+                    and old_phase.id != new_phase_id
+                ):
                     arena_type_row = await session.get(GameSetting, "arena_type")
                     arena_type_val = (
                         json.loads(arena_type_row.value) if arena_type_row else None
@@ -7597,12 +8195,16 @@ class AdminCog(commands.Cog):
                             )
                         elif mkt.type == "ARENA_IS_ARTIFICIAL":
                             result = (
-                                arena_type_val == "ARTIFICIAL" if arena_type_val else None
+                                arena_type_val == "ARTIFICIAL"
+                                if arena_type_val
+                                else None
                             )
                         elif mkt.type == "NUM_TENS_OU":
                             high_count = sum(
-                                1 for t in all_tributes
-                                if t.training_score is not None and t.training_score >= 10
+                                1
+                                for t in all_tributes
+                                if t.training_score is not None
+                                and t.training_score >= 10
                             )
                             line = mkt.ou_line if mkt.ou_line is not None else 0.5
                             result = (
@@ -7612,7 +8214,8 @@ class AdminCog(commands.Cog):
                             )
                         elif mkt.type == "SOLO_TRIBUTES_OU":
                             solo_count = sum(
-                                1 for t in all_tributes
+                                1
+                                for t in all_tributes
                                 if t.status == "ALIVE" and t.alliance_id is None
                             )
                             line = mkt.ou_line if mkt.ou_line is not None else 0.5
@@ -7621,10 +8224,26 @@ class AdminCog(commands.Cog):
                                 if mkt.ou_side == "OVER"
                                 else solo_count <= line
                             )
-                        elif mkt.type in ("PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER"):
-                            ta = trib_map.get(mkt.tribute_a_id) if mkt.tribute_a_id else None
-                            tb = trib_map.get(mkt.tribute_b_id) if mkt.tribute_b_id else None
-                            if ta is None or tb is None or ta.training_score is None or tb.training_score is None:
+                        elif mkt.type in (
+                            "PARTNER_SCORE_HIGHER",
+                            "PARTNER_SCORE_LOWER",
+                        ):
+                            ta = (
+                                trib_map.get(mkt.tribute_a_id)
+                                if mkt.tribute_a_id
+                                else None
+                            )
+                            tb = (
+                                trib_map.get(mkt.tribute_b_id)
+                                if mkt.tribute_b_id
+                                else None
+                            )
+                            if (
+                                ta is None
+                                or tb is None
+                                or ta.training_score is None
+                                or tb.training_score is None
+                            ):
                                 result = None  # void — one or both scores never set
                             elif mkt.type == "PARTNER_SCORE_HIGHER":
                                 result = ta.training_score > tb.training_score
@@ -7655,12 +8274,22 @@ class AdminCog(commands.Cog):
                             )
                             ts_markets = ts_q.scalars().all()
                             for mkt in ts_markets:
-                                trib = trib_map.get(mkt.tribute_a_id) if mkt.tribute_a_id else None
+                                trib = (
+                                    trib_map.get(mkt.tribute_a_id)
+                                    if mkt.tribute_a_id
+                                    else None
+                                )
                                 result = bool(trib and trib.training_score == target)
                                 await _resolve_market(session, mkt, result)
                             if ts_markets:
-                                label = "Highest" if mtype == "HIGHEST_TRAINING_SCORE" else "Lowest"
-                                auto_resolved.append(f"{len(ts_markets)} {label} Training Score")
+                                label = (
+                                    "Highest"
+                                    if mtype == "HIGHEST_TRAINING_SCORE"
+                                    else "Lowest"
+                                )
+                                auto_resolved.append(
+                                    f"{len(ts_markets)} {label} Training Score"
+                                )
 
                     # DISTRICT_HIGHEST_SCORE
                     dist_scores: dict[int, int] = {}
@@ -7826,12 +8455,13 @@ class AdminCog(commands.Cog):
                 # Refresh the three featured parlays from this phase's open markets.
                 # Both generators are gated by _AUTO_PARLAY_GENERATION_ENABLED, so
                 # this is a no-op while that kill switch is off.
-                auto_made = (
-                    await _try_generate_ai_parlays(session, new_phase_id)
-                    or await _generate_auto_parlays(session, new_phase_id)
-                )
+                auto_made = await _try_generate_ai_parlays(
+                    session, new_phase_id
+                ) or await _generate_auto_parlays(session, new_phase_id)
                 if auto_made:
-                    auto_resolved.append(f"{auto_made} featured parlay(s) posted for tailing")
+                    auto_resolved.append(
+                        f"{auto_made} featured parlay(s) posted for tailing"
+                    )
 
         _notif_buffer.reset(_phase_token)
         await set_setting("current_phase_id", new_phase_id)
@@ -7974,12 +8604,8 @@ class AdminCog(commands.Cog):
                 )
             )
             for mkt in ru_result.scalars().all():
-                trib = next(
-                    (t for t in all_t_final if t.id == mkt.tribute_a_id), None
-                )
-                await _resolve_market(
-                    session, mkt, bool(trib and trib.placement == 2)
-                )
+                trib = next((t for t in all_t_final if t.id == mkt.tribute_a_id), None)
+                await _resolve_market(session, mkt, bool(trib and trib.placement == 2))
 
             # Resolve ALLIANCE_RUNNER_UP: any member of alliance finished 2nd
             aru_result = await session.execute(
@@ -8041,7 +8667,8 @@ class AdminCog(commands.Cog):
 
             # Resolve DISTRICT_PARTNER_KILL: any tribute killed their district partner
             any_partner_kill = any(
-                t.killed_by_id is not None and any(
+                t.killed_by_id is not None
+                and any(
                     k.district == t.district and k.id != t.id
                     for k in all_t_final
                     if k.id == t.killed_by_id
@@ -8081,7 +8708,9 @@ class AdminCog(commands.Cog):
                     )
                     await _resolve_market(session, mkt, result)
                 elif mkt.type == "KILL_EVENT" and mkt.tribute_b_id == victor.id:
-                    await _resolve_market(session, mkt, False)  # victor was never killed
+                    await _resolve_market(
+                        session, mkt, False
+                    )  # victor was never killed
 
             # Settle every placement-driven market (the victor placed 1st; the
             # rest carry the placement recorded at death) and the "most kills"
@@ -8105,7 +8734,11 @@ class AdminCog(commands.Cog):
             description="The Games have concluded. The Capitol thanks you for your patronage.",
             color=0xFFD700,
         )
-        settled = place_stats["resolved"] + partner_place_stats["resolved"] + killer_stats["resolved"]
+        settled = (
+            place_stats["resolved"]
+            + partner_place_stats["resolved"]
+            + killer_stats["resolved"]
+        )
         if settled:
             embed.add_field(
                 name="Final Markets Settled",
@@ -8218,9 +8851,7 @@ class AdminCog(commands.Cog):
     async def resolve_feast(
         self, interaction: discord.Interaction, happened: bool
     ) -> None:
-        await self._resolve_binary_prop(
-            interaction, "GAMES_FEAST", happened, "Feast"
-        )
+        await self._resolve_binary_prop(interaction, "GAMES_FEAST", happened, "Feast")
 
     @resolve.command(
         name="betrayal",
@@ -8239,9 +8870,7 @@ class AdminCog(commands.Cog):
         name="bb_double_kill",
         description="Settle 'Any Bloodbath Double-Kill' markets (manual override)",
     )
-    @app_commands.describe(
-        happened="Did any tribute score 2+ kills in the Bloodbath?"
-    )
+    @app_commands.describe(happened="Did any tribute score 2+ kills in the Bloodbath?")
     @is_admin()
     async def resolve_bb_double_kill(
         self, interaction: discord.Interaction, happened: bool
@@ -8269,7 +8898,11 @@ class AdminCog(commands.Cog):
         await interaction.followup.send(
             f"✅ Settled **{stats['markets']}** {label} market(s) — {label} {outcome}. "
             f"{stats['bets']} bet(s) graded"
-            + (f", {fmt_chips(stats['credits'])} paid out." if stats["credits"] else "."),
+            + (
+                f", {fmt_chips(stats['credits'])} paid out."
+                if stats["credits"]
+                else "."
+            ),
             ephemeral=True,
         )
 
@@ -8326,9 +8959,7 @@ class AdminCog(commands.Cog):
             for m in markets:
                 line = m.ou_line if m.ou_line is not None else default_line
                 result = (
-                    actual_count > line
-                    if m.ou_side == "OVER"
-                    else actual_count <= line
+                    actual_count > line if m.ou_side == "OVER" else actual_count <= line
                 )
                 await _resolve_market(session, m, result)
         _notif_buffer.reset(_ou_token)
@@ -8384,9 +9015,7 @@ class AdminCog(commands.Cog):
             if result.value == "WIN"
             else (0xCF4444 if result.value == "LOSS" else 0x888888)
         )
-        embed = discord.Embed(
-            title=f"Bulk Resolve: {result.value}", color=color
-        )
+        embed = discord.Embed(title=f"Bulk Resolve: {result.value}", color=color)
         embed.add_field(name="Market Type", value=f"`{market_type}`", inline=False)
         embed.add_field(name="Markets Resolved", value=str(stats["markets"]))
         embed.add_field(name="Bets Graded", value=str(stats["bets"]))
@@ -8440,9 +9069,7 @@ class AdminCog(commands.Cog):
         )
         embed.add_field(name="Tributes", value=str(len(tributes)))
         embed.add_field(name="Alive", value=str(len(alive)))
-        embed.add_field(
-            name="Fallen", value=str(len(dead) + len(victors))
-        )
+        embed.add_field(name="Fallen", value=str(len(dead) + len(victors)))
         embed.add_field(name="Total Kills", value=str(total_kills))
 
         if victors:
@@ -8453,16 +9080,12 @@ class AdminCog(commands.Cog):
             )
 
         # Top killers
-        killers = sorted(
-            [t for t in tributes if t.kills > 0], key=lambda t: -t.kills
-        )
+        killers = sorted([t for t in tributes if t.kills > 0], key=lambda t: -t.kills)
         if killers:
             top = killers[: min(8, len(killers))]
             embed.add_field(
                 name="🔪 Top Killers",
-                value="\n".join(
-                    f"`{t.kills:>2}` {_tribute_label(t)}" for t in top
-                ),
+                value="\n".join(f"`{t.kills:>2}` {_tribute_label(t)}" for t in top),
                 inline=False,
             )
 
@@ -8472,9 +9095,7 @@ class AdminCog(commands.Cog):
             lines = []
             for t in eliminated[:12]:
                 place = f"{t.placement}." if t.placement else "—"
-                killer = next(
-                    (k for k in tributes if k.id == t.killed_by_id), None
-                )
+                killer = next((k for k in tributes if k.id == t.killed_by_id), None)
                 by = f" ← {_tribute_label(killer)}" if killer else ""
                 cause = f" ({t.death_cause})" if t.death_cause else ""
                 lines.append(f"`{place:>3}` {_tribute_label(t)}{cause}{by}")
@@ -8519,15 +9140,11 @@ class AdminCog(commands.Cog):
         )
 
         # Leaderboard
-        killers = sorted(
-            [t for t in tributes if t.kills > 0], key=lambda t: -t.kills
-        )
+        killers = sorted([t for t in tributes if t.kills > 0], key=lambda t: -t.kills)
         if killers:
             lines = []
             for t in killers:
-                victims = [
-                    v for v in tributes if v.killed_by_id == t.id
-                ]
+                victims = [v for v in tributes if v.killed_by_id == t.id]
                 vstr = (
                     " — " + ", ".join(_tribute_label(v) for v in victims)
                     if victims
@@ -8550,9 +9167,7 @@ class AdminCog(commands.Cog):
                 )
             else:
                 feed_lines.append(f"💀 {_tribute_label(t)} — {cause} (no killer)")
-        _chunk_lines_into_fields(
-            embed, "Kill Feed", feed_lines, empty="No deaths yet."
-        )
+        _chunk_lines_into_fields(embed, "Kill Feed", feed_lines, empty="No deaths yet.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @stats.command(
@@ -8721,16 +9336,25 @@ class AdminCog(commands.Cog):
             pairs.append((leg, mkt))
         return tpl, pairs
 
-    @parlay.command(name="create", description="Create an empty pre-built parlay template")
-    @app_commands.describe(name="Display name", description="Short description (optional)")
+    @parlay.command(
+        name="create", description="Create an empty pre-built parlay template"
+    )
+    @app_commands.describe(
+        name="Display name", description="Short description (optional)"
+    )
     @is_admin()
     async def parlay_create(
-        self, interaction: discord.Interaction, name: str, description: str | None = None
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        description: str | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            tpl = ParlayTemplate(name=name[:100], description=description, source="ADMIN")
+            tpl = ParlayTemplate(
+                name=name[:100], description=description, source="ADMIN"
+            )
             session.add(tpl)
             await session.flush()
             tpl_id = tpl.id
@@ -8744,10 +9368,15 @@ class AdminCog(commands.Cog):
         name="save_slip",
         description="Save your current /parlay slip as a pre-built tailable parlay",
     )
-    @app_commands.describe(name="Display name", description="Short description (optional)")
+    @app_commands.describe(
+        name="Display name", description="Short description (optional)"
+    )
     @is_admin()
     async def parlay_save_slip(
-        self, interaction: discord.Interaction, name: str, description: str | None = None
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        description: str | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
@@ -8771,9 +9400,11 @@ class AdminCog(commands.Cog):
             session.add(tpl)
             await session.flush()
             for i, leg in enumerate(legs):
-                session.add(ParlayTemplateLeg(
-                    template_id=tpl.id, market_id=leg.market_id, sort_order=i
-                ))
+                session.add(
+                    ParlayTemplateLeg(
+                        template_id=tpl.id, market_id=leg.market_id, sort_order=i
+                    )
+                )
             tpl_id = tpl.id
             count = len(legs)
         await interaction.followup.send(
@@ -8783,7 +9414,9 @@ class AdminCog(commands.Cog):
         )
 
     @parlay.command(name="addleg", description="Add a market leg to a parlay template")
-    @app_commands.describe(template_id="Template to edit", market="Market to add as a leg")
+    @app_commands.describe(
+        template_id="Template to edit", market="Market to add as a leg"
+    )
     @app_commands.autocomplete(
         template_id=parlay_template_autocomplete, market=open_market_autocomplete
     )
@@ -8794,7 +9427,9 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         if not template_id.isdigit() or not market.isdigit():
-            await interaction.followup.send("Pick both from the autocomplete lists.", ephemeral=True)
+            await interaction.followup.send(
+                "Pick both from the autocomplete lists.", ephemeral=True
+            )
             return
         async with get_session() as session:
             tpl, pairs = await self._template_markets(session, int(template_id))
@@ -8806,17 +9441,23 @@ class AdminCog(commands.Cog):
                 await interaction.followup.send("Market not found.", ephemeral=True)
                 return
             if any(leg.market_id == new_mkt.id for leg, _ in pairs):
-                await interaction.followup.send("That market is already a leg.", ephemeral=True)
+                await interaction.followup.send(
+                    "That market is already a leg.", ephemeral=True
+                )
                 return
             existing_mkts = [m for _, m in pairs if m is not None]
-            tribute_by_id = await tribute_lookup_for_markets(session, existing_mkts + [new_mkt])
+            tribute_by_id = await tribute_lookup_for_markets(
+                session, existing_mkts + [new_mkt]
+            )
             conflict = _parlay_conflict(existing_mkts, new_mkt, tribute_by_id)
             if conflict:
                 await interaction.followup.send(conflict, ephemeral=True)
                 return
-            session.add(ParlayTemplateLeg(
-                template_id=tpl.id, market_id=new_mkt.id, sort_order=len(pairs)
-            ))
+            session.add(
+                ParlayTemplateLeg(
+                    template_id=tpl.id, market_id=new_mkt.id, sort_order=len(pairs)
+                )
+            )
             label = new_mkt.label
             name = tpl.name
         await interaction.followup.send(
@@ -8825,8 +9466,12 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @parlay.command(name="removeleg", description="Remove a leg from a parlay template by position")
-    @app_commands.describe(template_id="Template to edit", leg_number="Leg number (see /admin parlay list)")
+    @parlay.command(
+        name="removeleg", description="Remove a leg from a parlay template by position"
+    )
+    @app_commands.describe(
+        template_id="Template to edit", leg_number="Leg number (see /admin parlay list)"
+    )
     @app_commands.autocomplete(template_id=parlay_template_autocomplete)
     @is_admin()
     async def parlay_removeleg(
@@ -8838,7 +9483,9 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         if not template_id.isdigit():
-            await interaction.followup.send("Pick a template from the list.", ephemeral=True)
+            await interaction.followup.send(
+                "Pick a template from the list.", ephemeral=True
+            )
             return
         async with get_session() as session:
             tpl, pairs = await self._template_markets(session, int(template_id))
@@ -8865,7 +9512,9 @@ class AdminCog(commands.Cog):
             return
         async with get_session() as session:
             result = await session.execute(
-                select(ParlayTemplate).order_by(ParlayTemplate.source, ParlayTemplate.id)
+                select(ParlayTemplate).order_by(
+                    ParlayTemplate.source, ParlayTemplate.id
+                )
             )
             templates = result.scalars().all()
             rendered: list[tuple[ParlayTemplate, list[tuple], int | None, bool]] = []
@@ -8888,8 +9537,10 @@ class AdminCog(commands.Cog):
 
         embed = discord.Embed(title="🎟️ Pre-Built Parlay Templates", color=0xC9A227)
         for tpl, pairs, combined, all_open in rendered[:25]:
-            status = "live" if (tpl.active and all_open) else (
-                "hidden" if not tpl.active else "not all legs open"
+            status = (
+                "live"
+                if (tpl.active and all_open)
+                else ("hidden" if not tpl.active else "not all legs open")
             )
             head = f"#{tpl.id} · {tpl.source}"
             if combined is not None:
@@ -8901,18 +9552,26 @@ class AdminCog(commands.Cog):
             ] or ["_(no legs yet)_"]
             value = f"{head}\n" + "\n".join(leg_lines)
             embed.add_field(name=tpl.name[:256], value=value[:1024], inline=False)
-        embed.set_footer(text="Templates show on the board only while every leg is OPEN.")
+        embed.set_footer(
+            text="Templates show on the board only while every leg is OPEN."
+        )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @parlay.command(name="toggle", description="Show/hide a parlay template on the tailing board")
+    @parlay.command(
+        name="toggle", description="Show/hide a parlay template on the tailing board"
+    )
     @app_commands.describe(template_id="Template to toggle")
     @app_commands.autocomplete(template_id=parlay_template_autocomplete)
     @is_admin()
-    async def parlay_toggle(self, interaction: discord.Interaction, template_id: str) -> None:
+    async def parlay_toggle(
+        self, interaction: discord.Interaction, template_id: str
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         if not template_id.isdigit():
-            await interaction.followup.send("Pick a template from the list.", ephemeral=True)
+            await interaction.followup.send(
+                "Pick a template from the list.", ephemeral=True
+            )
             return
         async with get_session() as session:
             tpl = await session.get(ParlayTemplate, int(template_id))
@@ -8942,7 +9601,9 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         if not template_id.isdigit():
-            await interaction.followup.send("Pick a template from the list.", ephemeral=True)
+            await interaction.followup.send(
+                "Pick a template from the list.", ephemeral=True
+            )
             return
         from bot.lemonade import _fit_description
 
@@ -8968,11 +9629,15 @@ class AdminCog(commands.Cog):
     @app_commands.describe(template_id="Template to delete")
     @app_commands.autocomplete(template_id=parlay_template_autocomplete)
     @is_admin()
-    async def parlay_delete(self, interaction: discord.Interaction, template_id: str) -> None:
+    async def parlay_delete(
+        self, interaction: discord.Interaction, template_id: str
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         if not template_id.isdigit():
-            await interaction.followup.send("Pick a template from the list.", ephemeral=True)
+            await interaction.followup.send(
+                "Pick a template from the list.", ephemeral=True
+            )
             return
         async with get_session() as session:
             tpl = await session.get(ParlayTemplate, int(template_id))
@@ -8989,7 +9654,9 @@ class AdminCog(commands.Cog):
         name="generate",
         description="Regenerate auto featured parlays from open markets now",
     )
-    @app_commands.describe(count="How many themed parlays to generate (default 3, max 10)")
+    @app_commands.describe(
+        count="How many themed parlays to generate (default 3, max 10)"
+    )
     @is_admin()
     async def parlay_generate(
         self,
@@ -9007,10 +9674,9 @@ class AdminCog(commands.Cog):
         phase_raw = await get_setting("current_phase_id")
         phase_id = json.loads(phase_raw) if phase_raw else None
         async with get_session() as session:
-            made = (
-                await _try_generate_ai_parlays(session, phase_id, count)
-                or await _generate_auto_parlays(session, phase_id, count=count)
-            )
+            made = await _try_generate_ai_parlays(
+                session, phase_id, count
+            ) or await _generate_auto_parlays(session, phase_id, count=count)
         if made:
             await interaction.followup.send(
                 f"Generated **{made}** featured parlay(s) from the open markets.",
@@ -9018,14 +9684,17 @@ class AdminCog(commands.Cog):
             )
         else:
             await interaction.followup.send(
-                "Not enough open markets to build themed parlays right now.", ephemeral=True
+                "Not enough open markets to build themed parlays right now.",
+                ephemeral=True,
             )
 
     @parlay.command(
         name="ai-lore",
         description="Upload a PDF of district lore so the AI can generate smarter parlays",
     )
-    @app_commands.describe(pdf="PDF file with district identity / background descriptions")
+    @app_commands.describe(
+        pdf="PDF file with district identity / background descriptions"
+    )
     @is_admin()
     async def parlay_ai_lore(
         self,
@@ -9756,7 +10425,8 @@ class AdminCog(commands.Cog):
         )
 
     @modifier.command(
-        name="assign", description="Apply a modifier to a tribute, district, or alliance"
+        name="assign",
+        description="Apply a modifier to a tribute, district, or alliance",
     )
     @app_commands.describe(
         modifier_id="Modifier to assign",
@@ -9906,12 +10576,21 @@ class AdminCog(commands.Cog):
                     gender_code = tm.group(2).upper()
                     match = next(
                         (
-                            t for t in tributes
+                            t
+                            for t in tributes
                             if t.district == district_num
                             and (
                                 (gender_code == "NB" and t.non_binary)
-                                or (gender_code == "F" and t.gender == "F" and not t.non_binary)
-                                or (gender_code == "M" and t.gender == "M" and not t.non_binary)
+                                or (
+                                    gender_code == "F"
+                                    and t.gender == "F"
+                                    and not t.non_binary
+                                )
+                                or (
+                                    gender_code == "M"
+                                    and t.gender == "M"
+                                    and not t.non_binary
+                                )
                             )
                         ),
                         None,
@@ -9925,7 +10604,9 @@ class AdminCog(commands.Cog):
                             tribute_id=match.id,
                         )
                     )
-                    assigned.append(f"{match.name} (D{district_num}{match.display_gender})")
+                    assigned.append(
+                        f"{match.name} (D{district_num}{match.display_gender})"
+                    )
                     continue
 
                 # Alliance by name
@@ -10343,41 +11024,16 @@ class AdminCog(commands.Cog):
 
     @settings.command(
         name="announce",
-        description="Post a Capitol announcement to the announcement channel",
+        description="Post a Gamemaker announcement to the announcement channel",
     )
-    @app_commands.describe(message="The announcement message")
+    @app_commands.describe(role="Role to ping alongside the announcement (optional)")
     @is_admin()
-    async def announce(self, interaction: discord.Interaction, message: str) -> None:
-        if not await safe_defer(interaction, ephemeral=True):
-            return
-        from bot import config as cfg
-        from bot.database.engine import get_guild_setting
-
-        embed = discord.Embed(
-            title="📢 CAPITOL ANNOUNCEMENT",
-            description=message,
-            color=0xC9A227,
-        )
-        embed.set_footer(
-            text="Panem Sportsbook — May the odds be ever in your favor."
-        )
-
-        channel_id = None
-        if interaction.guild_id:
-            raw = await get_guild_setting(current_guild_id(), "announcement_channel_id")
-            if raw:
-                channel_id = json.loads(raw)
-        if channel_id is None:
-            channel_id = cfg.ANNOUNCEMENT_CHANNEL_ID
-
-        if channel_id:
-            channel = interaction.guild.get_channel(channel_id)
-            if channel:
-                await channel.send(embed=embed)
-                await interaction.followup.send("Announcement posted.", ephemeral=True)
-                return
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
+    async def announce(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role | None = None,
+    ) -> None:
+        await interaction.response.send_modal(AnnouncementModal(role))
 
     @settings.command(
         name="announce_channel",
@@ -10395,6 +11051,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         from bot.database.engine import set_guild_setting
+
         if channel is None:
             await set_guild_setting(current_guild_id(), "announcement_channel_id", None)
             await interaction.followup.send(
@@ -10403,7 +11060,9 @@ class AdminCog(commands.Cog):
                 ephemeral=True,
             )
             return
-        await set_guild_setting(current_guild_id(), "announcement_channel_id", channel.id)
+        await set_guild_setting(
+            current_guild_id(), "announcement_channel_id", channel.id
+        )
         await interaction.followup.send(
             f"Capitol announcements will now be posted in {channel.mention}.",
             ephemeral=True,
@@ -10425,6 +11084,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         from bot.database.engine import set_guild_setting
+
         if role is None:
             await set_guild_setting(current_guild_id(), "admin_role_id", None)
             await interaction.followup.send(
@@ -10455,6 +11115,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         from bot.database.engine import set_guild_setting
+
         if channel is None:
             await set_guild_setting(current_guild_id(), "withdraw_channel_id", None)
             await interaction.followup.send(
@@ -10485,6 +11146,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         from bot.database.engine import set_guild_setting
+
         if channel is None:
             await set_guild_setting(current_guild_id(), "log_channel_id", None)
             await interaction.followup.send(
@@ -10555,7 +11217,9 @@ class AdminCog(commands.Cog):
                 if row:
                     row.value = json.dumps(age)
                 else:
-                    session.add(GameSetting(key="victor_avg_age", value=json.dumps(age)))
+                    session.add(
+                        GameSetting(key="victor_avg_age", value=json.dumps(age))
+                    )
             await _recalculate_markets(session)
         if age is None:
             await interaction.followup.send(
@@ -10582,6 +11246,7 @@ class AdminCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         from bot.imaging.hot_odds import DEFAULT_ANNOUNCEMENT
+
         if text is None:
             await set_setting("capitol_announcement", None)
             await interaction.followup.send(
@@ -10619,11 +11284,13 @@ class AdminCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            session.add(BettingRestriction(
-                guild_id=current_guild_id(),
-                discord_user_id=member.id,
-                restriction_type="ALL",
-            ))
+            session.add(
+                BettingRestriction(
+                    guild_id=current_guild_id(),
+                    discord_user_id=member.id,
+                    restriction_type="ALL",
+                )
+            )
         await interaction.followup.send(
             f"**{member.display_name}** has been banned from placing any bets.",
             ephemeral=True,
@@ -10686,12 +11353,14 @@ class AdminCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            session.add(BettingRestriction(
-                guild_id=current_guild_id(),
-                discord_user_id=member.id,
-                restriction_type="DISTRICT",
-                district=district,
-            ))
+            session.add(
+                BettingRestriction(
+                    guild_id=current_guild_id(),
+                    discord_user_id=member.id,
+                    restriction_type="DISTRICT",
+                    district=district,
+                )
+            )
         await interaction.followup.send(
             f"**{member.display_name}** is now blocked from betting on District {district} markets.",
             ephemeral=True,
@@ -10774,12 +11443,14 @@ class AdminCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            session.add(BettingRestriction(
-                guild_id=current_guild_id(),
-                discord_user_id=member.id,
-                restriction_type="TRIBUTE",
-                tribute_id=tid,
-            ))
+            session.add(
+                BettingRestriction(
+                    guild_id=current_guild_id(),
+                    discord_user_id=member.id,
+                    restriction_type="TRIBUTE",
+                    tribute_id=tid,
+                )
+            )
             tribute_name = tribute.name
         await interaction.followup.send(
             f"**{member.display_name}** is now blocked from betting on markets involving **{tribute_name}**.",
@@ -10917,11 +11588,13 @@ class AdminCog(commands.Cog):
             if row:
                 row.tribute_id = tid
             else:
-                session.add(TributeLock(
-                    guild_id=current_guild_id(),
-                    discord_user_id=member.id,
-                    tribute_id=tid,
-                ))
+                session.add(
+                    TributeLock(
+                        guild_id=current_guild_id(),
+                        discord_user_id=member.id,
+                        tribute_id=tid,
+                    )
+                )
             tribute_name = tribute.name
         await interaction.followup.send(
             f"**{member.display_name}** is now locked out of the sportsbook as **{tribute_name}** — "
@@ -10956,7 +11629,8 @@ class AdminCog(commands.Cog):
                 return
             await session.delete(row)
         await interaction.followup.send(
-            f"**{member.display_name}**'s sportsbook access has been restored.", ephemeral=True
+            f"**{member.display_name}**'s sportsbook access has been restored.",
+            ephemeral=True,
         )
 
 
@@ -10972,8 +11646,10 @@ async def _get_or_create_user(session, member: discord.Member, guild_id: int) ->
         default_raw = await get_setting("default_chips")
         default_chips = json.loads(default_raw) if default_raw else 1000
         u = User(
-            guild_id=guild_id, discord_id=member.id,
-            username=member.display_name, chips=default_chips,
+            guild_id=guild_id,
+            discord_id=member.id,
+            username=member.display_name,
+            chips=default_chips,
         )
         session.add(u)
         await session.flush()

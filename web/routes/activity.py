@@ -123,6 +123,20 @@ def _parlay_dict(p: Parlay) -> dict:
 _GUILD_ID = get_request_guild
 
 
+async def _paused() -> bool:
+    """Wrap _betting_paused() with the guild-context bind it needs.
+
+    _betting_paused() reaches the DB through bot.database.engine (get_setting ->
+    get_session()), which resolves the active guild from *its own* contextvar —
+    separate from web/database.py's request-guild context that the rest of this
+    module uses. Without binding it first, current_guild_id() reads 0 and
+    get_session() raises "No guild context set", which isn't an HTTPException
+    and so surfaces as a bare 500 instead of the intended paused-betting message."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    return await _betting_paused()
+
+
 async def _fetch_user(db, discord_id: int) -> User | None:
     result = await db.execute(
         select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == discord_id)
@@ -455,7 +469,7 @@ async def place_bet(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
-    if await _betting_paused():
+    if await _paused():
         raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
@@ -657,7 +671,7 @@ async def parlay_submit(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
-    if await _betting_paused():
+    if await _paused():
         raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
@@ -744,6 +758,7 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
             combined = combined_american(odds_list) if len(odds_list) >= 2 else None
             out.append({
                 "id": tpl.id,
+                "kind": "template",
                 "name": tpl.name,
                 "description": tpl.description,
                 "difficulty": tpl.difficulty,
@@ -790,6 +805,49 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
                 entry["name"] = name
                 entry["description"] = desc
 
+        # Public, still-pending member parlays are also tailable (matches
+        # /parlay tail in the bot and the /tail page on the web dashboard) —
+        # they live in a separate id space from ParlayTemplate, so callers use
+        # entry["kind"] to route tail/add-to-slip requests to the right endpoint.
+        mp_rows = (await db.execute(
+            select(Parlay)
+            .where(Parlay.guild_id == _GUILD_ID(), Parlay.status == "PENDING", Parlay.is_public == True)  # noqa: E712
+            .order_by(Parlay.placed_at.desc())
+            .limit(15)
+        )).scalars().all()
+
+        for mp in mp_rows:
+            legs = (await db.execute(
+                select(Bet).where(Bet.parlay_id == mp.id).order_by(Bet.id)
+            )).scalars().all()
+            leg_markets = []
+            ok = True
+            for b in legs:
+                mkt = await db.get(Market, b.market_id)
+                if not mkt or mkt.status != "OPEN":
+                    ok = False
+                    break
+                leg_markets.append(mkt)
+            if not ok or len(leg_markets) < 2:
+                continue
+
+            owner = (await db.execute(
+                select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == mp.user_id)
+            )).scalar_one_or_none()
+            owner_name = owner.username if owner else "Member"
+            odds_list = [m.odds for m in leg_markets]
+
+            out.append({
+                "id": mp.id,
+                "kind": "member",
+                "name": mp.name or f"{owner_name}'s Parlay #{mp.id}",
+                "description": f"Tailing {owner_name}'s {len(leg_markets)}-leg parlay",
+                "difficulty": "MEMBER",
+                "source": "MEMBER",
+                "combined_odds": combined_american(odds_list),
+                "legs": [_market_dict(m) for m in leg_markets],
+            })
+
     return {"chips": db_user.chips, "templates": out}
 
 
@@ -801,7 +859,7 @@ async def tail_parlay(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
-    if await _betting_paused():
+    if await _paused():
         raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
@@ -879,6 +937,103 @@ async def add_template_to_slip(template_id: int, user: SessionUser = Depends(bea
 
         added, skipped = await add_markets_to_pending_slip(
             db, _GUILD_ID(), user.discord_id, tpl_markets
+        )
+        await db.commit()
+
+    if added == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't add any legs — they're already in your slip or conflict with what's there.",
+        )
+    message = f"Added {added} leg{'s' if added != 1 else ''} to your parlay slip."
+    if skipped:
+        message += f" Skipped {skipped} (already in slip or conflicting)."
+    return {"ok": True, "message": message, "added": added, "skipped": skipped}
+
+
+@router.post("/tail/parlay/{parlay_id}")
+async def tail_member_parlay(
+    parlay_id: int,
+    user: SessionUser = Depends(bearer_user),
+    wager: Annotated[int, Body(embed=True)] = 0,
+):
+    """Tail another member's public, still-pending parlay — lives in its own id
+    space from ParlayTemplate, hence the separate /tail/parlay/ route."""
+    if wager < 1:
+        raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if await _paused():
+        raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
+
+    async with get_db() as db:
+        source = await db.get(Parlay, parlay_id)
+        if not source or not source.is_public or source.status != "PENDING":
+            raise HTTPException(status_code=404, detail="Parlay not found or no longer available.")
+
+        db_user = await _get_or_create_user(db, user)
+
+        legs = (await db.execute(
+            select(Bet).where(Bet.parlay_id == parlay_id).order_by(Bet.id)
+        )).scalars().all()
+
+        leg_markets = []
+        for b in legs:
+            mkt = await db.get(Market, b.market_id)
+            if not mkt or mkt.status != "OPEN":
+                raise HTTPException(status_code=400, detail="One or more markets in this parlay are no longer open.")
+            leg_markets.append(mkt)
+
+        if len(leg_markets) < 2:
+            raise HTTPException(status_code=400, detail="Parlay has insufficient open markets.")
+        if db_user.chips < wager:
+            raise HTTPException(status_code=400, detail="Insufficient chips.")
+
+        odds_list = [m.odds for m in leg_markets]
+        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+
+        p = Parlay(
+            guild_id=_GUILD_ID(), user_id=user.discord_id, total_wager=wager, total_payout=total_payout,
+            status="PENDING", is_public=False,
+        )
+        db.add(p)
+        await db.flush()
+        for mkt in leg_markets:
+            db.add(Bet(
+                guild_id=_GUILD_ID(),
+                user_id=user.discord_id, parlay_id=p.id, market_id=mkt.id,
+                wager=wager, odds_at_placement=mkt.odds, payout_if_win=0, status="PENDING",
+            ))
+        db_user.chips -= wager
+        db_user.total_wagered += wager
+        await db.commit()
+        chips_left = db_user.chips
+
+    return {"ok": True, "total_payout": total_payout, "chips": chips_left,
+            "message": f"Parlay tailed! Potential payout: {total_payout:,} chips."}
+
+
+@router.post("/tail/parlay/{parlay_id}/add-to-slip")
+async def add_member_parlay_to_slip(parlay_id: int, user: SessionUser = Depends(bearer_user)):
+    """Copy a public member parlay's legs into the caller's own parlay slip so
+    they can edit it before submitting, instead of only being able to tail it."""
+    async with get_db() as db:
+        source = await db.get(Parlay, parlay_id)
+        if not source or not source.is_public or source.status != "PENDING":
+            raise HTTPException(status_code=404, detail="Parlay not found or no longer available.")
+
+        legs = (await db.execute(
+            select(Bet).where(Bet.parlay_id == parlay_id).order_by(Bet.id)
+        )).scalars().all()
+
+        leg_markets = []
+        for b in legs:
+            mkt = await db.get(Market, b.market_id)
+            if mkt and mkt.status == "OPEN":
+                leg_markets.append(mkt)
+        if not leg_markets:
+            raise HTTPException(status_code=400, detail="No open markets in this parlay to add.")
+
+        added, skipped = await add_markets_to_pending_slip(
+            db, _GUILD_ID(), user.discord_id, leg_markets
         )
         await db.commit()
 
