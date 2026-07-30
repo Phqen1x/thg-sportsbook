@@ -351,7 +351,7 @@ async def _migrate_schema() -> None:
             if prereaping_count == 0:
                 await conn.execute(text(
                     "INSERT OR IGNORE INTO betting_phases (name, description, sort_order) "
-                    "VALUES ('Pre-Reaping', 'Only District Victor markets are open — betting "
+                    "VALUES ('Pre-Reaping', 'Only District Futures markets are open — betting "
                     "before any tribute is reaped', -1)"
                 ))
 
@@ -420,6 +420,25 @@ async def _migrate_schema() -> None:
         ))
         await conn.execute(text(
             f"DELETE FROM market_templates WHERE type_key IN ({_removed_types})"
+        ))
+
+        # Rename the DISTRICT_VICTOR market type's display label from "District
+        # Victor" to "District Futures" on databases seeded before the rename.
+        await conn.execute(text(
+            "UPDATE market_templates SET name = 'District Futures' "
+            "WHERE type_key = 'DISTRICT_VICTOR' AND name = 'District Victor'"
+        ))
+        await conn.execute(text(
+            "UPDATE betting_phases SET description = "
+            "'Only District Futures markets are open — betting before any tribute is reaped' "
+            "WHERE name = 'Pre-Reaping' AND description = "
+            "'Only District Victor markets are open — betting before any tribute is reaped'"
+        ))
+        await conn.execute(text(
+            "UPDATE betting_phases SET description = "
+            "'Only District Futures and tribute score markets are open' "
+            "WHERE name = 'Pre-Games' AND description = "
+            "'Only District Victor and tribute score markets are open'"
         ))
 
         # Add alliance_id to modifier_assignments for alliance-scoped modifiers
@@ -617,7 +636,7 @@ _BUILTIN_MARKET_TYPES = [
     ("COMBINED_DISTRICT_SCORE", "Combined District Training Score",     "VERY_HARD", "Guess the combined training scores of both district tributes. Resolves when Pre-Games ends."),
     ("TRAINING_SCORE_OU",       "Training Score Over/Under",            "EASY",      "Bet over or under on a tribute's training score. Resolves when Pre-Games ends."),
     # ── District-level markets ─────────────────────────────────────────────────
-    ("DISTRICT_VICTOR",         "District Victor",                      "HARD",      "Bet on which district the victor will come from. Resolves at game end."),
+    ("DISTRICT_VICTOR",         "District Futures",                     "HARD",      "Bet on which district the victor will come from. Resolves at game end."),
     ("DISTRICT_KILLS_OU",       "District Total Kills Over/Under",      "MODERATE",  "Bet over or under on a district's combined kill total. Resolves at game end."),
     ("DISTRICT_BOTH_BLOODBATH", "District Both Survive Bloodbath",      "MODERATE",  "Both district tributes survive the opening bloodbath. Resolves when Bloodbath ends."),
     ("DISTRICT_BOTH_FINAL_8",   "District Both Make Final 8",           "HARD",      "Both district tributes are alive when the Final 8 phase begins."),
@@ -695,8 +714,8 @@ async def _seed_defaults() -> None:
         )
         if phase_count == 0:
             default_phases = [
-                ("Pre-Reaping",      "Only District Victor markets are open — betting before any tribute is reaped", -1),
-                ("Pre-Games",        "Only District Victor and tribute score markets are open", 0),
+                ("Pre-Reaping",      "Only District Futures markets are open — betting before any tribute is reaped", -1),
+                ("Pre-Games",        "Only District Futures and tribute score markets are open", 0),
                 ("Bloodbath",        "The initial cornucopia bloodbath — bloodbath markets open", 1),
                 ("Arena",            "The arena opens — all remaining markets go live",           2),
                 ("Sponsors Open",    "Sponsorship window opens — funded districts surge",         3),

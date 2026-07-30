@@ -74,7 +74,7 @@ def market_type_label(t: str) -> str:
         "TRIBUTE_KILLED_BLOODBATH":  "Bloodbath Kill",
         "KILLS_OU":                "Kills Over/Under",
         "PLACEMENT_OU":            "Placement Over/Under",
-        "DISTRICT_VICTOR":         "District Victor",
+        "DISTRICT_VICTOR":         "District Futures",
         "DISTRICT_KILLS_OU":       "District Kills O/U",
         "DISTRICT_BOTH_BLOODBATH":   "District Both Bloodbath",
         "DISTRICT_WIPED_BLOODBATH":  "District BB Wipe",

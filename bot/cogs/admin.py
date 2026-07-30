@@ -276,7 +276,7 @@ MARKET_TYPES = [
         name="Places Lower Than District Partner", value="PARTNER_PLACE_LOWER"
     ),
     # ── District-level markets ─────────────────────────────────────────────────
-    app_commands.Choice(name="District Victor", value="DISTRICT_VICTOR"),
+    app_commands.Choice(name="District Futures", value="DISTRICT_VICTOR"),
     app_commands.Choice(
         name="District Highest Combined Score", value="DISTRICT_HIGHEST_SCORE"
     ),

@@ -66,7 +66,7 @@ MARKET_TYPES = [
     ("GAMES_DURATION", "Games Duration (Days)"),
     ("GAMES_FEAST", "Games — Features a Feast"),
     ("GAMES_BETRAYAL", "Games — Features a Betrayal"),
-    ("DISTRICT_VICTOR", "District Victor"),
+    ("DISTRICT_VICTOR", "District Futures"),
     ("DISTRICT_KILLS_OU", "District Total Kills Over/Under"),
     ("DISTRICT_BOTH_BLOODBATH", "District Both Survive Bloodbath"),
     ("DISTRICT_BOTH_FINAL_8", "District Both Make Final 8"),

@@ -122,7 +122,7 @@ _TYPE_LABELS: dict[str, str] = {
     "GAMES_BETRAYAL":            "Games Features a Betrayal",
     "DISTRICT_PARTNER_KILL":     "District Partner Kill",
     # District markets
-    "DISTRICT_VICTOR":           "District Victor",
+    "DISTRICT_VICTOR":           "District Futures",
     "DISTRICT_KILLS_OU":         "District Kills Over/Under",
     "DISTRICT_BOTH_BLOODBATH":   "District Both Bloodbath",
     "DISTRICT_WIPED_BLOODBATH":  "District Wiped in Bloodbath",
