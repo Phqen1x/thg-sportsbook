@@ -229,13 +229,17 @@ def _build_board(
 
     elif mode == "district":
         victor = {m.placement_num: m.odds for m in markets if m.type == "DISTRICT_VICTOR"}
-        for d in sorted({t.district for t in tributes}):
+        # District moneylines can be open (Pre-Reaping) before any tribute has
+        # been reaped into a district, so the card list comes from the markets
+        # themselves rather than `tributes` — otherwise an empty roster means
+        # zero cards even though all 12 district odds are live.
+        for d in sorted(set(victor) | {t.district for t in tributes}):
             members = [t for t in tributes if t.district == d]
             cards.append(BoardCardData(
                 badge=f"D{d}",
                 name=f"District {d}",
                 odds=victor.get(d),
-                status=_group_status([t.status for t in members]),
+                status=_group_status([t.status for t in members]) if members else "PENDING",
                 sort_key=(d,),
             ))
 
@@ -538,10 +542,17 @@ class DisplayCog(commands.Cog):
         if not available:
             available = ["tribute"]
 
+        # Pre-Reaping only has DISTRICT_VICTOR markets open — some tributes may
+        # already be reaped (and thus have per-tribute markets seeded) before the
+        # phase advances to Pre-Games, so hide those modes rather than relying on
+        # `tributes`/`alliances` being empty.
+        if phase_name == "Pre-Reaping" and "district" in available:
+            available = ["district"]
+
         # Pregames default to the district board (the headline early-stage view);
         # individual tribute victor odds are open too and reachable via the toggle.
         # Every other phase defaults to the tribute board.
-        if phase_name == "Pre-Games" and "district" in available:
+        if phase_name in ("Pre-Reaping", "Pre-Games") and "district" in available:
             mode = "district"
         else:
             mode = "tribute" if "tribute" in available else available[0]
