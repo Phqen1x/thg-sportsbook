@@ -663,6 +663,38 @@ def _victor_conflict(existing_markets: list[Market], new_mkt: Market) -> str | N
     return None
 
 
+def _arena_side(m: Market) -> str | None:
+    """Which arena-nature outcome `m` is a bet FOR ("ARTIFICIAL"/"NATURAL"),
+    or None if `m` isn't an arena-nature market at all."""
+    if m.type == "ARENA_IS_ARTIFICIAL":
+        return "ARTIFICIAL"
+    if m.type == "ARENA_IS_NATURAL":
+        return "NATURAL"
+    if m.type == "ARENA_TYPE":
+        return m.cause
+    return None
+
+
+def _arena_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Disallow parlaying an artificial-arena bet with a natural-arena bet.
+
+    ARENA_TYPE (cause=ARTIFICIAL/NATURAL), ARENA_IS_ARTIFICIAL, and
+    ARENA_IS_NATURAL all resolve off the same single global arena-type
+    setting, so an artificial-side leg and a natural-side leg can never both
+    win — one guarantees the other loses.
+    """
+    new_side = _arena_side(new_mkt)
+    if new_side is None:
+        return None
+    if any(_arena_side(m) not in (None, new_side) for m in existing_markets):
+        return (
+            "You can't parlay an artificial-arena bet with a natural-arena bet — "
+            "the Games only has one arena, so betting both sides is a guaranteed "
+            "loser. Pick one arena type per parlay."
+        )
+    return None
+
+
 def _parlay_conflict(
     existing_markets: list[Market],
     new_mkt: Market,
@@ -686,6 +718,7 @@ def _parlay_conflict(
         or _partner_comparison_conflict(existing_markets, new_mkt)
         or _extreme_score_partner_conflict(existing_markets, new_mkt)
         or _victor_conflict(existing_markets, new_mkt)
+        or _arena_conflict(existing_markets, new_mkt)
     )
 
 
