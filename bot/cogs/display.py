@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import time
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from sqlalchemy import select, func, or_
 
-from bot.database.engine import get_session, get_read_session, get_setting, current_guild_id
+from bot.database.engine import (
+    get_session, get_read_session, get_setting, current_guild_id,
+    get_guild_setting, set_guild_setting, set_guild_context,
+)
 from bot.database.models import Alliance, Bet, BettingPhase, Market, MarketTemplate, Parlay, Tribute, User
 from bot.imaging.hot_odds import (
     BoardCardData, FeaturedMarket, TributeDetailData,
@@ -142,6 +147,21 @@ _MODE_BUTTON_LABELS = {
     "alliance": "Alliance Odds",
     "tribute":  "Tribute Odds",
 }
+
+# Default check cadence for the live odds-updates watcher (see
+# `/settings odds_updates`) when a guild hasn't customized it.
+DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES = 5
+
+
+def _decode_setting(raw: str | None, default=None):
+    """Decode a JSON-encoded guild-setting value, treating both "never set"
+    (``raw is None``) and "explicitly cleared" (stored as JSON ``null``) as
+    ``default`` — a bare ``if raw else default`` gets this wrong since the
+    string ``"null"`` is truthy."""
+    if raw is None:
+        return default
+    value = json.loads(raw)
+    return default if value is None else value
 # The headline moneyline shown as the board cards is excluded from each mode's
 # featured strip so the two halves never duplicate.
 _HEADLINE_TYPE = {
@@ -403,6 +423,106 @@ async def _leaderboard_rows(
 class DisplayCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        self._odds_watch_loop.start()
+
+    async def cog_unload(self) -> None:
+        self._odds_watch_loop.cancel()
+
+    # ── Live odds-updates watcher (see /settings odds_updates) ─────────────────
+    # Runs on a fixed 1-minute tick across every joined guild; each guild's own
+    # `odds_updates_interval_minutes` setting decides how often it's actually
+    # due, so different servers can run this at their own customized cadence
+    # off of one shared loop rather than needing a dynamic per-guild task.
+
+    @tasks.loop(minutes=1)
+    async def _odds_watch_loop(self) -> None:
+        for guild in list(self.bot.guilds):
+            try:
+                await self._check_odds_updates(guild)
+            except Exception:
+                log.exception(f"Odds-updates check failed for guild {guild.id}")
+
+    @_odds_watch_loop.before_loop
+    async def _before_odds_watch_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _check_odds_updates(self, guild: discord.Guild) -> None:
+        set_guild_context(guild.id)
+
+        channel_id = _decode_setting(await get_guild_setting(guild.id, "odds_updates_channel_id"))
+        if channel_id is None:
+            return
+        channel = self.bot.get_channel(channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return
+
+        interval_minutes = _decode_setting(
+            await get_guild_setting(guild.id, "odds_updates_interval_minutes"),
+            DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES,
+        )
+
+        last_checked = _decode_setting(await get_guild_setting(guild.id, "odds_updates_last_checked_at"), 0)
+        now = time.time()
+        if now - last_checked < interval_minutes * 60:
+            return
+        await set_guild_setting(guild.id, "odds_updates_last_checked_at", now)
+
+        async with get_session() as session:
+            tributes = list((await session.execute(
+                select(Tribute).order_by(Tribute.district)
+            )).scalars().all())
+            if not tributes:
+                return
+            alliances = list((await session.execute(
+                select(Alliance).order_by(Alliance.name)
+            )).scalars().all())
+            markets = list((await session.execute(
+                select(Market).where(Market.status == "OPEN").order_by(Market.id)
+            )).scalars().all())
+            bet_count_rows = await session.execute(
+                select(Bet.market_id, func.count(Bet.id).label("cnt"))
+                .where(Bet.parlay_id.is_(None))
+                .join(Market, Bet.market_id == Market.id)
+                .where(Market.status == "OPEN")
+                .where(Market.type != "TRIBUTE_WINS")
+                .group_by(Bet.market_id)
+            )
+            bet_counts = {row.market_id: row.cnt for row in bet_count_rows.all()}
+
+        cards, featured = _build_board("tribute", tributes, alliances, markets, bet_counts)
+
+        # Only the moneyline cards feed change-detection — the featured-markets
+        # panel is cosmetic context, not what "tribute odds board" refers to.
+        snapshot = hashlib.sha256(
+            "|".join(
+                f"{c.badge}:{c.name}:{c.odds}:{c.status}"
+                for c in sorted(cards, key=lambda c: c.sort_key)
+            ).encode()
+        ).hexdigest()
+
+        previous_hash = _decode_setting(await get_guild_setting(guild.id, "odds_updates_last_hash"))
+        await set_guild_setting(guild.id, "odds_updates_last_hash", snapshot)
+
+        # First check ever for this guild (no baseline yet) — record it
+        # silently rather than posting, since nothing has actually "changed".
+        if previous_hash is None or previous_hash == snapshot:
+            return
+
+        from bot.imaging.hot_odds import DEFAULT_ANNOUNCEMENT
+        ann_raw = await get_setting("capitol_announcement")
+        announcement = json.loads(ann_raw) if ann_raw else None
+        buf = await render_async(
+            render_hot_odds, cards, featured, 0,
+            _BOARD_TITLES["tribute"], _FEATURED_TITLES["tribute"],
+            announcement or DEFAULT_ANNOUNCEMENT,
+        )
+        f = buf_to_discord_file(buf, "hot_odds.png")
+        try:
+            await channel.send(content="📈 **The odds have moved!**", file=f)
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning(f"Failed to post odds update to channel {channel.id} in guild {guild.id}")
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError

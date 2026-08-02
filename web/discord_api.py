@@ -7,6 +7,12 @@ from web import config
 DISCORD_API = "https://discord.com/api/v10"
 
 
+def avatar_url(discord_id: int, avatar_hash: str | None) -> str:
+    if avatar_hash:
+        return f"https://cdn.discordapp.com/avatars/{discord_id}/{avatar_hash}.png"
+    return f"https://cdn.discordapp.com/embed/avatars/{discord_id % 5}.png"
+
+
 async def exchange_code(code: str) -> dict:
     async with httpx.AsyncClient() as c:
         r = await c.post(

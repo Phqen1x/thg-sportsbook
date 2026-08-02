@@ -141,21 +141,29 @@ const TABS = [
   ["tail", "Tail"],
 ];
 
+function tabLink([id, label], extraClass = "") {
+  return `<a href="${location.pathname}${location.search}#${id}" data-tab="${id}" class="${extraClass}">${label}</a>`;
+}
+
 function renderShell() {
+  const isAdmin = !!ME?.is_admin;
   const tabs = [...TABS];
-  if (ME?.is_admin) tabs.push(["admin", "Admin"]);
+  if (isAdmin) tabs.push(["admin", "Admin"]);
   document.getElementById("app").innerHTML = `
     <header class="topbar">
       <div class="brand"><img src="static/panem.png" alt="" class="brand-logo"> PANEM</div>
       <nav class="tabs" id="tabs">
-        ${tabs.map(([id, label]) =>
-          `<a href="${location.pathname}${location.search}#${id}" data-tab="${id}">${label}</a>`).join("")}
+        ${tabs.map((t) => tabLink(t)).join("")}
       </nav>
       <a href="${location.pathname}${location.search}#balance" class="me">
         <span id="balance" class="chips">${fmtChips(ME?.chips)} chips</span>
         <img class="avatar" src="${esc(ME?.avatar_url || "")}" alt="">
       </a>
     </header>
+    <nav class="tabs-grid" id="tabs-grid">
+      ${TABS.map((t) => tabLink(t)).join("")}
+      ${isAdmin ? tabLink(["admin", "Admin"], "tabs-grid-admin") : ""}
+    </nav>
     <main id="view" class="view"></main>`;
   window.addEventListener("hashchange", route);
 }
@@ -174,7 +182,7 @@ const VIEWS = {
 async function route() {
   let tab = (location.hash || "#markets").slice(1).split("/")[0];
   if (!VIEWS[tab] || (tab === "admin" && !ME?.is_admin)) tab = "markets";
-  document.querySelectorAll("#tabs a").forEach((a) =>
+  document.querySelectorAll("[data-tab]").forEach((a) =>
     a.classList.toggle("active", a.dataset.tab === tab));
   const view = $("#view");
   view.innerHTML = `<div class="loading-inline">Loading…</div>`;
@@ -253,18 +261,60 @@ const CATS = [
   { key: "props",    icon: "🎯",  label: "Props" },
 ];
 
+const MARKETS_PAGE_SIZE = 24;
+
 async function viewMarkets(view) {
-  const [marketsData, tailData, bannersData] = await Promise.all([
+  const [marketsData, tailData, bannersData, tributesData] = await Promise.all([
     api("/markets?status=open"),
     api("/tail").catch(() => ({ templates: [] })),
     api("/banners").catch(() => ({ banners: [] })),
+    api("/tributes").catch(() => ({ tributes: [] })),
   ]);
 
   const allMarkets = marketsData.markets;
   const templates  = tailData.templates || [];
   const banners    = bannersData.banners || [];
+  const tributes   = [...(tributesData.tributes || [])]
+    .sort((a, b) => a.district - b.district || a.name.localeCompare(b.name));
 
   view.innerHTML = `
+    <div class="filter-sort-bar">
+      <div class="cat-pills" id="cat-pills">
+        ${CATS.map((c) => `
+          <button class="cat-pill${c.key === "" ? " active" : ""}" data-cat="${esc(c.key)}">
+            <span class="cat-icon">${c.icon}</span>
+            <span class="cat-label">${c.label}</span>
+          </button>`).join("")}
+      </div>
+      <div class="tribute-filter" id="tribute-filter">
+        <button type="button" class="btn btn-outline btn-sm tribute-filter-btn" id="tribute-filter-btn">
+          Tributes <span class="tribute-filter-count" id="tribute-filter-count"></span> ▾
+        </button>
+        <div class="tribute-filter-menu" id="tribute-filter-menu" hidden>
+          <div class="tribute-filter-menu-actions">
+            <button type="button" class="link-btn" id="tribute-filter-clear">Clear</button>
+          </div>
+          <div class="tribute-filter-list" id="tribute-filter-list">
+            ${tributes.map((t) => `
+              <label class="tribute-filter-item">
+                <input type="checkbox" value="${t.id}">
+                <span>D${t.district} · ${esc(t.name)}</span>
+              </label>`).join("")}
+          </div>
+        </div>
+      </div>
+      <div class="sort-row">
+        <label class="sort-label" for="mkt-sort">Sort</label>
+        <select class="input sort-select" id="mkt-sort">
+          <option value="default">Default</option>
+          <option value="name">Name (A–Z)</option>
+          <option value="odds-fav">Odds: Favorites First</option>
+          <option value="odds-long">Odds: Longshots First</option>
+          <option value="popular">Most Bets</option>
+        </select>
+      </div>
+    </div>
+
     ${marketsData.phase_name
       ? `<div class="phase-banner">Phase: ${esc(marketsData.phase_name)}</div>`
       : ""}
@@ -272,14 +322,6 @@ async function viewMarkets(view) {
     <div class="home-search">
       <input class="home-search-input" id="mkt-search"
         placeholder="Search tributes, districts, alliances…" autocomplete="off" type="search">
-    </div>
-
-    <div class="cat-pills" id="cat-pills">
-      ${CATS.map((c) => `
-        <button class="cat-pill${c.key === "" ? " active" : ""}" data-cat="${esc(c.key)}">
-          <span class="cat-icon">${c.icon}</span>
-          <span class="cat-label">${c.label}</span>
-        </button>`).join("")}
     </div>
 
     ${banners.length ? `
@@ -298,11 +340,12 @@ async function viewMarkets(view) {
     <h2 class="section-title" id="mkts-heading">Open Markets</h2>
     <div class="list" id="market-list">
       ${allMarkets.length
-        ? allMarkets.map((m) => marketCard(m)).join("")
+        ? ""
         : marketsData.phase_name
           ? `<div class="empty">No open markets right now.</div>`
           : `<div class="empty">The Games haven't started yet — check back once an admin kicks things off.</div>`}
     </div>
+    <div class="pagination" id="market-pagination"></div>
 
     ${templates.length ? `
     <h2 class="section-title">Featured Parlays</h2>
@@ -313,40 +356,137 @@ async function viewMarkets(view) {
   bindMemberMarketActions(view);
   bindFeaturedParlayActions(view);
 
-  let activeCat = "";
-  let searchQ   = "";
+  let activeCat  = "";
+  let searchQ    = "";
+  let sortBy     = "default";
+  let page       = 1;
+  const selectedTributeIds = new Set();
 
-  function refilter() {
+  function sortMarkets(list) {
+    const arr = [...list];
+    if (sortBy === "name") arr.sort((a, b) => a.label.localeCompare(b.label));
+    else if (sortBy === "odds-fav") arr.sort((a, b) => (a.odds ?? Infinity) - (b.odds ?? Infinity));
+    else if (sortBy === "odds-long") arr.sort((a, b) => (b.odds ?? -Infinity) - (a.odds ?? -Infinity));
+    else if (sortBy === "popular") arr.sort((a, b) => (b.bet_count ?? 0) - (a.bet_count ?? 0));
+    return arr;
+  }
+
+  function matchesTributes(m) {
+    if (!selectedTributeIds.size) return true;
+    return selectedTributeIds.has(String(m.tribute_a_id)) || selectedTributeIds.has(String(m.tribute_b_id));
+  }
+
+  function computeFiltered() {
     const q = searchQ.toLowerCase();
-    const filtered = allMarkets.filter((m) => {
+    return sortMarkets(allMarkets.filter((m) => {
       if (!matchesCat(m, activeCat)) return false;
+      if (!matchesTributes(m)) return false;
       if (!q) return true;
       return (
         m.label.toLowerCase().includes(q) ||
         (m.tribute_a && m.tribute_a.toLowerCase().includes(q)) ||
         (m.tribute_b && m.tribute_b.toLowerCase().includes(q))
       );
-    });
+    }));
+  }
+
+  // Re-renders the current page from the current filter/sort/search state.
+  // Filtering/sorting always runs over the full market set first, so search
+  // results and filtered/sorted lists page exactly like the unfiltered list.
+  function renderMarketsPage() {
+    if (!allMarkets.length) return; // static empty-state markup already in place
+    const filtered = computeFiltered();
+    const totalPages = Math.max(1, Math.ceil(filtered.length / MARKETS_PAGE_SIZE));
+    page = Math.min(Math.max(page, 1), totalPages);
+    const start = (page - 1) * MARKETS_PAGE_SIZE;
+    const pageItems = filtered.slice(start, start + MARKETS_PAGE_SIZE);
+
     const listEl = $("#market-list", view);
     const heading = $("#mkts-heading", view);
     if (heading) heading.textContent = `Open Markets${filtered.length !== allMarkets.length ? ` (${filtered.length})` : ""}`;
-    listEl.innerHTML = filtered.length
-      ? filtered.map((m) => marketCard(m)).join("")
+    listEl.innerHTML = pageItems.length
+      ? pageItems.map((m) => marketCard(m)).join("")
       : `<div class="empty">No markets match.</div>`;
     bindMemberMarketActions(view);
+    renderPagination(totalPages);
   }
 
+  function renderPagination(totalPages) {
+    const el = $("#market-pagination", view);
+    if (!el) return;
+    if (totalPages <= 1) { el.innerHTML = ""; return; }
+    el.innerHTML = `
+      <button type="button" class="btn btn-outline btn-sm" id="mkt-prev"${page <= 1 ? " disabled" : ""}>Prev</button>
+      <span class="pagination-info">Page
+        <input type="number" class="pagination-page-input" id="mkt-page-input" min="1" max="${totalPages}" value="${page}">
+        of ${totalPages}
+      </span>
+      <button type="button" class="btn btn-outline btn-sm" id="mkt-next"${page >= totalPages ? " disabled" : ""}>Next</button>`;
+    $("#mkt-prev", el).addEventListener("click", () => { page--; renderMarketsPage(); });
+    $("#mkt-next", el).addEventListener("click", () => { page++; renderMarketsPage(); });
+    $("#mkt-page-input", el).addEventListener("change", (e) => {
+      const v = parseInt(e.target.value, 10);
+      page = Number.isFinite(v) ? v : 1;
+      renderMarketsPage();
+    });
+  }
+
+  // Any change to filter/search/sort/tribute selection invalidates the
+  // current page, so jump back to page 1; Prev/Next/page-input leave it alone.
+  function applyFilters() { page = 1; renderMarketsPage(); }
+
+  renderMarketsPage();
+
   const searchEl = $("#mkt-search", view);
-  searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); refilter(); });
+  searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); applyFilters(); });
+
+  const sortEl = $("#mkt-sort", view);
+  sortEl.addEventListener("change", () => { sortBy = sortEl.value; applyFilters(); });
 
   view.querySelectorAll(".cat-pill").forEach((pill) =>
     pill.addEventListener("click", () => {
       view.querySelectorAll(".cat-pill").forEach((p) => p.classList.remove("active"));
       pill.classList.add("active");
       activeCat = pill.dataset.cat;
-      refilter();
+      applyFilters();
     }));
+
+  // Tribute picker: multi-select dropdown, "select all that apply".
+  const tributeBtn   = $("#tribute-filter-btn", view);
+  const tributeMenu  = $("#tribute-filter-menu", view);
+  const tributeCount = $("#tribute-filter-count", view);
+  const tributeClear = $("#tribute-filter-clear", view);
+
+  if (tributeBtn) {
+    tributeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      tributeMenu.hidden = !tributeMenu.hidden;
+    });
+  }
+  view.querySelectorAll('.tribute-filter-item input[type="checkbox"]').forEach((cb) =>
+    cb.addEventListener("change", () => {
+      if (cb.checked) selectedTributeIds.add(cb.value); else selectedTributeIds.delete(cb.value);
+      tributeCount.textContent = selectedTributeIds.size ? `(${selectedTributeIds.size})` : "";
+      applyFilters();
+    }));
+  if (tributeClear) {
+    tributeClear.addEventListener("click", () => {
+      selectedTributeIds.clear();
+      view.querySelectorAll('.tribute-filter-item input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
+      tributeCount.textContent = "";
+      applyFilters();
+    });
+  }
 }
+
+// Closes the tribute picker dropdown when clicking outside it. Bound once at
+// module scope (not per viewMarkets() render) since the elements only exist
+// while the Markets tab is mounted — the lookups simply no-op on other tabs.
+document.addEventListener("click", (e) => {
+  const menu = document.getElementById("tribute-filter-menu");
+  const wrap = document.getElementById("tribute-filter");
+  if (menu && !menu.hidden && wrap && !wrap.contains(e.target)) menu.hidden = true;
+});
 
 function tailPath(t) {
   return t.kind === "member" ? `/tail/parlay/${t.id}` : `/tail/${t.id}`;
@@ -402,27 +542,50 @@ function bindMemberMarketActions(view) {
 
 // ── Views: Tributes ────────────────────────────────────────────────────────────
 
+function tributeStatCells(t) {
+  const stats = [
+    ["Training", t.training_score != null ? String(t.training_score) : "—"],
+    ["Kills", String(t.kills ?? 0)],
+    ["Alliance", t.alliance ? esc(t.alliance) : "—"],
+  ];
+  if (t.placement != null) stats.push(["Placement", `#${t.placement}`]);
+  return stats.map(([label, value]) => `
+    <div class="tribute-stat">
+      <span class="tribute-stat-label">${label}</span>
+      <span class="tribute-stat-value">${value}</span>
+    </div>`).join("");
+}
+
+// Shown at its natural aspect ratio (width:100%, height:auto — no cropping)
+// so the card just grows to fit whatever image is provided, rather than
+// squeezing a portrait photo into a small fixed-size thumbnail. Omitted
+// entirely when no face claim is set, so undecorated tributes stay compact.
+function tributePortrait(t) {
+  if (!t.face_claim) return "";
+  return `<img class="tribute-portrait" src="${esc(t.face_claim)}" alt="" loading="lazy" onerror="this.remove()">`;
+}
+
 async function viewTributes(view) {
   const { tributes } = await api("/tributes");
   view.innerHTML = `
-    <div class="grid">
+    <div class="grid tribute-grid">
       ${tributes.map((t) => `
         <div class="card tribute-card status-edge-${esc(t.status.toLowerCase())}">
           <div class="tribute-head">
             <span class="district">D${t.district}</span>
             <span class="status status-${esc(t.status.toLowerCase())}">${esc(t.status)}</span>
           </div>
-          <div class="tribute-name">${esc(t.name)} <span class="dim">${esc(t.gender)}</span></div>
-          <div class="tribute-stats dim">
-            ${t.training_score != null ? `Training ${t.training_score}` : ""}
-            ${t.kills ? `· ${t.kills} kills` : ""}
-            ${t.alliance ? `· ${esc(t.alliance)}` : ""}
+          ${tributePortrait(t)}
+          <div class="tribute-content">
+            <div class="tribute-name">${esc(t.name)}</div>
+            <div class="dim tribute-sub">${esc(t.gender)}${t.age != null ? ` · Age ${t.age}` : ""}</div>
+            <div class="tribute-stat-grid">${tributeStatCells(t)}</div>
+            ${t.win_market_id && t.status === "ALIVE" ? `
+              <div class="tribute-bet">
+                <span class="${oddsClass(t.win_odds)}">${fmtOdds(t.win_odds)} to win</span>
+                <button class="btn btn-primary btn-sm" data-act="bet" data-id="${t.win_market_id}">Bet</button>
+              </div>` : ""}
           </div>
-          ${t.win_market_id && t.status === "ALIVE" ? `
-            <div class="tribute-bet">
-              <span class="${oddsClass(t.win_odds)}">${fmtOdds(t.win_odds)} to win</span>
-              <button class="btn btn-primary btn-sm" data-act="bet" data-id="${t.win_market_id}">Bet</button>
-            </div>` : ""}
         </div>`).join("")}
     </div>`;
   bindMemberMarketActions(view);
@@ -523,9 +686,10 @@ async function viewParlay(view) {
         <div class="card parlay-submit">
           <input id="parlay-wager" type="number" min="1" placeholder="Wager (chips)" class="input">
           <div class="modal-payout dim" id="parlay-payout"></div>
-          <label class="checkbox"><input type="checkbox" id="parlay-public"> List on tail board</label>
+          <label class="checkbox"><input type="checkbox" id="parlay-public" checked> List on tail board</label>
           <div class="row-buttons">
             <button class="btn btn-primary" id="parlay-go">Submit Parlay</button>
+            ${ME?.is_admin ? `<button class="btn btn-outline" id="parlay-feature">Feature Parlay</button>` : ""}
             <button class="btn btn-outline" id="parlay-clear">Clear</button>
           </div>
         </div>` : (legs.length ? `<button class="btn btn-outline" id="parlay-clear">Clear slip</button>` : "")}
@@ -535,6 +699,8 @@ async function viewParlay(view) {
     b.addEventListener("click", () => doAction(`/parlay/remove/${b.dataset.id}`, "POST")));
   const clear = $("#parlay-clear", view);
   if (clear) clear.addEventListener("click", () => doAction("/parlay/clear", "POST"));
+  const feature = $("#parlay-feature", view);
+  if (feature) feature.addEventListener("click", () => openFeatureParlayModal());
   const wagerEl = $("#parlay-wager", view);
   if (wagerEl && data.combined_odds != null) {
     wagerEl.addEventListener("input", () => {
@@ -666,6 +832,7 @@ async function viewAdmin(view) {
       <a href="${base}#admin/chips"    class="${sub === "chips"    ? "active" : ""}">Chips</a>
       <a href="${base}#admin/tributes" class="${sub === "tributes" ? "active" : ""}">Tributes</a>
       <a href="${base}#admin/banners"  class="${sub === "banners"  ? "active" : ""}">Banners</a>
+      <a href="${base}#admin/parlays"  class="${sub === "parlays"  ? "active" : ""}">Parlays</a>
     </div>
     <div id="admin-body"><div class="loading-inline">Loading…</div></div>`;
   const startBtn = $("#admin-start-game", view);
@@ -679,6 +846,7 @@ async function viewAdmin(view) {
   if (sub === "chips")    return adminChips(body);
   if (sub === "tributes") return adminTributes(body);
   if (sub === "banners")  return adminBanners(body);
+  if (sub === "parlays")  return adminParlays(body);
   return adminMarkets(body);
 }
 
@@ -780,23 +948,27 @@ async function adminChips(body) {
 
 async function adminTributes(body) {
   const { tributes } = await api("/tributes");
-  body.innerHTML = `<div class="grid">
+  body.innerHTML = `<div class="grid tribute-grid">
     ${tributes.map((t) => `
       <div class="card tribute-card status-edge-${esc(t.status.toLowerCase())}">
         <div class="tribute-head">
           <span class="district">D${t.district}</span>
           <span class="status status-${esc(t.status.toLowerCase())}">${esc(t.status)}</span>
         </div>
-        <div class="tribute-name">${esc(t.name)} <span class="dim">${esc(t.gender)}</span></div>
-        ${t.status === "ALIVE" ? `
-          <div class="row-buttons">
-            <button class="btn btn-outline btn-sm" data-act="kill"   data-id="${t.id}" data-name="${esc(t.name)}">Eliminate</button>
-            <button class="btn btn-primary btn-sm" data-act="victor" data-id="${t.id}" data-name="${esc(t.name)}">Victor</button>
-          </div>` : ""}
-        ${t.status === "DEAD" ? `
-          <div class="row-buttons">
-            <button class="btn btn-outline btn-sm" data-act="unkill" data-id="${t.id}" data-name="${esc(t.name)}">Unkill</button>
-          </div>` : ""}
+        ${tributePortrait(t)}
+        <div class="tribute-content">
+          <div class="tribute-name">${esc(t.name)}</div>
+          <div class="dim tribute-sub">${esc(t.gender)}${t.age != null ? ` · Age ${t.age}` : ""}</div>
+          ${t.status === "ALIVE" ? `
+            <div class="row-buttons">
+              <button class="btn btn-outline btn-sm" data-act="kill"   data-id="${t.id}" data-name="${esc(t.name)}">Eliminate</button>
+              <button class="btn btn-primary btn-sm" data-act="victor" data-id="${t.id}" data-name="${esc(t.name)}">Victor</button>
+            </div>` : ""}
+          ${t.status === "DEAD" ? `
+            <div class="row-buttons">
+              <button class="btn btn-outline btn-sm" data-act="unkill" data-id="${t.id}" data-name="${esc(t.name)}">Unkill</button>
+            </div>` : ""}
+        </div>
       </div>`).join("")}
   </div>`;
   body.querySelectorAll('[data-act="kill"]').forEach((b) =>
@@ -864,6 +1036,106 @@ async function adminBanners(body) {
     }));
 }
 
+async function adminParlays(body) {
+  const [{ templates }, openData] = await Promise.all([
+    api("/admin/parlays"),
+    api("/markets?status=open"),
+  ]);
+  const openMarkets = openData.markets;
+
+  body.innerHTML = `
+    <div class="card admin-form" id="parlay-form">
+      <div class="card-label">CREATE FEATURED PARLAY</div>
+      <input id="p-name" class="input" placeholder="Name (required)" maxlength="100">
+      <input id="p-desc" class="input" placeholder="Description (optional)" maxlength="500">
+      <button class="btn btn-primary" id="p-add">Create Template</button>
+    </div>
+    <div class="list" id="parlay-list">
+      ${templates.length ? templates.map((t) => `
+        <div class="card tail-card">
+          <div class="tail-head">
+            <span class="tail-name">${esc(t.name)}</span>
+            ${t.difficulty ? `<span class="badge">${esc(t.difficulty)}</span>` : ""}
+            <span class="status ${t.active ? "status-open" : "status-closed"}">${t.active ? "ACTIVE" : "INACTIVE"}</span>
+          </div>
+          ${t.description ? `<div class="dim">${esc(t.description)}</div>` : ""}
+          <ul class="parlay-legs">
+            ${t.legs.length ? t.legs.map((l) => `
+              <li>
+                <span>${esc(l.label)}</span>
+                <span class="${oddsClass(l.odds)}">${fmtOdds(l.odds)}</span>
+                <button class="btn btn-outline btn-sm" data-act="p-remove-leg" data-tpl="${t.id}" data-leg="${l.leg_id}" style="margin-left:auto">Remove</button>
+              </li>`).join("") : `<li class="dim">No legs yet — add one below.</li>`}
+          </ul>
+          <div class="row-buttons">
+            <select class="input p-leg-picker" data-tpl="${t.id}" style="flex:1;min-width:140px">
+              <option value="">Add a market as a leg…</option>
+              ${openMarkets.filter((m) => !t.legs.some((l) => l.market_id === m.id)).map((m) => `
+                <option value="${m.id}">${esc(m.label)} (${fmtOdds(m.odds)})</option>`).join("")}
+            </select>
+            <button class="btn btn-outline btn-sm" data-act="p-add-leg" data-tpl="${t.id}">Add Leg</button>
+          </div>
+          <div class="row-buttons">
+            <span class="${oddsClass(t.combined_odds)}" style="flex:1;align-self:center;font-weight:700">${t.combined_odds == null ? "—" : fmtOdds(t.combined_odds)}</span>
+            <button class="btn btn-outline btn-sm" data-act="p-toggle" data-tpl="${t.id}">${t.active ? "Deactivate" : "Activate"}</button>
+            <button class="btn btn-outline btn-sm" data-act="p-delete" data-tpl="${t.id}">Delete</button>
+          </div>
+        </div>`).join("") : `<div class="empty">No featured parlays yet — create one above.</div>`}
+    </div>`;
+
+  $("#p-add", body).addEventListener("click", async () => {
+    const name = $("#p-name", body).value.trim();
+    const description = $("#p-desc", body).value.trim();
+    if (!name) return toast("Name is required.", "error");
+    try {
+      const r = await api("/admin/parlays/create", { method: "POST", body: { name, description } });
+      toast(r.message);
+      adminParlays(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  body.querySelectorAll('[data-act="p-add-leg"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const tplId = btn.dataset.tpl;
+      const picker = body.querySelector(`.p-leg-picker[data-tpl="${tplId}"]`);
+      const marketId = picker ? Number(picker.value) : 0;
+      if (!marketId) return toast("Pick a market first.", "error");
+      try {
+        const r = await api(`/admin/parlays/${tplId}/add-leg`, { method: "POST", body: { market_id: marketId } });
+        toast(r.message);
+        adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
+  body.querySelectorAll('[data-act="p-remove-leg"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/parlays/${btn.dataset.tpl}/remove-leg`, { method: "POST", body: { leg_id: Number(btn.dataset.leg) } });
+        toast(r.message);
+        adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
+  body.querySelectorAll('[data-act="p-toggle"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/parlays/${btn.dataset.tpl}/toggle`, { method: "POST" });
+        toast(r.message);
+        adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
+  body.querySelectorAll('[data-act="p-delete"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      if (!confirm("Delete this featured parlay template? This can't be undone.")) return;
+      try {
+        const r = await api(`/admin/parlays/${btn.dataset.tpl}`, { method: "DELETE" });
+        toast(r.message);
+        adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+}
+
 // ── Generic helpers / modals ───────────────────────────────────────────────────
 
 async function doAction(path, method = "POST", body) {
@@ -911,6 +1183,30 @@ async function openBetModal(marketId) {
       toast(r.message);
       overlay.remove();
       await refreshMe();
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+
+function openFeatureParlayModal() {
+  const overlay = modal(`
+    <h3>Feature Parlay</h3>
+    <div class="dim">Turns your current slip into a no-wager GM parlay on the tail board and clears your slip.</div>
+    <input id="feature-name" class="input" type="text" maxlength="100" placeholder="Name (required)">
+    <textarea id="feature-desc" class="input" maxlength="500" placeholder="Description (optional)"></textarea>
+    <div class="row-buttons">
+      <button class="btn btn-primary" id="feature-go">Feature</button>
+      <button class="btn btn-outline" id="feature-cancel">Cancel</button>
+    </div>`);
+  $("#feature-cancel", overlay).addEventListener("click", () => overlay.remove());
+  $("#feature-go", overlay).addEventListener("click", async () => {
+    const name = $("#feature-name", overlay).value.trim();
+    const description = $("#feature-desc", overlay).value.trim();
+    if (!name) return toast("Enter a name for the featured parlay.", "error");
+    try {
+      const r = await api("/parlay/feature", { method: "POST", body: { name, description } });
+      toast(r.message);
+      overlay.remove();
+      location.hash = "#tail";
     } catch (e) { toast(e.message, "error"); }
   });
 }

@@ -26,7 +26,29 @@ def _parlay_flavor(
     fallback_name: str,
     fallback_desc: str | None,
 ) -> tuple[str, str | None]:
-    """Generate a fun, data-driven title + description for a featured parlay."""
+    """Fill in a data-driven description when a featured parlay doesn't already
+    have one. The creator's name is never overridden, and an existing
+    description is always left as-is — this only generates flavor text as a
+    fallback for templates that were saved without one."""
+    if fallback_desc:
+        return (fallback_name, fallback_desc)
+    _, desc = _generate_parlay_flavor(
+        markets, tributes_map, alliance_names, district_records, fallback_name, fallback_desc,
+    )
+    return (fallback_name, desc)
+
+
+def _generate_parlay_flavor(
+    markets: list,
+    tributes_map: dict,
+    alliance_names: dict,
+    district_records: dict,
+    fallback_name: str,
+    fallback_desc: str | None,
+) -> tuple[str, str | None]:
+    """Generate a fun, data-driven title + description for a featured parlay.
+    Internal helper for _parlay_flavor — only reached when there's no
+    creator-provided description to preserve."""
     tid_set: set[int] = set()
     for m in markets:
         if m.tribute_a_id:
@@ -413,6 +435,15 @@ async def markets(
             )).scalars().all()
             tributes_map = {t.id: t for t in t_rows}
 
+        # Full tribute roster for the tribute-filter picker (independent of which
+        # tributes have markets right now) — embedded as JSON for the page's JS.
+        all_tributes_raw = (await db.execute(
+            select(Tribute).order_by(Tribute.district, Tribute.name)
+        )).scalars().all()
+        all_tributes_json = json.dumps(
+            [{"id": t.id, "name": t.name, "district": t.district} for t in all_tributes_raw]
+        ).replace("<", "\\u003c")
+
         # Bet counts per market (for display)
         bet_counts_raw = (await db.execute(
             select(Bet.market_id, func.count(Bet.id)).group_by(Bet.market_id)
@@ -483,6 +514,7 @@ async def markets(
         "user": user,
         "markets": markets_list,
         "tributes_map": tributes_map,
+        "all_tributes_json": all_tributes_json,
         "bet_counts": bet_counts,
         "status": status,
         "type_filter": type_filter,

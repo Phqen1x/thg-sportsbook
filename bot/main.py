@@ -43,9 +43,16 @@ def _install_component_guild_context() -> None:
     to the contextvar default 0 (sportsbook_0.db). Wrap those task entry points
     to stamp the guild context in the same task that runs the callback — and,
     while we're already intercepting every component/modal interaction here,
-    also block Tribute-locked users from buttons, selects, and modal submits."""
+    also block Tribute-locked users from buttons, selects, and modal submits.
+
+    Persistent DynamicItem buttons (see bot/utils/action_views.py) are dispatched
+    through a separate path — ViewStore.schedule_dynamic_item_call, which calls
+    factory.from_custom_id() and item.callback() directly — bypassing
+    View._scheduled_task entirely, so it needs the same treatment or those
+    callbacks hit "No guild context set" and Discord shows a timeout."""
     _orig_view_task = discord.ui.View._scheduled_task
     _orig_modal_task = discord.ui.Modal._scheduled_task
+    _orig_dynamic_item_call = discord.ui.view.ViewStore.schedule_dynamic_item_call
 
     async def _view_task(self, item, interaction):
         set_guild_context(interaction.guild_id or 0)
@@ -59,8 +66,15 @@ def _install_component_guild_context() -> None:
             return
         return await _orig_modal_task(self, interaction, *args, **kwargs)
 
+    async def _dynamic_item_call(self, component_type, factory, interaction, custom_id, match):
+        set_guild_context(interaction.guild_id or 0)
+        if await _reject_if_tribute_locked(interaction):
+            return
+        return await _orig_dynamic_item_call(self, component_type, factory, interaction, custom_id, match)
+
     discord.ui.View._scheduled_task = _view_task
     discord.ui.Modal._scheduled_task = _modal_task
+    discord.ui.view.ViewStore.schedule_dynamic_item_call = _dynamic_item_call
 
 
 class SportsBookCommandTree(app_commands.CommandTree):
@@ -107,6 +121,9 @@ class SportsBookBot(commands.Bot):
         _install_component_guild_context()
 
     async def setup_hook(self) -> None:
+        from bot.utils.action_views import BlockToggleButton, RequestDoneButton
+        self.add_dynamic_items(BlockToggleButton, RequestDoneButton)
+
         log.info("Loading cogs...")
         await self.load_extension("bot.cogs.admin")
         await self.load_extension("bot.cogs.betting")

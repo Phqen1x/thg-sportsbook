@@ -100,6 +100,7 @@ from bot.cogs.betting import (
     tribute_lookup_for_markets,
     PARLAY_PAYOUT_CAP,
 )
+from bot.cogs.display import DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES
 
 log = logging.getLogger("capitol.admin")
 
@@ -120,7 +121,36 @@ async def _collect_notifications() -> AsyncGenerator[list[dict], None]:
         _notif_buffer.reset(token)
 
 
+async def _post_win_logs(bot: commands.Bot, notifications: list[dict]) -> None:
+    """Logs every resolved WON straight bet / parlay to the log channel — a
+    single hook covering all resolution call sites (market resolution, arena
+    reveal, phase advance, etc.) since they all funnel notifications through
+    here rather than the log call being duplicated at each one."""
+    from bot.database.engine import current_guild_id
+    from bot.utils.audit import post_win_log
+
+    guild_id = current_guild_id()
+    for notif in notifications:
+        if notif.get("status") != "WON":
+            continue
+        try:
+            if notif["type"] == "straight":
+                await post_win_log(
+                    bot, guild_id, notif["user_id"], "BET",
+                    [notif["market_label"]], notif["wager"], notif["payout"],
+                )
+            elif notif["type"] == "parlay":
+                markets = [leg["market_label"] for leg in notif["legs"]]
+                await post_win_log(
+                    bot, guild_id, notif["user_id"], "PARLAY",
+                    markets, notif["wager"], notif["payout"],
+                )
+        except Exception:
+            log.exception("Failed to post win log for user %s", notif.get("user_id"))
+
+
 async def _send_resolution_dms(bot: commands.Bot, notifications: list[dict]) -> None:
+    await _post_win_logs(bot, notifications)
     for notif in notifications:
         try:
             user = bot.get_user(notif["user_id"]) or await bot.fetch_user(
@@ -5043,6 +5073,9 @@ class AdminCog(commands.Cog):
     stats = app_commands.Group(
         name="stats", description="Live running-game statistics", parent=admin
     )
+    user = app_commands.Group(
+        name="user", description="Look up a member's sportsbook profile", parent=admin
+    )
     settings = app_commands.Group(
         name="settings",
         description="Bot settings",
@@ -9405,6 +9438,7 @@ class AdminCog(commands.Cog):
                         template_id=tpl.id, market_id=leg.market_id, sort_order=i
                     )
                 )
+                await session.delete(leg)
             tpl_id = tpl.id
             count = len(legs)
         await interaction.followup.send(
@@ -10987,11 +11021,36 @@ class AdminCog(commands.Cog):
         )
 
     @settings.command(
-        name="chips_reset", description="Reset ALL users to the default chip balance"
+        name="stats_reset",
+        description="Reset a user's wagered/won totals (their ROI), leaving chips untouched",
     )
+    @app_commands.describe(user="User whose betting stats should be reset")
     @is_admin()
-    async def chips_reset(self, interaction: discord.Interaction) -> None:
+    async def stats_reset(
+        self, interaction: discord.Interaction, user: discord.Member
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            u = await _get_or_create_user(session, user, current_guild_id())
+            u.total_wagered = 0
+            u.total_won = 0
+
+        await interaction.followup.send(
+            f"Reset {user.mention}'s ROI stats (total wagered and total won set to 0).",
+            ephemeral=True,
+        )
+
+    @settings.command(
+        name="chips_reset", description="DANGER: Reset ALL users to the default chip balance"
+    )
+    @app_commands.describe(confirm="Type 'yes' to confirm resetting everyone's chips")
+    @is_admin()
+    async def chips_reset(self, interaction: discord.Interaction, confirm: str) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        if confirm.lower() != "yes":
+            await interaction.followup.send("Chip reset cancelled.", ephemeral=True)
             return
         default = json.loads(await get_setting("default_chips") or "1000")
         async with get_session() as session:
@@ -11129,6 +11188,201 @@ class AdminCog(commands.Cog):
             f"Withdraw/deposit requests will now be posted in {channel.mention}.",
             ephemeral=True,
         )
+
+    @settings.command(
+        name="withdraw_ping",
+        description="Optionally ping a role or member whenever a /withdraw or /deposit request is posted",
+    )
+    @app_commands.describe(
+        role="Role to ping on each request (leave both empty to clear)",
+        user="Member to ping on each request (leave both empty to clear)",
+    )
+    @is_admin()
+    async def withdraw_ping(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role | None = None,
+        user: discord.Member | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.database.engine import set_guild_setting
+
+        if role is None and user is None:
+            await set_guild_setting(current_guild_id(), "withdraw_ping_role_id", None)
+            await set_guild_setting(current_guild_id(), "withdraw_ping_user_id", None)
+            await interaction.followup.send(
+                "Cleared the withdraw/deposit ping. Requests will no longer ping anyone.",
+                ephemeral=True,
+            )
+            return
+        # A request has exactly one target: setting one clears the other.
+        await set_guild_setting(current_guild_id(), "withdraw_ping_role_id", role.id if role else None)
+        await set_guild_setting(current_guild_id(), "withdraw_ping_user_id", user.id if user else None)
+        target = role.mention if role else user.mention
+        await interaction.followup.send(
+            f"Withdraw/deposit requests will now ping {target}.",
+            ephemeral=True,
+        )
+
+    @settings.command(
+        name="big_win_threshold",
+        description="Set the payout amount that triggers an admin-role ping on a win log",
+    )
+    @app_commands.describe(amount="Payout threshold in chips (default 500,000)")
+    @is_admin()
+    async def big_win_threshold(
+        self,
+        interaction: discord.Interaction,
+        amount: app_commands.Range[int, 1, 100_000_000],
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.database.engine import set_guild_setting
+
+        await set_guild_setting(current_guild_id(), "big_win_threshold", amount)
+        await interaction.followup.send(
+            f"Big-win alerts now trigger at payouts of **{fmt_chips(amount)}** or more.",
+            ephemeral=True,
+        )
+
+    @settings.command(
+        name="odds_updates",
+        description="Post live Tribute Odds board updates to a channel whenever the odds change",
+    )
+    @app_commands.describe(
+        channel="Channel to post odds updates in (leave empty to disable)",
+        interval_minutes=f"How often to check for changes, in minutes (default {DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES})",
+    )
+    @is_admin()
+    async def odds_updates(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+        interval_minutes: app_commands.Range[int, 1, 1440] | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.database.engine import set_guild_setting
+
+        gid = current_guild_id()
+        if channel is None:
+            await set_guild_setting(gid, "odds_updates_channel_id", None)
+            await interaction.followup.send(
+                "Cleared the odds-updates channel. Live Tribute Odds updates are now disabled.",
+                ephemeral=True,
+            )
+            return
+
+        interval = interval_minutes or DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES
+        await set_guild_setting(gid, "odds_updates_channel_id", channel.id)
+        await set_guild_setting(gid, "odds_updates_interval_minutes", interval)
+        # Reset change-detection state so the next check establishes a fresh
+        # baseline against the current board instead of comparing against
+        # whatever was tracked before this (re)configuration.
+        await set_guild_setting(gid, "odds_updates_last_hash", None)
+        await set_guild_setting(gid, "odds_updates_last_checked_at", None)
+
+        await interaction.followup.send(
+            f"Live Tribute Odds updates will now post to {channel.mention} whenever the "
+            f"board changes, checked every **{interval}** minute(s).",
+            ephemeral=True,
+        )
+
+    @user.command(
+        name="profile",
+        description="View a member's entire bet/parlay history, balance, and stats",
+    )
+    @app_commands.describe(member="Member to look up")
+    @is_admin()
+    async def user_profile(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+
+        from bot.imaging.my_bets import BetRowData, ParlayData, render_my_bets
+        from bot.utils.restrictions import is_fully_restricted
+
+        guild_id = current_guild_id()
+        async with get_read_session() as session:
+            db_user = await session.get(User, (guild_id, member.id))
+
+            straight_result = await session.execute(
+                select(Bet)
+                .where(Bet.guild_id == guild_id, Bet.user_id == member.id, Bet.parlay_id == None)
+                .order_by(Bet.placed_at.desc())
+            )
+            straight_bets_orm = straight_result.scalars().all()
+
+            parlay_result = await session.execute(
+                select(Parlay)
+                .where(Parlay.guild_id == guild_id, Parlay.user_id == member.id)
+                .order_by(Parlay.placed_at.desc())
+            )
+            parlays_orm = parlay_result.scalars().all()
+
+            straight_rows: list[BetRowData] = []
+            for b in straight_bets_orm:
+                mkt = await session.get(Market, b.market_id)
+                straight_rows.append(BetRowData(
+                    bet_id=b.id,
+                    market_label=mkt.label if mkt else f"Market #{b.market_id}",
+                    wager=b.wager,
+                    odds=b.odds_at_placement,
+                    payout=b.payout_if_win,
+                    status=b.status,
+                ))
+
+            parlay_data: list[ParlayData] = []
+            for p in parlays_orm:
+                legs_result = await session.execute(
+                    select(Bet).where(Bet.parlay_id == p.id).order_by(Bet.placed_at)
+                )
+                leg_rows: list[BetRowData] = []
+                for b in legs_result.scalars().all():
+                    mkt = await session.get(Market, b.market_id)
+                    leg_rows.append(BetRowData(
+                        bet_id=b.id,
+                        market_label=mkt.label if mkt else f"Market #{b.market_id}",
+                        wager=b.wager,
+                        odds=b.odds_at_placement,
+                        payout=b.payout_if_win,
+                        status=b.status,
+                    ))
+                combo = combined_american([l.odds for l in leg_rows]) if leg_rows else 0
+                parlay_data.append(ParlayData(
+                    parlay_id=p.id,
+                    total_wager=p.total_wager,
+                    total_payout=p.total_payout,
+                    combined_odds=combo,
+                    status=p.status,
+                    legs=leg_rows,
+                ))
+
+            blocked = await is_fully_restricted(session, guild_id, member.id)
+
+        chips = db_user.chips if db_user else 0
+        total_wagered = db_user.total_wagered if db_user else 0
+        total_won = db_user.total_won if db_user else 0
+
+        embed = discord.Embed(
+            title=f"{member.display_name}'s Sportsbook Profile", color=discord.Color.blurple()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="Balance", value=fmt_chips(chips), inline=True)
+        embed.add_field(name="Total Wagered", value=fmt_chips(total_wagered), inline=True)
+        embed.add_field(name="Total Won", value=fmt_chips(total_won), inline=True)
+        embed.add_field(name="Betting Status", value="🚫 Blocked" if blocked else "✅ Active", inline=True)
+        embed.add_field(name="Straight Bets", value=str(len(straight_rows)), inline=True)
+        embed.add_field(name="Parlays", value=str(len(parlay_data)), inline=True)
+        embed.set_footer(text=f"{member.id}")
+
+        buf = await render_async(
+            render_my_bets, member.display_name, chips, straight_rows, parlay_data, "ALL"
+        )
+        f = buf_to_discord_file(buf, "user_profile.png")
+        await interaction.followup.send(embed=embed, file=f, ephemeral=True)
 
     @settings.command(
         name="log_channel",

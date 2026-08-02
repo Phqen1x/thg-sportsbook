@@ -249,6 +249,25 @@ class GameSetting(Base):
     value: Mapped[str] = mapped_column(String(500), nullable=False)
 
 
+class ChipRequest(Base):
+    """A /withdraw or /deposit request posted to the withdraw channel.
+
+    Tracked so the "Mark Done" button on the posted message can survive a bot
+    restart — the button's custom_id only carries this row's id, and the rest
+    of the message content is regenerated from these fields rather than
+    parsed back out of the message text.
+    """
+    __tablename__ = "chip_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)  # WITHDRAW | DEPOSIT
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(10), default="PENDING", nullable=False)  # PENDING | DONE
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class DistrictRecord(Base):
     """Aggregate historical performance for one district across all past games."""
     __tablename__ = "district_records"

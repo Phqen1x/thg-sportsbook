@@ -11,8 +11,8 @@ from sqlalchemy import select
 from bot import config
 from bot.database.engine import get_session, get_setting, current_guild_id
 from bot.database.models import (
-    Alliance, Bet, BettingRestriction, Market, MarketTemplate, Parlay, ParlayTemplate,
-    ParlayTemplateLeg, PendingParlayLeg, Tribute, User,
+    Alliance, Bet, BettingRestriction, ChipRequest, Market, MarketTemplate, Parlay,
+    ParlayTemplate, ParlayTemplateLeg, PendingParlayLeg, Tribute, User,
 )
 from bot.imaging.bet_slip import ParlayLegData, render_parlay_slip
 from bot.imaging.my_bets import (
@@ -23,6 +23,9 @@ from bot.imaging.base import render_async, buf_to_discord_file
 from bot.odds.calculator import (
     straight_payout, parlay_payout, combined_american, resolve_cashout
 )
+from bot.utils.action_views import build_request_view, render_request_content
+from bot.utils.audit import post_bet_log
+from bot.utils.restrictions import is_fully_restricted
 from bot.utils.formatters import fmt_chips, fmt_odds, fmt_odds_with_mult, safe_defer
 from bot.utils.market_view import _TYPE_LABELS, _TYPE_ORDER, _type_section
 
@@ -36,6 +39,10 @@ EXCHANGE_MIN = 5000
 
 BETTING_PAUSED_MSG = (
     "🛑 Betting is currently paused by an admin. Try again once it's resumed."
+)
+
+BETTING_BLOCKED_MSG = (
+    "🚫 Your betting privileges have been temporarily suspended by a Gamemaker."
 )
 
 
@@ -1150,9 +1157,14 @@ async def _gather_tailable(session, guild_id: int) -> tuple[list[dict], list[dic
     """Return ``(featured, member)`` lists of tailable-parlay entries.
 
     Each entry is a dict with ``key``, ``name``, ``sub``, ``tag``,
-    ``market_ids``, ``labels`` and ``odds_list``. Only parlays whose every leg
-    market is still OPEN (and that still have at least 2 legs) are included, so
-    everything returned is actually tailable at live odds.
+    ``market_ids``, ``labels`` and ``odds_list``.
+
+    Featured (GM/auto) templates are listed regardless of leg status — matching
+    the Discord Activity's tail board — so a template with a closed leg is still
+    visible (with its real combined odds) rather than silently vanishing; actual
+    tailing is still blocked at bet time by ``_validate_tail_markets``. Member
+    parlays stay stricter: only shown if every leg is still OPEN, since tailing
+    someone else's pending slip should reflect what's genuinely live right now.
     """
     featured: list[dict] = []
     member: list[dict] = []
@@ -1169,14 +1181,11 @@ async def _gather_tailable(session, guild_id: int) -> tuple[list[dict], list[dic
             .order_by(ParlayTemplateLeg.sort_order)
         )
         mkts: list[Market] = []
-        ok = True
         for leg in legs_result.scalars().all():
             m = await session.get(Market, leg.market_id)
-            if not m or m.status != "OPEN":
-                ok = False
-                break
-            mkts.append(m)
-        if not ok or len(mkts) < 2:
+            if m:
+                mkts.append(m)
+        if len(mkts) < 2:
             continue
         tag = tpl.difficulty or tpl.source
         if tag == "ADMIN":
@@ -1294,6 +1303,8 @@ async def _tail_submit(
     """
     if await _betting_paused():
         return BETTING_PAUSED_MSG, None
+    if await is_fully_restricted(session, user.guild_id, user.discord_id):
+        return BETTING_BLOCKED_MSG, None
     if user.chips < wager:
         return f"Insufficient chips. You have **{fmt_chips(user.chips)}**.", None
     err, markets = await _validate_tail_markets(session, user.discord_id, market_ids, user.guild_id)
@@ -1400,6 +1411,13 @@ class TailWagerModal(discord.ui.Modal, title="Tail this parlay"):
             file=f,
             ephemeral=True,
         )
+
+        if isinstance(interaction.user, discord.Member):
+            await post_bet_log(
+                interaction.client, interaction.user, "PARLAY",
+                [leg.market_label for leg in res["leg_data"]], res["wager"], res["payout"],
+                is_tail=True,
+            )
 
 
 class TailView(discord.ui.View):
@@ -1758,6 +1776,8 @@ class BettingCog(commands.Cog):
                 return
 
             user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            # A full ("ALL") betting restriction is already checked above via
+            # _get_restriction_msg — no separate check needed here.
             if user.chips < amount:
                 await interaction.followup.send(
                     f"Insufficient chips. You have **{fmt_chips(user.chips)}** but need **{fmt_chips(amount)}**.",
@@ -1792,6 +1812,9 @@ class BettingCog(commands.Cog):
         embed.add_field(name="Bet ID", value=f"#{bet_id}")
         embed.set_footer(text=f"Remaining balance: {fmt_chips(new_balance)}")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+        if isinstance(interaction.user, discord.Member):
+            await post_bet_log(self.bot, interaction.user, "BET", [label], amount, payout)
 
     # ── /parlay ───────────────────────────────────────────────────────────────
 
@@ -1972,6 +1995,9 @@ class BettingCog(commands.Cog):
 
         async with get_session() as session:
             user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            if await is_fully_restricted(session, user.guild_id, user.discord_id):
+                await interaction.followup.send(BETTING_BLOCKED_MSG, ephemeral=True)
+                return
             if user.chips < wager:
                 await interaction.followup.send(
                     f"Insufficient chips. You have **{fmt_chips(user.chips)}**.", ephemeral=True
@@ -2066,6 +2092,12 @@ class BettingCog(commands.Cog):
             file=f,
             ephemeral=True,
         )
+
+        if isinstance(interaction.user, discord.Member):
+            await post_bet_log(
+                self.bot, interaction.user, "PARLAY",
+                [mkt.label for mkt in markets], wager, total_payout,
+            )
 
     @parlay_group.command(name="remove", description="Remove a leg from your pending parlay slip by position")
     @app_commands.describe(leg_number="Leg number to remove (see /parlay view)")
@@ -2251,6 +2283,23 @@ class BettingCog(commands.Cog):
             return None
         return interaction.guild.get_channel(channel_id)
 
+    async def _withdraw_ping(self, interaction: discord.Interaction) -> str:
+        """Resolve the optional /settings withdraw_ping target into a mention
+        string ("" if unset)."""
+        if interaction.guild is None:
+            return ""
+        from bot.database.engine import get_guild_setting
+        gid = current_guild_id()
+        role_raw = await get_guild_setting(gid, "withdraw_ping_role_id")
+        role_id = json.loads(role_raw) if role_raw else None
+        if role_id:
+            return f"<@&{role_id}> "
+        user_raw = await get_guild_setting(gid, "withdraw_ping_user_id")
+        user_id = json.loads(user_raw) if user_raw else None
+        if user_id:
+            return f"<@{user_id}> "
+        return ""
+
     @app_commands.command(
         name="withdraw",
         description="Convert chips back into panars (sends an admin payout request)",
@@ -2286,17 +2335,23 @@ class BettingCog(commands.Cog):
 
             user.chips -= amount
             new_balance = user.chips
+            blocked = await is_fully_restricted(session, user.guild_id, user.discord_id)
+
+            req = ChipRequest(
+                guild_id=user.guild_id, user_id=user.discord_id,
+                kind="WITHDRAW", amount=amount, status="PENDING",
+            )
+            session.add(req)
+            await session.flush()
+
+            ping = await self._withdraw_ping(interaction)
+            content = ping + render_request_content("WITHDRAW", user.discord_id, amount)
+            view = build_request_view(req, user.guild_id, user.discord_id, blocked)
 
             # Post the payout request inside the transaction: if the send fails,
             # the chip debit rolls back so we never take chips without notifying
             # admins to pay out the panars.
-            await channel.send(
-                f"💸 **Withdrawal request** — {member.mention} is converting "
-                f"**{fmt_chips(amount)}** into Panars. Their chip balance has "
-                f"already been debited. Run this to pay them out:\n"
-                f"`/admin1 award-deprive citizen:{member.mention} operation:Award "
-                f"resource:Panars amount:{amount}`"
-            )
+            await channel.send(content=content, view=view)
 
         await interaction.followup.send(
             f"Withdrawal request for **{fmt_chips(amount)}** submitted. The amount "
@@ -2330,14 +2385,22 @@ class BettingCog(commands.Cog):
         # Chips are NOT credited here — an admin takes the panars and credits the
         # chips so nobody can mint chips they didn't pay for.
         member = interaction.user
-        await channel.send(
-            f"🏦 **Deposit request** — {member.mention} wants to convert "
-            f"**{amount:,} Panars** into chips. Take their Panars, then credit "
-            "the chips:\n"
-            f"`/admin1 award-deprive citizen:{member.mention} operation:Deprive "
-            f"resource:Panars amount:{amount}`\n"
-            f"`/settings chips_give user:{member.mention} amount:{amount}`"
-        )
+        async with get_session() as session:
+            user = await _get_or_create_user(session, member, current_guild_id())
+            guild_id = user.guild_id
+            blocked = await is_fully_restricted(session, guild_id, user.discord_id)
+
+            req = ChipRequest(
+                guild_id=guild_id, user_id=user.discord_id,
+                kind="DEPOSIT", amount=amount, status="PENDING",
+            )
+            session.add(req)
+            await session.flush()
+
+        ping = await self._withdraw_ping(interaction)
+        content = ping + render_request_content("DEPOSIT", member.id, amount)
+        view = build_request_view(req, guild_id, member.id, blocked)
+        await channel.send(content=content, view=view)
 
         await interaction.followup.send(
             f"Deposit request for **{amount:,} Panars** submitted. An admin will "
@@ -2438,7 +2501,7 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            featured_list, member_list = await _gather_tailable(session)
+            featured_list, member_list = await _gather_tailable(session, current_guild_id())
 
         if not featured_list:
             await interaction.followup.send(

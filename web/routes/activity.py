@@ -17,7 +17,7 @@ from sqlalchemy import func, select, text
 
 from bot.cogs.betting import (
     _betting_paused, _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
-    BETTING_PAUSED_MSG, MAX_PARLAY_LEGS, PARLAY_PAYOUT_CAP,
+    BETTING_BLOCKED_MSG, BETTING_PAUSED_MSG, MAX_PARLAY_LEGS, PARLAY_PAYOUT_CAP,
 )
 from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
 from bot.database.models import (
@@ -27,9 +27,10 @@ from bot.database.models import (
 from bot.odds.calculator import (
     combined_american, parlay_payout, resolve_cashout, straight_payout,
 )
+from bot.utils.restrictions import is_fully_restricted
 from web import config, discord_api
 from web.activity_auth import bearer_admin, bearer_user, mint_token
-from web.audit import post_admin_action
+from web.audit import post_admin_action, post_bet_log
 from web.database import get_db, get_request_guild, set_request_guild
 from web.routes.public import _parlay_flavor
 from web.session import SessionUser
@@ -478,6 +479,8 @@ async def place_bet(
             raise HTTPException(status_code=400, detail="Market is not open for betting.")
 
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
         if db_user.chips < wager:
             raise HTTPException(status_code=400, detail="Insufficient chips.")
 
@@ -508,7 +511,9 @@ async def place_bet(
         db.add(bet)
         await db.commit()
         chips_left = db_user.chips
+        market_label = market.label
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "BET", [market_label], wager, payout))
     return {"ok": True, "payout_if_win": payout, "chips": chips_left,
             "message": f"Bet placed! Win {payout:,} chips if correct."}
 
@@ -676,6 +681,8 @@ async def parlay_submit(
 
     async with get_db() as db:
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
 
         legs_raw = (await db.execute(
             select(PendingParlayLeg)
@@ -723,9 +730,54 @@ async def parlay_submit(
             await db.delete(l)
         await db.commit()
         chips_left = db_user.chips
+        labels = [m.label for m in leg_markets]
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout))
     return {"ok": True, "total_payout": total_payout, "chips": chips_left,
             "message": f"Parlay submitted! Potential payout: {total_payout:,} chips."}
+
+
+@router.post("/parlay/feature")
+async def parlay_feature(
+    user: SessionUser = Depends(bearer_user),
+    name: Annotated[str, Body()] = "",
+    description: Annotated[str, Body()] = "",
+):
+    """Admin-only: turn the caller's current parlay slip into a GM-featured,
+    tailable, no-wager tail-board entry — same underlying model as the bot's
+    `/admin parlay save_slip`, just reachable from the Activity's Parlay tab."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="Name is required.")
+
+    async with get_db() as db:
+        legs = (await db.execute(
+            select(PendingParlayLeg)
+            .where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
+            .order_by(PendingParlayLeg.added_at)
+        )).scalars().all()
+        if len(legs) < 2:
+            raise HTTPException(status_code=400, detail="Your slip needs at least 2 legs to feature.")
+
+        tpl = ParlayTemplate(
+            name=name.strip()[:100],
+            description=(description.strip()[:500] or None),
+            source="ADMIN",
+            active=True,
+        )
+        db.add(tpl)
+        await db.flush()
+        for i, leg in enumerate(legs):
+            db.add(ParlayTemplateLeg(template_id=tpl.id, market_id=leg.market_id, sort_order=i))
+            await db.delete(leg)
+        await db.commit()
+        tpl_id, tpl_name = tpl.id, tpl.name
+
+    asyncio.create_task(post_admin_action(
+        user, "Featured parlay created", {"name": tpl_name}, source="Discord Activity",
+    ))
+    return {"ok": True, "message": f"Featured parlay #{tpl_id} is now live on the tail board.", "id": tpl_id}
 
 
 # ── Member: tail board ───────────────────────────────────────────────────────
@@ -754,7 +806,7 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
                 if mkt:
                     leg_markets.append(mkt)
             tpl_leg_markets[tpl.id] = leg_markets
-            odds_list = [m.odds for m in leg_markets if m.status == "OPEN"]
+            odds_list = [m.odds for m in leg_markets]
             combined = combined_american(odds_list) if len(odds_list) >= 2 else None
             out.append({
                 "id": tpl.id,
@@ -795,15 +847,12 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
             act_district_records = {dr.district: dr for dr in dr_rows}
 
         for entry in out:
-            if entry["source"] == "AI" and entry["description"]:
-                pass  # preserve the AI-generated name and description as-is
-            else:
-                name, desc = _parlay_flavor(
-                    tpl_leg_markets[entry["id"]], act_tributes_map, act_alliance_names,
-                    act_district_records, entry["name"], entry["description"],
-                )
-                entry["name"] = name
-                entry["description"] = desc
+            name, desc = _parlay_flavor(
+                tpl_leg_markets[entry["id"]], act_tributes_map, act_alliance_names,
+                act_district_records, entry["name"], entry["description"],
+            )
+            entry["name"] = name
+            entry["description"] = desc
 
         # Public, still-pending member parlays are also tailable (matches
         # /parlay tail in the bot and the /tail page on the web dashboard) —
@@ -868,6 +917,8 @@ async def tail_parlay(
             raise HTTPException(status_code=404, detail="Template not found.")
 
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
 
         legs = (await db.execute(
             select(ParlayTemplateLeg)
@@ -906,7 +957,9 @@ async def tail_parlay(
         db_user.total_wagered += wager
         await db.commit()
         chips_left = db_user.chips
+        labels = [m.label for m in leg_markets]
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout, is_tail=True))
     return {"ok": True, "total_payout": total_payout, "chips": chips_left,
             "message": f"Parlay tailed! Potential payout: {total_payout:,} chips."}
 
@@ -970,6 +1023,8 @@ async def tail_member_parlay(
             raise HTTPException(status_code=404, detail="Parlay not found or no longer available.")
 
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
 
         legs = (await db.execute(
             select(Bet).where(Bet.parlay_id == parlay_id).order_by(Bet.id)
@@ -1006,7 +1061,9 @@ async def tail_member_parlay(
         db_user.total_wagered += wager
         await db.commit()
         chips_left = db_user.chips
+        labels = [m.label for m in leg_markets]
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout, is_tail=True))
     return {"ok": True, "total_payout": total_payout, "chips": chips_left,
             "message": f"Parlay tailed! Potential payout: {total_payout:,} chips."}
 
@@ -1136,6 +1193,148 @@ async def admin_banners_delete(banner_id: str, admin: SessionUser = Depends(bear
             await db.commit()
     asyncio.create_task(post_admin_action(admin, "Banner removed", {"banner_id": banner_id}, source="Discord Activity"))
     return {"ok": True, "message": "Banner removed."}
+
+
+@router.get("/admin/parlays")
+async def admin_parlays_list(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        templates_raw = (await db.execute(
+            select(ParlayTemplate).order_by(ParlayTemplate.created_at.desc())
+        )).scalars().all()
+        out = []
+        for tpl in templates_raw:
+            legs = (await db.execute(
+                select(ParlayTemplateLeg)
+                .where(ParlayTemplateLeg.template_id == tpl.id)
+                .order_by(ParlayTemplateLeg.sort_order)
+            )).scalars().all()
+            leg_out = []
+            odds_list = []
+            for leg in legs:
+                mkt = await db.get(Market, leg.market_id)
+                if not mkt:
+                    continue
+                leg_out.append({"leg_id": leg.id, "market_id": mkt.id, "label": mkt.label, "odds": mkt.odds})
+                if mkt.status == "OPEN":
+                    odds_list.append(mkt.odds)
+            out.append({
+                "id": tpl.id,
+                "name": tpl.name,
+                "description": tpl.description,
+                "difficulty": tpl.difficulty,
+                "active": tpl.active,
+                "source": tpl.source,
+                "combined_odds": combined_american(odds_list) if len(odds_list) >= 2 else None,
+                "legs": leg_out,
+            })
+    return {"templates": out}
+
+
+@router.post("/admin/parlays/create")
+async def admin_parlays_create(
+    admin: SessionUser = Depends(bearer_admin),
+    name: Annotated[str, Body()] = "",
+    description: Annotated[str, Body()] = "",
+):
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="Name is required.")
+    async with get_db() as db:
+        tpl = ParlayTemplate(
+            name=name.strip()[:100],
+            description=(description.strip() or None),
+            source="ADMIN",
+            active=False,
+        )
+        db.add(tpl)
+        await db.commit()
+        await db.refresh(tpl)
+    asyncio.create_task(post_admin_action(admin, "Parlay template created", {"name": tpl.name}, source="Discord Activity"))
+    return {"ok": True, "message": "Template created.", "id": tpl.id}
+
+
+@router.post("/admin/parlays/{tpl_id}/add-leg")
+async def admin_parlays_add_leg(
+    tpl_id: int,
+    admin: SessionUser = Depends(bearer_admin),
+    market_id: Annotated[int, Body()] = 0,
+):
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, tpl_id)
+        if not tpl:
+            raise HTTPException(status_code=404, detail="Template not found.")
+        new_mkt = await db.get(Market, market_id)
+        if not new_mkt:
+            raise HTTPException(status_code=404, detail="Market not found.")
+
+        existing_legs = (await db.execute(
+            select(ParlayTemplateLeg)
+            .where(ParlayTemplateLeg.template_id == tpl_id)
+            .order_by(ParlayTemplateLeg.sort_order)
+        )).scalars().all()
+        if any(leg.market_id == market_id for leg in existing_legs):
+            raise HTTPException(status_code=400, detail="That market is already a leg on this template.")
+
+        existing_markets = []
+        for leg in existing_legs:
+            mkt = await db.get(Market, leg.market_id)
+            if mkt:
+                existing_markets.append(mkt)
+
+        tribute_by_id = await tribute_lookup_for_markets(db, existing_markets + [new_mkt])
+        conflict = _parlay_conflict(existing_markets, new_mkt, tribute_by_id)
+        if conflict:
+            raise HTTPException(status_code=400, detail=conflict)
+
+        leg = ParlayTemplateLeg(template_id=tpl_id, market_id=market_id, sort_order=len(existing_legs))
+        db.add(leg)
+        await db.commit()
+    asyncio.create_task(post_admin_action(
+        admin, "Parlay template leg added", {"template": tpl.name, "market_id": str(market_id)}, source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Leg added."}
+
+
+@router.post("/admin/parlays/{tpl_id}/remove-leg")
+async def admin_parlays_remove_leg(
+    tpl_id: int,
+    admin: SessionUser = Depends(bearer_admin),
+    leg_id: Annotated[int, Body()] = 0,
+):
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, tpl_id)
+        leg = await db.get(ParlayTemplateLeg, leg_id)
+        if not tpl or not leg or leg.template_id != tpl_id:
+            raise HTTPException(status_code=404, detail="Leg not found.")
+        await db.delete(leg)
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Parlay template leg removed", {"template": tpl.name}, source="Discord Activity"))
+    return {"ok": True, "message": "Leg removed."}
+
+
+@router.post("/admin/parlays/{tpl_id}/toggle")
+async def admin_parlays_toggle(tpl_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, tpl_id)
+        if not tpl:
+            raise HTTPException(status_code=404, detail="Template not found.")
+        tpl.active = not tpl.active
+        await db.commit()
+        active = tpl.active
+    asyncio.create_task(post_admin_action(admin, "Parlay template toggled", {"template": tpl.name, "active": str(active)}, source="Discord Activity"))
+    return {"ok": True, "message": f"Template {'activated' if active else 'deactivated'}.", "active": active}
+
+
+@router.delete("/admin/parlays/{tpl_id}")
+async def admin_parlays_delete(tpl_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, tpl_id)
+        if not tpl:
+            raise HTTPException(status_code=404, detail="Template not found.")
+        name = tpl.name
+        await db.delete(tpl)
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Parlay template deleted", {"template": name}, source="Discord Activity"))
+    return {"ok": True, "message": "Template deleted."}
 
 
 @router.get("/admin/users")

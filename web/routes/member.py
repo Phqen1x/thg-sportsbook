@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated
 
@@ -9,9 +10,11 @@ from sqlalchemy import select, text
 
 from bot.cogs.betting import (
     _betting_paused, _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
-    PARLAY_PAYOUT_CAP, MAX_PARLAY_LEGS,
+    BETTING_BLOCKED_MSG, PARLAY_PAYOUT_CAP, MAX_PARLAY_LEGS,
 )
 from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
+from bot.utils.restrictions import is_fully_restricted
+from web.audit import post_bet_log
 from web.routes.public import _parlay_flavor
 from bot.odds.calculator import straight_payout, parlay_payout, combined_american, resolve_cashout
 from web.database import get_db, get_request_guild
@@ -302,6 +305,8 @@ async def place_bet(
 
         db_user = await _get_or_create_user(db, user)
 
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            return _redirect(f"/bet/{market_id}", error=BETTING_BLOCKED_MSG.replace(" ", "+"))
         if db_user.chips < wager:
             return _redirect(f"/bet/{market_id}", error="Insufficient+chips.")
 
@@ -331,7 +336,9 @@ async def place_bet(
         db_user.total_wagered += wager
         db.add(bet)
         await db.commit()
+        market_label = market.label
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "BET", [market_label], wager, payout))
     return _redirect("/my-bets", msg=f"Bet+placed!+Win+{payout:,}+chips+if+correct.")
 
 
@@ -505,6 +512,8 @@ async def parlay_submit(
 
     async with get_db() as db:
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            return _redirect("/parlay", error=BETTING_BLOCKED_MSG.replace(" ", "+"))
 
         legs_raw = (await db.execute(
             select(PendingParlayLeg)
@@ -560,8 +569,50 @@ async def parlay_submit(
             await db.delete(l)
 
         await db.commit()
+        labels = [m.label for m in leg_markets]
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout))
     return _redirect("/my-bets", msg=f"Parlay+submitted!+Potential+payout:+{total_payout:,}+chips.")
+
+
+@router.post("/parlay/feature")
+async def parlay_feature(
+    user: SessionUser = Depends(require_user),
+    name: Annotated[str, Form()] = "",
+    description: Annotated[str, Form()] = "",
+):
+    """Admin-only: turn the caller's current parlay slip into a GM-featured,
+    tailable, no-wager tail-board entry. Same model as the bot's
+    `/admin parlay save_slip`, reachable from the website's Parlay tab."""
+    if not user.is_admin:
+        return _redirect("/parlay", error="Admin+access+required.")
+    if not name.strip():
+        return _redirect("/parlay", error="Name+is+required.")
+
+    async with get_db() as db:
+        legs = (await db.execute(
+            select(PendingParlayLeg)
+            .where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
+            .order_by(PendingParlayLeg.added_at)
+        )).scalars().all()
+        if len(legs) < 2:
+            return _redirect("/parlay", error="Your+slip+needs+at+least+2+legs+to+feature.")
+
+        tpl = ParlayTemplate(
+            name=name.strip()[:100],
+            description=(description.strip()[:500] or None),
+            source="ADMIN",
+            active=True,
+        )
+        db.add(tpl)
+        await db.flush()
+        for i, leg in enumerate(legs):
+            db.add(ParlayTemplateLeg(template_id=tpl.id, market_id=leg.market_id, sort_order=i))
+            await db.delete(leg)
+        tpl_id = tpl.id
+        await db.commit()
+
+    return _redirect("/tail", msg=f"Featured+parlay+%23{tpl_id}+is+now+live+on+the+tail+board.")
 
 
 # ── Tail Board ─────────────────────────────────────────────────────────────────
@@ -626,15 +677,12 @@ async def tail_board(
 
         tpl_flavor: dict[int, dict] = {}
         for tpl in templates_raw:
-            if tpl.source == "AI" and tpl.description:
-                tpl_flavor[tpl.id] = {"name": tpl.name, "description": tpl.description}
-            else:
-                leg_mkts = [tpl_markets[leg.market_id] for leg in tpl_legs.get(tpl.id, []) if leg.market_id in tpl_markets]
-                name, desc = _parlay_flavor(
-                    leg_mkts, tail_tributes_map, tail_alliance_names,
-                    tail_district_records, tpl.name, tpl.description,
-                )
-                tpl_flavor[tpl.id] = {"name": name, "description": desc}
+            leg_mkts = [tpl_markets[leg.market_id] for leg in tpl_legs.get(tpl.id, []) if leg.market_id in tpl_markets]
+            name, desc = _parlay_flavor(
+                leg_mkts, tail_tributes_map, tail_alliance_names,
+                tail_district_records, tpl.name, tpl.description,
+            )
+            tpl_flavor[tpl.id] = {"name": name, "description": desc}
 
         # Combined odds per template, for live payout preview
         tpl_combined: dict[int, int] = {}
@@ -720,6 +768,8 @@ async def tail_parlay(
             return _redirect("/tail", error="Template+not+found.")
 
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            return _redirect("/tail", error=BETTING_BLOCKED_MSG.replace(" ", "+"))
 
         legs = (await db.execute(
             select(ParlayTemplateLeg)
@@ -770,7 +820,9 @@ async def tail_parlay(
         db_user.chips -= wager
         db_user.total_wagered += wager
         await db.commit()
+        labels = [m.label for m in leg_markets]
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout, is_tail=True))
     return _redirect("/my-bets", msg=f"Parlay+tailed!+Potential+payout:+{total_payout:,}+chips.")
 
 
@@ -791,6 +843,8 @@ async def tail_member_parlay(
             return _redirect("/tail", error="Parlay+not+found+or+no+longer+available.")
 
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            return _redirect("/tail", error=BETTING_BLOCKED_MSG.replace(" ", "+"))
 
         legs = (await db.execute(
             select(Bet).where(Bet.parlay_id == parlay_id).order_by(Bet.id)
@@ -839,7 +893,9 @@ async def tail_member_parlay(
         db_user.chips -= wager
         db_user.total_wagered += wager
         await db.commit()
+        labels = [m.label for m in leg_markets]
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout, is_tail=True))
     return _redirect("/my-bets", msg=f"Parlay+tailed!+Potential+payout:+{total_payout:,}+chips.")
 
 
