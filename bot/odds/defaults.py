@@ -435,14 +435,18 @@ def kill_quality_multiplier(victim_win_prob: float, field_avg_prob: float) -> fl
     return max(KILL_QUALITY_MIN, min(KILL_QUALITY_MAX, mult))
 
 
-# ── District-pair kill suppression ───────────────────────────────────────────
+# ── District-pair / alliance kill suppression ────────────────────────────────
 # Tributes from the same district are paired together and rarely fight each
 # other. DISTRICT_PAIR_KILL_SUPPRESSION is the base multiplier on the raw
 # KILL_EVENT probability when both tributes share a district.
-# If they also belong to *opposing* alliances (each has an alliance_id and
-# those ids differ), competing loyalties make conflict more plausible, so a
-# less severe multiplier is used instead.
+# Allies are voluntarily bonded rather than forced together like district
+# partners, so cross-district allies get a lighter (but still significant)
+# ALLIANCE_PAIR_KILL_SUPPRESSION instead of the district figure.
+# If two same-district tributes belong to *opposing* alliances (each has an
+# alliance_id and those ids differ), competing loyalties make conflict more
+# plausible, so a less severe multiplier is used instead.
 DISTRICT_PAIR_KILL_SUPPRESSION = 0.10
+ALLIANCE_PAIR_KILL_SUPPRESSION = 0.20
 OPPOSING_ALLIANCE_KILL_SUPPRESSION = 0.35
 
 
@@ -462,23 +466,33 @@ def kill_boost_dr_factor(kills_before: int, national_kill_record: int | None) ->
 
 
 def district_pair_kill_factor(tribute_a: "Tribute", tribute_b: "Tribute") -> float:
-    """Probability suppression for a KILL_EVENT between same-district tributes.
+    """Probability suppression for a KILL_EVENT between bonded tributes.
 
-    Returns 1.0 (no change) when the two tributes are from different districts.
-    Returns DISTRICT_PAIR_KILL_SUPPRESSION for district partners with aligned
-    or no alliance affiliation, and OPPOSING_ALLIANCE_KILL_SUPPRESSION when
-    both belong to different alliances — less suppression because their
-    competing alliance loyalties override the usual district bond.
+    Returns 1.0 (no change) when the two tributes share neither a district nor
+    an alliance. Returns DISTRICT_PAIR_KILL_SUPPRESSION for district partners
+    with aligned or no alliance affiliation, ALLIANCE_PAIR_KILL_SUPPRESSION for
+    allies from different districts, and OPPOSING_ALLIANCE_KILL_SUPPRESSION
+    when same-district tributes belong to different alliances — less
+    suppression because their competing alliance loyalties override the usual
+    district bond.
     """
-    if tribute_a.district != tribute_b.district:
-        return 1.0
-    if (
+    same_district = tribute_a.district == tribute_b.district
+    same_alliance = (
+        tribute_a.alliance_id is not None
+        and tribute_a.alliance_id == tribute_b.alliance_id
+    )
+    opposing_alliance = (
         tribute_a.alliance_id is not None
         and tribute_b.alliance_id is not None
         and tribute_a.alliance_id != tribute_b.alliance_id
-    ):
+    )
+    if same_district and opposing_alliance:
         return OPPOSING_ALLIANCE_KILL_SUPPRESSION
-    return DISTRICT_PAIR_KILL_SUPPRESSION
+    if same_district:
+        return DISTRICT_PAIR_KILL_SUPPRESSION
+    if same_alliance:
+        return ALLIANCE_PAIR_KILL_SUPPRESSION
+    return 1.0
 
 
 def _p_top_k(strength: float, k: int) -> float:
