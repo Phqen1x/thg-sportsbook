@@ -104,11 +104,19 @@ async def dashboard(request: Request, user: SessionUser = Depends(require_admin)
         active_phase_id = json.loads(phase_row[0]) if phase_row else None
         economy = await economy_totals(db, _GUILD_ID())
 
+        single_cap_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='single_payout_cap'"))).fetchone()
+        parlay_cap_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='parlay_payout_cap'"))).fetchone()
+        payout_caps = {
+            "single": int(single_cap_row[0]) if single_cap_row else _web_config.SINGLE_PAYOUT_CAP,
+            "parlay": int(parlay_cap_row[0]) if parlay_cap_row else _web_config.PARLAY_PAYOUT_CAP,
+        }
+
     return request.app.state.templates.TemplateResponse("admin/index.html", {
         "request": request, "user": user,
         "alive": alive, "dead": dead, "open_mkts": open_mkts,
         "total_bets": total_bets, "pending_bets": pending_bets, "total_users": total_users,
         "phases": phases, "active_phase_id": active_phase_id, "economy": economy,
+        "payout_caps": payout_caps,
         "success": success, "error": error,
     })
 
@@ -793,6 +801,8 @@ async def settings(request: Request, user: SessionUser = Depends(require_admin),
         default_chips_setting = settings_map.get("default_chips", str(1000))
         deposit_rate = settings_map.get("deposit_rate", "1.0")
         withdraw_rate = settings_map.get("withdraw_rate", "1.0")
+        single_payout_cap = settings_map.get("single_payout_cap", str(_web_config.SINGLE_PAYOUT_CAP))
+        parlay_payout_cap = settings_map.get("parlay_payout_cap", str(_web_config.PARLAY_PAYOUT_CAP))
 
     return request.app.state.templates.TemplateResponse("admin/settings.html", {
         "request": request, "user": user,
@@ -803,6 +813,8 @@ async def settings(request: Request, user: SessionUser = Depends(require_admin),
         "default_chips": default_chips_setting,
         "deposit_rate": deposit_rate,
         "withdraw_rate": withdraw_rate,
+        "single_payout_cap": single_payout_cap,
+        "parlay_payout_cap": parlay_payout_cap,
         "success": success, "error": error,
     })
 
@@ -816,8 +828,16 @@ async def settings_save(
     default_chips: Annotated[str, Form()] = "1000",
     deposit_rate: Annotated[str, Form()] = "1.0",
     withdraw_rate: Annotated[str, Form()] = "1.0",
+    single_payout_cap: Annotated[str, Form()] = "10000000",
+    parlay_payout_cap: Annotated[str, Form()] = "10000000",
     capitol_announcement: Annotated[str, Form()] = "",
 ):
+    try:
+        if int(single_payout_cap) < 1 or int(parlay_payout_cap) < 1:
+            raise ValueError
+    except ValueError:
+        return _redirect("/admin/settings", error="Payout+caps+must+be+whole+numbers+of+at+least+1+chip.")
+
     async with get_db() as db:
         async def upsert(key: str, value: str) -> None:
             await db.execute(text(f"INSERT OR REPLACE INTO game_settings (key, value) VALUES (:k, :v)"), {"k": key, "v": value})
@@ -828,6 +848,8 @@ async def settings_save(
         await upsert("default_chips", default_chips)
         await upsert("deposit_rate", deposit_rate)
         await upsert("withdraw_rate", withdraw_rate)
+        await upsert("single_payout_cap", single_payout_cap)
+        await upsert("parlay_payout_cap", parlay_payout_cap)
         if capitol_announcement:
             import json
             await upsert("capitol_announcement", json.dumps(capitol_announcement))

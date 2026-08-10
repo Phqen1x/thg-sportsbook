@@ -101,6 +101,7 @@ from bot.utils.exchange_rates import (
 )
 from bot.utils.formatters import fmt_chips, fmt_odds, safe_defer
 from bot.utils.market_view import MarketPageView, MarketTypePageView, sort_markets
+from bot.utils.payout_caps import get_payout_cap, set_payout_cap
 from bot.utils.restrictions import is_public_bet_blocked, set_public_block
 
 # Leg-compatibility validation lives in the betting cog; reused here so admin and
@@ -109,7 +110,6 @@ from bot.cogs.betting import (
     _multi_outcome_type_keys,
     _parlay_conflict,
     tribute_lookup_for_markets,
-    PARLAY_PAYOUT_CAP,
 )
 from bot.cogs.display import (
     DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES, DEFAULT_ODDS_UPDATE_MESSAGE, DEFAULT_ODDS_UPDATE_THRESHOLD,
@@ -1860,13 +1860,14 @@ def _parlay_prob(legs: list[Market]) -> float:
     return parlay_combined_probability([m.odds for m in legs])
 
 
-def _parlay_within_cap(legs: list[Market]) -> bool:
+def _parlay_within_cap(legs: list[Market], cap: int) -> bool:
     payout = parlay_payout(AUTO_PARLAY_MAX_WAGER, [m.odds for m in legs])
-    return payout <= PARLAY_PAYOUT_CAP
+    return payout <= cap
 
 
 def _pick_themed_legs(
     candidates: list[Market],
+    cap: int,
     max_legs: int = _MAX_PARLAY_LEGS,
     min_legs: int = _MIN_PARLAY_LEGS,
     *,
@@ -1877,7 +1878,9 @@ def _pick_themed_legs(
 
     By default sorts probability high→low (best odds first). Pass worst_odds_first=True
     to pick the most difficult markets — used for LONGSHOT fallback. ``tribute_by_id``
-    is forwarded to _parlay_conflict for district-aware rules.
+    is forwarded to _parlay_conflict for district-aware rules. ``cap`` is the current
+    parlay payout cap (fetched once by the caller — see _generate_auto_parlays) that
+    AUTO_PARLAY_MAX_WAGER-sized legs must stay within.
     """
     sorted_cands = sorted(
         candidates,
@@ -1890,7 +1893,7 @@ def _pick_themed_legs(
             if _parlay_conflict(chosen, m, tribute_by_id) is not None:
                 continue
             chosen.append(m)
-            if not _parlay_within_cap(chosen):
+            if not _parlay_within_cap(chosen, cap):
                 chosen.pop()
                 continue
             if len(chosen) == target:
@@ -1918,6 +1921,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
     """
     if not _AUTO_PARLAY_GENERATION_ENABLED:
         return 0
+    cap = await get_payout_cap("PARLAY")
     old = await session.execute(
         select(ParlayTemplate).where(ParlayTemplate.source == "AUTO")
     )
@@ -2119,7 +2123,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                 if not _tribute_allowed(theme_type, theme_key):
                     continue
                 legs = _pick_themed_legs(
-                    mkts, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map
+                    mkts, cap, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map
                 )
                 if len(legs) >= min_l:
                     leg_key = frozenset(l.id for l in legs)
@@ -2133,6 +2137,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                         continue
                     legs = _pick_themed_legs(
                         mkts,
+                        cap,
                         max_legs=_MAX_PARLAY_LEGS,
                         min_legs=_MIN_PARLAY_LEGS,
                         worst_odds_first=True,
@@ -2152,7 +2157,7 @@ async def _generate_auto_parlays(session, phase_id: int | None, count: int = 3) 
                         if theme_key in used_tribute_keys:
                             continue
                     legs = _pick_themed_legs(
-                        mkts, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map
+                        mkts, cap, max_legs=max_l, min_legs=min_l, tribute_by_id=tributes_map
                     )
                     if len(legs) >= min_l:
                         leg_key = frozenset(l.id for l in legs)
@@ -11474,6 +11479,41 @@ class AdminCog(commands.Cog):
         await interaction.followup.send(
             f"Early cashout is now {status_str}{rate_str}.", ephemeral=True
         )
+
+    @settings.command(
+        name="payout_cap",
+        description="View or set the max chip payout for single bets and parlays",
+    )
+    @app_commands.describe(
+        single="Max payout for a single (non-parlay) bet — omit to leave unchanged",
+        parlay="Max payout for a parlay — omit to leave unchanged",
+    )
+    @is_admin()
+    async def settings_payout_cap(
+        self,
+        interaction: discord.Interaction,
+        single: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+        parlay: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        if single is None and parlay is None:
+            cur_single = await get_payout_cap("SINGLE")
+            cur_parlay = await get_payout_cap("PARLAY")
+            await interaction.followup.send(
+                f"Current payout caps — Single bet: **{fmt_chips(cur_single)}**, "
+                f"Parlay: **{fmt_chips(cur_parlay)}**.",
+                ephemeral=True,
+            )
+            return
+        parts = []
+        if single is not None:
+            await set_payout_cap("SINGLE", single)
+            parts.append(f"single bet cap set to **{fmt_chips(single)}**")
+        if parlay is not None:
+            await set_payout_cap("PARLAY", parlay)
+            parts.append(f"parlay cap set to **{fmt_chips(parlay)}**")
+        await interaction.followup.send(f"Payout caps updated — {' and '.join(parts)}.", ephemeral=True)
 
     @settings.command(
         name="market_cashout",

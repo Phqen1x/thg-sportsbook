@@ -16,8 +16,9 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import func, select, text
 
 from bot.cogs.betting import (
-    _betting_paused, _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
-    BETTING_BLOCKED_MSG, BETTING_PAUSED_MSG, MAX_PARLAY_LEGS, PARLAY_PAYOUT_CAP,
+    _betting_paused, _parlay_conflict, _single_cap_error, _parlay_cap_error,
+    add_markets_to_pending_slip, tribute_lookup_for_markets,
+    BETTING_BLOCKED_MSG, BETTING_PAUSED_MSG, MAX_PARLAY_LEGS,
 )
 from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
 from bot.database.models import (
@@ -29,6 +30,7 @@ from bot.odds.calculator import (
 )
 from bot.utils.economy import economy_totals
 from bot.utils.exchange_rates import get_global_rate, list_overrides, set_global_rate, set_override
+from bot.utils.payout_caps import get_payout_cap, set_payout_cap
 from bot.utils.restrictions import (
     is_fully_restricted, is_public_bet_blocked, list_public_blocks, set_public_block,
 )
@@ -141,6 +143,26 @@ async def _paused() -> bool:
     from bot.database.engine import set_guild_context
     set_guild_context(_GUILD_ID())
     return await _betting_paused()
+
+
+async def _single_cap_error_activity(amount: int, odds: int) -> str | None:
+    """Guild-context-bound wrapper — see _paused() for why this is needed.
+    Strips the Discord-markdown ** the shared helper wraps chip amounts in,
+    since this surface renders errors as plain text."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    err = await _single_cap_error(amount, odds)
+    return err.replace("**", "") if err else None
+
+
+async def _parlay_cap_error_activity(wager: int, odds_list: list[int]) -> str | None:
+    """Guild-context-bound wrapper — see _paused() for why this is needed.
+    Strips the Discord-markdown ** the shared helper wraps chip amounts in,
+    since this surface renders errors as plain text."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    err = await _parlay_cap_error(wager, odds_list)
+    return err.replace("**", "") if err else None
 
 
 async def _fetch_user(db, discord_id: int) -> User | None:
@@ -306,6 +328,11 @@ async def me(user: SessionUser = Depends(bearer_user)):
         "is_admin": user.is_admin,
         "avatar_url": user.avatar_url,
         "roi": round(roi, 1),
+        # Exposed here (rather than only on the admin-gated /admin/payout-caps
+        # endpoint) so the bet/parlay wager UI can preview an accurate payout —
+        # every member already fetches /me on load and after each bet.
+        "single_payout_cap": await get_payout_cap("SINGLE"),
+        "parlay_payout_cap": await get_payout_cap("PARLAY"),
     }
 
 
@@ -500,6 +527,10 @@ async def place_bet(
         )).scalars().first()
         if existing:
             raise HTTPException(status_code=400, detail="You already have a pending bet on this market.")
+
+        cap_err = await _single_cap_error_activity(wager, market.odds)
+        if cap_err:
+            raise HTTPException(status_code=400, detail=cap_err)
 
         payout = straight_payout(wager, market.odds)
         bet = Bet(
@@ -709,7 +740,10 @@ async def parlay_submit(
             raise HTTPException(status_code=400, detail="Insufficient chips.")
 
         odds_list = [m.odds for m in leg_markets]
-        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+        cap_err = await _parlay_cap_error_activity(wager, odds_list)
+        if cap_err:
+            raise HTTPException(status_code=400, detail=cap_err)
+        total_payout = parlay_payout(wager, odds_list)
 
         role_ids = await live_role_ids(user.discord_id, user.guild_id)
         downgraded = is_public and await is_public_bet_blocked(db, _GUILD_ID(), user.discord_id, role_ids)
@@ -950,7 +984,10 @@ async def tail_parlay(
             raise HTTPException(status_code=400, detail="Insufficient chips.")
 
         odds_list = [m.odds for m in leg_markets]
-        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+        cap_err = await _parlay_cap_error_activity(wager, odds_list)
+        if cap_err:
+            raise HTTPException(status_code=400, detail=cap_err)
+        total_payout = parlay_payout(wager, odds_list)
 
         p = Parlay(
             guild_id=_GUILD_ID(), user_id=user.discord_id, total_wager=wager, total_payout=total_payout,
@@ -1054,7 +1091,10 @@ async def tail_member_parlay(
             raise HTTPException(status_code=400, detail="Insufficient chips.")
 
         odds_list = [m.odds for m in leg_markets]
-        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+        cap_err = await _parlay_cap_error_activity(wager, odds_list)
+        if cap_err:
+            raise HTTPException(status_code=400, detail=cap_err)
+        total_payout = parlay_payout(wager, odds_list)
 
         # Tailed copies are private by default; record provenance (unless the
         # member tailed their own board listing) so the original poster gets
@@ -1365,6 +1405,32 @@ def _override_dict(o: ExchangeRateOverride) -> dict:
 
 def _block_dict(b: PublicBetRestriction) -> dict:
     return {"id": b.id, "scope": b.scope, "target_id": str(b.target_id)}
+
+
+@router.get("/admin/payout-caps")
+async def admin_payout_caps(admin: SessionUser = Depends(bearer_admin)):
+    return {
+        "single_payout_cap": await get_payout_cap("SINGLE"),
+        "parlay_payout_cap": await get_payout_cap("PARLAY"),
+    }
+
+
+@router.post("/admin/payout-caps")
+async def admin_payout_caps_set(
+    admin: SessionUser = Depends(bearer_admin),
+    single_payout_cap: Annotated[int, Body()] = 0,
+    parlay_payout_cap: Annotated[int, Body()] = 0,
+):
+    if single_payout_cap <= 0 or parlay_payout_cap <= 0:
+        raise HTTPException(status_code=400, detail="Payout caps must be positive.")
+    await set_payout_cap("SINGLE", single_payout_cap)
+    await set_payout_cap("PARLAY", parlay_payout_cap)
+    asyncio.create_task(post_admin_action(
+        admin, "Payout caps updated",
+        {"single": str(single_payout_cap), "parlay": str(parlay_payout_cap)},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Payout caps updated."}
 
 
 @router.get("/admin/exchange-rates")

@@ -21,11 +21,13 @@ from bot.imaging.my_bets import (
 )
 from bot.imaging.base import render_async, buf_to_discord_file
 from bot.odds.calculator import (
-    straight_payout, parlay_payout, combined_american, resolve_cashout
+    straight_payout, parlay_payout, combined_american, resolve_cashout,
+    american_to_decimal, max_wager_for_cap,
 )
 from bot.utils.action_views import build_request_view, render_request_content
 from bot.utils.exchange_rates import effective_rate
 from bot.utils.audit import post_bet_log
+from bot.utils.payout_caps import get_payout_cap
 from bot.utils.restrictions import is_fully_restricted, is_public_bet_blocked
 from bot.utils.formatters import fmt_chips, fmt_odds, fmt_odds_with_mult, safe_defer
 from bot.utils.market_view import _TYPE_LABELS, _TYPE_ORDER, _type_section
@@ -33,7 +35,6 @@ from bot.utils.market_view import _TYPE_LABELS, _TYPE_ORDER, _type_section
 log = logging.getLogger("capitol.betting")
 
 MAX_PARLAY_LEGS = 10
-PARLAY_PAYOUT_CAP = 10_000_000
 
 # Minimum chips a member may withdraw or deposit in a single panars exchange.
 EXCHANGE_MIN = 5000
@@ -50,6 +51,33 @@ BETTING_BLOCKED_MSG = (
 async def _betting_paused() -> bool:
     raw = await get_setting("betting_paused")
     return json.loads(raw) if raw else False
+
+
+async def _single_cap_error(amount: int, odds: int) -> str | None:
+    """None if a straight bet of ``amount`` at ``odds`` stays within the single-bet
+    payout cap; otherwise a message naming the largest wager that would still
+    qualify, so the member knows exactly what they can do instead of just being
+    told no."""
+    cap = await get_payout_cap("SINGLE")
+    if straight_payout(amount, odds) <= cap:
+        return None
+    max_wager = max_wager_for_cap(american_to_decimal(odds), cap)
+    return (
+        f"You can't wager more than **{fmt_chips(max_wager)}** on this bet — "
+        f"you can't win more than **{fmt_chips(cap)}**."
+    )
+
+
+async def _parlay_cap_error(wager: int, legs_odds: list[int]) -> str | None:
+    """Same as _single_cap_error but for a parlay's combined odds."""
+    cap = await get_payout_cap("PARLAY")
+    if parlay_payout(wager, legs_odds) <= cap:
+        return None
+    max_wager = max_wager_for_cap(american_to_decimal(combined_american(legs_odds)), cap)
+    return (
+        f"You can't wager more than **{fmt_chips(max_wager)}** on this parlay — "
+        f"you can't win more than **{fmt_chips(cap)}**."
+    )
 
 
 _MAKES_MILESTONES = {"MAKES_FINAL_8", "MAKES_FINAL_5"}
@@ -1353,13 +1381,10 @@ async def _tail_submit(
         return err, None
 
     all_odds = [m.odds for m in markets]
+    cap_err = await _parlay_cap_error(wager, all_odds)
+    if cap_err:
+        return cap_err, None
     total_payout = parlay_payout(wager, all_odds)
-    if total_payout > PARLAY_PAYOUT_CAP:
-        return (
-            f"Parlay payout cannot exceed **{fmt_chips(PARLAY_PAYOUT_CAP)}**. "
-            "Reduce your wager or remove legs.",
-            None,
-        )
 
     user.chips -= wager
     user.total_wagered += wager
@@ -1826,6 +1851,11 @@ class BettingCog(commands.Cog):
                 )
                 return
 
+            cap_err = await _single_cap_error(amount, mkt.odds)
+            if cap_err:
+                await interaction.followup.send(cap_err, ephemeral=True)
+                return
+
             payout = straight_payout(amount, mkt.odds)
             user.chips -= amount
             user.total_wagered += amount
@@ -2083,13 +2113,11 @@ class BettingCog(commands.Cog):
                     return
 
             all_odds = [m.odds for m in markets]
+            cap_err = await _parlay_cap_error(wager, all_odds)
+            if cap_err:
+                await interaction.followup.send(cap_err, ephemeral=True)
+                return
             total_payout = parlay_payout(wager, all_odds)
-            if total_payout > PARLAY_PAYOUT_CAP:
-                return (
-                    f"Parlay payout cannot exceed **{fmt_chips(PARLAY_PAYOUT_CAP)}**. "
-                    "Reduce your wager or remove legs.",
-                    None,
-                )
 
             user.chips -= wager
             user.total_wagered += wager

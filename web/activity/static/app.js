@@ -20,7 +20,12 @@ const fmtOdds = (n) => (n == null ? "—" : n >= 0 ? `+${n}` : `${n}`);
 const oddsClass = (n) => (n == null ? "" : n >= 0 ? "odds-pos" : "odds-neg");
 const decFromOdds = (odds) => (odds >= 0 ? odds / 100 + 1 : 100 / Math.abs(odds) + 1);
 const payoutForWager = (wager, odds) => Math.max(wager, Math.round(wager * decFromOdds(odds)));
-const PARLAY_PAYOUT_CAP = 10_000_000; // keep in sync with bot/cogs/betting.py
+// Live payout caps come from ME (see /me in web/routes/activity.py) so previews
+// track admin changes without a page reload; fall back to a generous default
+// (never used to actually reject a bet — the server is the source of truth)
+// if ME hasn't loaded yet.
+const singlePayoutCap = () => ME?.single_payout_cap ?? 10_000_000;
+const parlayPayoutCap = () => ME?.parlay_payout_cap ?? 10_000_000;
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -705,7 +710,7 @@ async function viewParlay(view) {
   if (wagerEl && data.combined_odds != null) {
     wagerEl.addEventListener("input", () => {
       const w = Number(wagerEl.value) || 0;
-      const payout = Math.min(payoutForWager(w, data.combined_odds), PARLAY_PAYOUT_CAP);
+      const payout = Math.min(payoutForWager(w, data.combined_odds), parlayPayoutCap());
       $("#parlay-payout", view).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
     });
   }
@@ -893,9 +898,10 @@ async function adminMarkets(body) {
 }
 
 async function adminChips(body) {
-  const [{ users }, economy] = await Promise.all([
+  const [{ users }, economy, payoutCaps] = await Promise.all([
     api("/admin/users"),
     api("/admin/economy").catch(() => null),
+    api("/admin/payout-caps").catch(() => null),
   ]);
   body.innerHTML = `
     ${economy ? `
@@ -923,6 +929,21 @@ async function adminChips(body) {
           <span class="econ-label">Net Panars</span>
         </div>
       </div>
+    </div>` : ""}
+    ${payoutCaps ? `
+    <div class="card">
+      <div class="card-label">PAYOUT CAPS</div>
+      <div class="econ-grid">
+        <div class="econ-item">
+          <span class="econ-num">${fmtChips(payoutCaps.single_payout_cap)}</span>
+          <span class="econ-label">Single Bet Cap</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num">${fmtChips(payoutCaps.parlay_payout_cap)}</span>
+          <span class="econ-label">Parlay Cap</span>
+        </div>
+      </div>
+      <div class="dim" style="margin-top:8px">Adjust these on the <a href="${location.pathname}${location.search}#admin/rates">Rates</a> tab.</div>
     </div>` : ""}
     <div class="card admin-form">
       <div class="card-label">GIVE / TAKE</div>
@@ -1168,12 +1189,21 @@ async function adminParlays(body) {
 }
 
 async function adminRates(body) {
-  const [rates, { blocks }] = await Promise.all([
+  const [rates, { blocks }, payoutCaps] = await Promise.all([
     api("/admin/exchange-rates"),
     api("/admin/public-blocks"),
+    api("/admin/payout-caps"),
   ]);
 
   body.innerHTML = `
+    <div class="card admin-form">
+      <div class="card-label">GLOBAL PAYOUT CAPS</div>
+      <input id="pc-single" class="input" type="number" min="1" value="${payoutCaps.single_payout_cap}" placeholder="Single bet cap (chips)">
+      <input id="pc-parlay" class="input" type="number" min="1" value="${payoutCaps.parlay_payout_cap}" placeholder="Parlay cap (chips)">
+      <button class="btn btn-primary" id="pc-save">Save Payout Caps</button>
+      <div class="dim" style="width:100%">A wager that would pay out more than the applicable cap is rejected with the max wager the member could place instead.</div>
+    </div>
+
     <div class="card admin-form">
       <div class="card-label">GLOBAL RATES</div>
       <input id="r-deposit" class="input" type="number" step="0.01" min="0.01" value="${rates.global_deposit_rate}" placeholder="Deposit rate (chips per Panar)">
@@ -1230,6 +1260,17 @@ async function adminRates(body) {
           </div>
         </div>`).join("") : `<div class="empty">No public-parlay blocks set.</div>`}
     </div>`;
+
+  $("#pc-save", body).addEventListener("click", async () => {
+    const single_payout_cap = Number($("#pc-single", body).value);
+    const parlay_payout_cap = Number($("#pc-parlay", body).value);
+    if (!single_payout_cap || !parlay_payout_cap) return toast("Enter both payout caps.", "error");
+    try {
+      const r = await api("/admin/payout-caps", { method: "POST", body: { single_payout_cap, parlay_payout_cap } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
 
   $("#r-save-global", body).addEventListener("click", async () => {
     const deposit_rate = Number($("#r-deposit", body).value);
@@ -1321,7 +1362,8 @@ async function openBetModal(marketId) {
   const wagerEl = $("#bet-wager", overlay);
   wagerEl.addEventListener("input", () => {
     const w = Number(wagerEl.value) || 0;
-    $("#bet-payout", overlay).textContent = w ? `Win ${fmtChips(payoutForWager(w, m.odds))} chips` : "";
+    const payout = Math.min(payoutForWager(w, m.odds), singlePayoutCap());
+    $("#bet-payout", overlay).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
   });
   $("#bet-cancel", overlay).addEventListener("click", () => overlay.remove());
   $("#bet-go", overlay).addEventListener("click", async () => {
@@ -1374,7 +1416,7 @@ function openWagerModal({ title, odds, onSubmit, after }) {
   if (odds != null) {
     wagerEl.addEventListener("input", () => {
       const w = Number(wagerEl.value) || 0;
-      const payout = Math.min(payoutForWager(w, odds), PARLAY_PAYOUT_CAP);
+      const payout = Math.min(payoutForWager(w, odds), parlayPayoutCap());
       $("#w-payout", overlay).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
     });
   }

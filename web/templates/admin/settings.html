@@ -45,6 +45,18 @@
     </div>
 
     <div class="form-group">
+      <label class="form-label">Single Bet Payout Cap (chips)</label>
+      <input type="number" name="single_payout_cap" class="form-control" min="1" value="{{ single_payout_cap }}">
+      <div class="form-help">Max chips a single (non-parlay) bet can pay out on a win. A wager that would pay out more is rejected with the max wager they can place instead.</div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Parlay Payout Cap (chips)</label>
+      <input type="number" name="parlay_payout_cap" class="form-control" min="1" value="{{ parlay_payout_cap }}">
+      <div class="form-help">Max chips a parlay can pay out on a win. Set separately from the single-bet cap since parlays compound odds across legs.</div>
+    </div>
+
+    <div class="form-group">
       <label class="form-label">Capitol Announcement (shown on odds board)</label>
       <input type="text" name="capitol_announcement" class="form-control" value="{{ announcement | replace('\"', '') }}" placeholder="e.g. May the odds be ever in your favor!">
     </div>

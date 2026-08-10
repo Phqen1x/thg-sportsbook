@@ -28,6 +28,12 @@ DEV_GUILD_ID: int | None = (
 DEFAULT_CHIPS: int = int(os.environ.get("DEFAULT_CHIPS", "1000"))
 CASHOUT_ALLOWED: bool = os.environ.get("CASHOUT_ALLOWED", "false").lower() == "true"
 CASHOUT_RATE: float = float(os.environ.get("CASHOUT_RATE", "0.65"))
+# Maximum chips a single bet / a parlay is allowed to pay out on a win, regardless
+# of wager or odds. Kept separate since parlays compound odds across legs and can
+# reach far larger multipliers than any one market. Both are admin-adjustable at
+# runtime (GameSetting overrides these) — see bot/utils/payout_caps.py.
+SINGLE_PAYOUT_CAP: int = int(os.environ.get("SINGLE_PAYOUT_CAP", "10000000"))
+PARLAY_PAYOUT_CAP: int = int(os.environ.get("PARLAY_PAYOUT_CAP", "10000000"))
 
 # Public base URL of the web app (used by /play to link the standalone Activity).
 WEB_BASE_URL: str | None = (os.environ.get("WEB_BASE_URL") or "").rstrip("/") or None

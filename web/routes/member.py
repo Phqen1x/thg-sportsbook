@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Annotated
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select, text
 
 from bot.cogs.betting import (
-    _betting_paused, _parlay_conflict, add_markets_to_pending_slip, tribute_lookup_for_markets,
-    BETTING_BLOCKED_MSG, PARLAY_PAYOUT_CAP, MAX_PARLAY_LEGS,
+    _betting_paused, _parlay_conflict, _single_cap_error, _parlay_cap_error,
+    add_markets_to_pending_slip, tribute_lookup_for_markets,
+    BETTING_BLOCKED_MSG, MAX_PARLAY_LEGS,
 )
 from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
 from bot.utils.restrictions import is_fully_restricted, is_public_bet_blocked
@@ -40,6 +42,26 @@ async def _paused() -> bool:
     from bot.database.engine import set_guild_context
     set_guild_context(_GUILD_ID())
     return await _betting_paused()
+
+
+async def _single_cap_error_web(amount: int, odds: int) -> str | None:
+    """Guild-context-bound wrapper — see _paused() for why this is needed.
+    Strips the Discord-markdown ** the shared helper wraps chip amounts in,
+    since this surface renders errors as plain text."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    err = await _single_cap_error(amount, odds)
+    return err.replace("**", "") if err else None
+
+
+async def _parlay_cap_error_web(wager: int, odds_list: list[int]) -> str | None:
+    """Guild-context-bound wrapper — see _paused() for why this is needed.
+    Strips the Discord-markdown ** the shared helper wraps chip amounts in,
+    since this surface renders errors as plain text."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    err = await _parlay_cap_error(wager, odds_list)
+    return err.replace("**", "") if err else None
 
 
 async def _cashout_settings(db) -> tuple[bool, float, dict]:
@@ -322,6 +344,10 @@ async def place_bet(
         if existing:
             return _redirect(f"/bet/{market_id}", error="You+already+have+a+pending+bet+on+this+market.")
 
+        cap_err = await _single_cap_error_web(wager, market.odds)
+        if cap_err:
+            return _redirect(f"/bet/{market_id}", error=quote_plus(cap_err))
+
         payout = straight_payout(wager, market.odds)
         bet = Bet(
             guild_id=_GUILD_ID(),
@@ -535,7 +561,10 @@ async def parlay_submit(
             return _redirect("/parlay", error="Insufficient+chips.")
 
         odds_list = [m.odds for m in leg_markets]
-        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+        cap_err = await _parlay_cap_error_web(wager, odds_list)
+        if cap_err:
+            return _redirect("/parlay", error=quote_plus(cap_err))
+        total_payout = parlay_payout(wager, odds_list)
 
         public = is_public == "on"
         role_ids = await live_role_ids(user.discord_id, user.guild_id)
@@ -797,7 +826,10 @@ async def tail_parlay(
             return _redirect("/tail", error="Insufficient+chips.")
 
         odds_list = [m.odds for m in leg_markets]
-        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+        cap_err = await _parlay_cap_error_web(wager, odds_list)
+        if cap_err:
+            return _redirect("/tail", error=quote_plus(cap_err))
+        total_payout = parlay_payout(wager, odds_list)
 
         p = Parlay(
             guild_id=_GUILD_ID(),
@@ -870,7 +902,10 @@ async def tail_member_parlay(
             return _redirect("/tail", error="Insufficient+chips.")
 
         odds_list = [m.odds for m in leg_markets]
-        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+        cap_err = await _parlay_cap_error_web(wager, odds_list)
+        if cap_err:
+            return _redirect("/tail", error=quote_plus(cap_err))
+        total_payout = parlay_payout(wager, odds_list)
 
         p = Parlay(
             guild_id=_GUILD_ID(),

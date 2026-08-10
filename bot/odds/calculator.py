@@ -71,6 +71,19 @@ def straight_payout(wager: int, odds: int) -> int:
     return max(wager, round(wager * american_to_decimal(odds)))
 
 
+def max_wager_for_cap(decimal_odds: float, cap: int) -> int:
+    """Largest integer wager whose payout at ``decimal_odds`` (see straight_payout
+    / parlay_payout — always max(wager, round(wager * decimal_odds))) stays within
+    ``cap``. Used to tell a member exactly how much they *could* wager when their
+    attempted amount would breach a payout cap, rather than just rejecting it."""
+    if cap <= 0 or decimal_odds <= 0:
+        return 0
+    wager = int(cap / decimal_odds)
+    while wager > 0 and round(wager * decimal_odds) > cap:
+        wager -= 1
+    return max(wager, 0)
+
+
 def cashout_value(original_wager: int, payout_if_win: int, rate: float) -> int:
     profit = payout_if_win - original_wager
     return max(1, round(original_wager + profit * rate))

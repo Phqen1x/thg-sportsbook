@@ -715,6 +715,8 @@ async def _seed_defaults() -> None:
     defaults = {
         "cashout_allowed": json.dumps(config.CASHOUT_ALLOWED),
         "cashout_rate": json.dumps(config.CASHOUT_RATE),
+        "single_payout_cap": json.dumps(config.SINGLE_PAYOUT_CAP),
+        "parlay_payout_cap": json.dumps(config.PARLAY_PAYOUT_CAP),
         "game_active": json.dumps(False),
         "betting_paused": json.dumps(False),
         "default_chips": json.dumps(config.DEFAULT_CHIPS),
