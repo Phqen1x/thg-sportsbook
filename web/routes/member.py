@@ -13,12 +13,12 @@ from bot.cogs.betting import (
     BETTING_BLOCKED_MSG, PARLAY_PAYOUT_CAP, MAX_PARLAY_LEGS,
 )
 from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
-from bot.utils.restrictions import is_fully_restricted
+from bot.utils.restrictions import is_fully_restricted, is_public_bet_blocked
 from web.audit import post_bet_log
 from web.routes.public import _parlay_flavor
 from bot.odds.calculator import straight_payout, parlay_payout, combined_american, resolve_cashout
 from web.database import get_db, get_request_guild
-from web.deps import require_user
+from web.deps import require_user, live_role_ids
 from web.session import SessionUser
 from web import config as _web_config
 
@@ -538,6 +538,9 @@ async def parlay_submit(
         total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
 
         public = is_public == "on"
+        role_ids = await live_role_ids(user.discord_id, user.guild_id)
+        downgraded = public and await is_public_bet_blocked(db, _GUILD_ID(), user.discord_id, role_ids)
+        public = public and not downgraded
         p = Parlay(
             guild_id=_GUILD_ID(),
             user_id=user.discord_id,
@@ -572,7 +575,10 @@ async def parlay_submit(
         labels = [m.label for m in leg_markets]
 
     asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout))
-    return _redirect("/my-bets", msg=f"Parlay+submitted!+Potential+payout:+{total_payout:,}+chips.")
+    msg = f"Parlay+submitted!+Potential+payout:+{total_payout:,}+chips."
+    if downgraded:
+        msg += "+(Kept+private+-+public+posting+is+restricted+for+you.)"
+    return _redirect("/my-bets", msg=msg)
 
 
 @router.post("/parlay/feature")

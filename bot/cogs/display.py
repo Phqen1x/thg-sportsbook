@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
@@ -151,6 +150,11 @@ _MODE_BUTTON_LABELS = {
 # Default check cadence for the live odds-updates watcher (see
 # `/settings odds_updates`) when a guild hasn't customized it.
 DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES = 5
+
+# Default announcement text and odds-movers bar when a guild hasn't
+# customized them (see `/settings odds_updates_message` / `odds_updates_threshold`).
+DEFAULT_ODDS_UPDATE_MESSAGE = "📈 **The odds have moved!** Check them out and place your bets!"
+DEFAULT_ODDS_UPDATE_THRESHOLD = 100
 
 
 def _decode_setting(raw: str | None, default=None):
@@ -362,7 +366,7 @@ LEADERBOARD_CATEGORIES = [
     ("CHIPS_BET", "Most Chips Bet"),
     ("BETS_WON", "Most Bets Won"),
     ("PARLAYS_WON", "Most Parlays Won"),
-    ("PARLAYS_TAILED", "Most Parlays Tailed"),
+    ("PARLAYS_TAILED", "Most Tailed Parlays"),
 ]
 
 
@@ -401,11 +405,11 @@ async def _leaderboard_rows(
             .limit(limit)
         )
     elif category == "PARLAYS_TAILED":
-        title, kind = "Most Parlays Tailed", "count"
+        title, kind = "Most Tailed Parlays", "count"
         result = await session.execute(
-            select(Parlay.user_id, func.count(Parlay.id))
-            .where(Parlay.guild_id == guild_id, Parlay.tailed_from_parlay_id.isnot(None))
-            .group_by(Parlay.user_id)
+            select(Parlay.tailed_from_user_id, func.count(Parlay.id))
+            .where(Parlay.guild_id == guild_id, Parlay.tailed_from_user_id.isnot(None))
+            .group_by(Parlay.tailed_from_user_id)
             .order_by(func.count(Parlay.id).desc())
             .limit(limit)
         )
@@ -493,21 +497,24 @@ class DisplayCog(commands.Cog):
 
         cards, featured = _build_board("tribute", tributes, alliances, markets, bet_counts)
 
-        # Only the moneyline cards feed change-detection — the featured-markets
-        # panel is cosmetic context, not what "tribute odds board" refers to.
-        snapshot = hashlib.sha256(
-            "|".join(
-                f"{c.badge}:{c.name}:{c.odds}:{c.status}"
-                for c in sorted(cards, key=lambda c: c.sort_key)
-            ).encode()
-        ).hexdigest()
+        # Per-tribute odds snapshot drives both change-detection and the
+        # odds-movers embed below, which needs each tribute's before/after
+        # odds rather than just a "something changed" fingerprint.
+        win_odds = {m.tribute_a_id: m.odds for m in markets if m.type == "TRIBUTE_WINS"}
+        new_snapshot = {
+            str(t.id): {
+                "name": t.name, "district": t.district, "gender": t.display_gender,
+                "odds": win_odds.get(t.id), "status": t.status,
+            }
+            for t in tributes
+        }
 
-        previous_hash = _decode_setting(await get_guild_setting(guild.id, "odds_updates_last_hash"))
-        await set_guild_setting(guild.id, "odds_updates_last_hash", snapshot)
+        previous_snapshot = _decode_setting(await get_guild_setting(guild.id, "odds_updates_last_snapshot"))
+        await set_guild_setting(guild.id, "odds_updates_last_snapshot", new_snapshot)
 
         # First check ever for this guild (no baseline yet) — record it
         # silently rather than posting, since nothing has actually "changed".
-        if previous_hash is None or previous_hash == snapshot:
+        if previous_snapshot is None or previous_snapshot == new_snapshot:
             return
 
         from bot.imaging.hot_odds import DEFAULT_ANNOUNCEMENT
@@ -519,8 +526,39 @@ class DisplayCog(commands.Cog):
             announcement or DEFAULT_ANNOUNCEMENT,
         )
         f = buf_to_discord_file(buf, "hot_odds.png")
+
+        # Odds-movers embed: only tributes present in both snapshots with
+        # known odds on both sides, and only if the swing clears the bar —
+        # skipped entirely (no embed) when nothing clears it.
+        threshold = _decode_setting(
+            await get_guild_setting(guild.id, "odds_updates_threshold"), DEFAULT_ODDS_UPDATE_THRESHOLD
+        )
+        movers = []
+        for tid, new in new_snapshot.items():
+            old = previous_snapshot.get(tid)
+            if old is None or old["odds"] is None or new["odds"] is None:
+                continue
+            diff = new["odds"] - old["odds"]
+            if abs(diff) >= threshold:
+                movers.append((abs(diff), diff, old, new))
+        movers.sort(key=lambda m: -m[0])
+
+        embeds = []
+        if movers:
+            embed = discord.Embed(title="📊 Odds Movers", color=0xC9A227)
+            lines = [
+                f"**{new['name']}** (D{new['district']}{new['gender']}) — "
+                f"{fmt_odds(old['odds'])} → {fmt_odds(new['odds'])}  ({diff:+d})"
+                for _, diff, old, new in movers
+            ]
+            _add_field_chunks(embed, f"Moved ±{threshold} or more since the last update", lines)
+            embeds.append(embed)
+
+        message = _decode_setting(
+            await get_guild_setting(guild.id, "odds_updates_message"), DEFAULT_ODDS_UPDATE_MESSAGE
+        )
         try:
-            await channel.send(content="📈 **The odds have moved!**", file=f)
+            await channel.send(content=message, file=f, embeds=embeds)
         except (discord.Forbidden, discord.HTTPException):
             log.warning(f"Failed to post odds update to channel {channel.id} in guild {guild.id}")
 

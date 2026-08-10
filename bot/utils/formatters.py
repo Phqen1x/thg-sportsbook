@@ -89,6 +89,10 @@ def market_type_label(t: str) -> str:
         "ALLIANCE_ONE_FINAL_8":    "Alliance One Final 8",
         "ALLIANCE_ALL_FINAL_5":    "Alliance All Final 5",
         "ALLIANCE_ONE_FINAL_5":    "Alliance One Final 5",
+        "PARTNER_SCORE_HIGHER":    "Partner Score Higher",
+        "PARTNER_SCORE_LOWER":     "Partner Score Lower",
+        "PARTNER_PLACE_HIGHER":    "Partner Place Higher",
+        "PARTNER_PLACE_LOWER":     "Partner Place Lower",
     }.get(t, t)
 
 

@@ -22,6 +22,7 @@ description: |
     WEB_PORT=443
 
   The database persists in $SNAP_COMMON/data/sportsbook.db across upgrades.
+  Uploaded face-claim images persist alongside it in $SNAP_COMMON/data/uploads.
 
 grade: stable
 confinement: strict

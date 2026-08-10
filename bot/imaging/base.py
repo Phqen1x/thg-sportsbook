@@ -244,6 +244,15 @@ async def _is_safe_image_url(url: str) -> bool:
 async def fetch_image_bytes(url: str) -> bytes | None:
     if not url:
         return None
+    if url.startswith("/uploads/"):
+        # Locally-persisted upload (see AdminCog._persist_asset) — read straight off
+        # disk instead of round-tripping through HTTP, since it's not a real URL.
+        path = config.UPLOADS_DIR / Path(url).name
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, path.read_bytes)
+        except OSError as e:
+            log.warning(f"Failed to read local upload {path}: {e}")
+            return None
     if not await _is_safe_image_url(url):
         log.warning(f"Blocked face claim fetch to non-HTTPS or private-network URL: {url}")
         return None

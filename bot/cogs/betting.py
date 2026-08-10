@@ -24,8 +24,9 @@ from bot.odds.calculator import (
     straight_payout, parlay_payout, combined_american, resolve_cashout
 )
 from bot.utils.action_views import build_request_view, render_request_content
+from bot.utils.exchange_rates import effective_rate
 from bot.utils.audit import post_bet_log
-from bot.utils.restrictions import is_fully_restricted
+from bot.utils.restrictions import is_fully_restricted, is_public_bet_blocked
 from bot.utils.formatters import fmt_chips, fmt_odds, fmt_odds_with_mult, safe_defer
 from bot.utils.market_view import _TYPE_LABELS, _TYPE_ORDER, _type_section
 
@@ -702,16 +703,52 @@ def _arena_conflict(existing_markets: list[Market], new_mkt: Market) -> str | No
     return None
 
 
+async def _multi_outcome_type_keys(db) -> set[str]:
+    """Type keys (CUSTOM_{id}) for every multi_outcome MarketTemplate — roster
+    markets like "Fifth Career Alliance Member" where one Market row exists per
+    eligible tribute and only one/a few can win. Takes a plain AsyncSession so
+    it works from either the bot's get_session() or the web's get_db()."""
+    rows = (await db.execute(
+        select(MarketTemplate).where(MarketTemplate.multi_outcome == True)
+    )).scalars().all()
+    return {f"CUSTOM_{t.id}" for t in rows}
+
+
+def _multi_outcome_conflict(
+    existing_markets: list[Market],
+    new_mkt: Market,
+    multi_outcome_types: set[str] | None,
+) -> str | None:
+    """Block stacking two outcome-rows of the same multi_outcome roster market
+    (e.g. two different tributes both bet as "Fifth Career Alliance Member") —
+    only one (or a tied few) tribute can win it, so a second leg from the same
+    template is either redundant or a guaranteed loser. Only types confirmed
+    multi_outcome via `multi_outcome_types` trigger this — legacy single-outcome
+    CUSTOM_ props (independent per-tribute yes/no bets) are unaffected."""
+    if not multi_outcome_types or new_mkt.type not in multi_outcome_types:
+        return None
+    if any(m.type == new_mkt.type for m in existing_markets):
+        return (
+            "You can't parlay more than one outcome from the same roster market "
+            "— only one (or a tied few) tribute can win it, so stacking two legs "
+            "from it is either redundant or a guaranteed loser."
+        )
+    return None
+
+
 def _parlay_conflict(
     existing_markets: list[Market],
     new_mkt: Market,
     tribute_by_id: dict[int, "Tribute"] | None = None,
+    multi_outcome_types: set[str] | None = None,
 ) -> str | None:
     """Single gate for every parlay leg-compatibility rule. Returns an error
     string if `new_mkt` can't legally share a parlay with `existing_markets`.
     `tribute_by_id` is optional context (tribute id -> Tribute) some rules need
     to resolve which district a market belongs to; pass one via
-    tribute_lookup_for_markets() where practical, or omit to skip those rules."""
+    tribute_lookup_for_markets() where practical, or omit to skip those rules.
+    `multi_outcome_types` is optional context (see _multi_outcome_type_keys())
+    for the roster-market rule; omit to skip it."""
     return (
         _milestone_conflict(existing_markets, new_mkt)
         or _placement_conflict(existing_markets, new_mkt)
@@ -726,6 +763,7 @@ def _parlay_conflict(
         or _extreme_score_partner_conflict(existing_markets, new_mkt)
         or _victor_conflict(existing_markets, new_mkt)
         or _arena_conflict(existing_markets, new_mkt)
+        or _multi_outcome_conflict(existing_markets, new_mkt, multi_outcome_types)
     )
 
 
@@ -752,6 +790,7 @@ async def add_markets_to_pending_slip(
             existing_markets.append(mkt)
 
     tribute_by_id = await tribute_lookup_for_markets(db, existing_markets + candidate_markets)
+    mo_types = await _multi_outcome_type_keys(db)
 
     added = 0
     skipped = 0
@@ -762,7 +801,7 @@ async def add_markets_to_pending_slip(
         if len(existing_market_ids) >= MAX_PARLAY_LEGS:
             skipped += 1
             continue
-        if _parlay_conflict(existing_markets, mkt, tribute_by_id):
+        if _parlay_conflict(existing_markets, mkt, tribute_by_id, mo_types):
             skipped += 1
             continue
         db.add(PendingParlayLeg(guild_id=guild_id, user_id=discord_id, market_id=mkt.id))
@@ -978,6 +1017,7 @@ async def parlay_market_autocomplete(
             existing_mkts = list(slip_result.scalars().all())
 
         tribute_by_id = await tribute_lookup_for_markets(session, existing_mkts + markets)
+        mo_types = await _multi_outcome_type_keys(session)
 
     choices = []
     for m in markets:
@@ -989,7 +1029,7 @@ async def parlay_market_autocomplete(
             continue
         if current.lower() not in m.label.lower():
             continue
-        if _parlay_conflict(existing_mkts, m, tribute_by_id):
+        if _parlay_conflict(existing_mkts, m, tribute_by_id, mo_types):
             continue
         choices.append(app_commands.Choice(name=m.label[:100], value=str(m.id)))
         if len(choices) >= 25:
@@ -1257,8 +1297,9 @@ async def _validate_tail_markets(session, user_id: int, market_ids: list[int], g
     if len(markets) < 2:
         return "This parlay no longer has enough open legs to tail.", []
     tribute_by_id = await tribute_lookup_for_markets(session, markets)
+    mo_types = await _multi_outcome_type_keys(session)
     for i, mkt in enumerate(markets):
-        conflict = _parlay_conflict(markets[:i], mkt, tribute_by_id)
+        conflict = _parlay_conflict(markets[:i], mkt, tribute_by_id, mo_types)
         if conflict:
             return conflict, []
         restriction = await _get_restriction_msg(session, user_id, mkt, guild_id)
@@ -1905,7 +1946,8 @@ class BettingCog(commands.Cog):
                 if leg_mkt:
                     existing_mkts.append(leg_mkt)
             tribute_by_id = await tribute_lookup_for_markets(session, existing_mkts + [mkt])
-            conflict = _parlay_conflict(existing_mkts, mkt, tribute_by_id)
+            mo_types = await _multi_outcome_type_keys(session)
+            conflict = _parlay_conflict(existing_mkts, mkt, tribute_by_id, mo_types)
             if conflict:
                 await interaction.followup.send(conflict, ephemeral=True)
                 return
@@ -2033,8 +2075,9 @@ class BettingCog(commands.Cog):
 
             # Final leg-compatibility validation pass before committing
             tribute_by_id = await tribute_lookup_for_markets(session, markets)
+            mo_types = await _multi_outcome_type_keys(session)
             for i, mkt in enumerate(markets):
-                conflict = _parlay_conflict(markets[:i], mkt, tribute_by_id)
+                conflict = _parlay_conflict(markets[:i], mkt, tribute_by_id, mo_types)
                 if conflict:
                     await interaction.followup.send(conflict, ephemeral=True)
                     return
@@ -2050,6 +2093,10 @@ class BettingCog(commands.Cog):
 
             user.chips -= wager
             user.total_wagered += wager
+
+            role_ids = {r.id for r in interaction.user.roles} if isinstance(interaction.user, discord.Member) else set()
+            downgraded = public and await is_public_bet_blocked(session, user.guild_id, user.discord_id, role_ids)
+            public = public and not downgraded
 
             parlay = Parlay(
                 guild_id=user.guild_id,
@@ -2082,10 +2129,12 @@ class BettingCog(commands.Cog):
 
         buf = await render_async(render_parlay_slip, leg_data, wager, total_payout, True)
         f = buf_to_discord_file(buf, f"parlay_{parlay_id}.png")
-        listed = (
-            "📣 Listed on the tailing board for others to copy."
-            if public else "🔒 Kept private — not listed for tailing."
-        )
+        if downgraded:
+            listed = "🔒 Kept private — public posting is restricted for you."
+        elif public:
+            listed = "📣 Listed on the tailing board for others to copy."
+        else:
+            listed = "🔒 Kept private — not listed for tailing."
         await interaction.followup.send(
             f"**Parlay #{parlay_id} submitted!** Wagered **{fmt_chips(wager)}** for a potential **{fmt_chips(total_payout)}**.\n"
             f"Remaining balance: {fmt_chips(new_balance)}\n{listed}",
@@ -2333,19 +2382,22 @@ class BettingCog(commands.Cog):
                 )
                 return
 
+            rate = await effective_rate(session, user.guild_id, member, "WITHDRAW")
+            panar_amount = round(amount * rate)
+
             user.chips -= amount
             new_balance = user.chips
             blocked = await is_fully_restricted(session, user.guild_id, user.discord_id)
 
             req = ChipRequest(
                 guild_id=user.guild_id, user_id=user.discord_id,
-                kind="WITHDRAW", amount=amount, status="PENDING",
+                kind="WITHDRAW", amount=amount, converted_amount=panar_amount, status="PENDING",
             )
             session.add(req)
             await session.flush()
 
             ping = await self._withdraw_ping(interaction)
-            content = ping + render_request_content("WITHDRAW", user.discord_id, amount)
+            content = ping + render_request_content("WITHDRAW", user.discord_id, amount, panar_amount)
             view = build_request_view(req, user.guild_id, user.discord_id, blocked)
 
             # Post the payout request inside the transaction: if the send fails,
@@ -2356,7 +2408,7 @@ class BettingCog(commands.Cog):
         await interaction.followup.send(
             f"Withdrawal request for **{fmt_chips(amount)}** submitted. The amount "
             f"has been debited from your balance (now **{fmt_chips(new_balance)}**) "
-            "and an admin will pay out your Panars shortly.",
+            f"and an admin will pay out **{panar_amount:,} Panars** shortly.",
             ephemeral=True,
         )
 
@@ -2390,21 +2442,24 @@ class BettingCog(commands.Cog):
             guild_id = user.guild_id
             blocked = await is_fully_restricted(session, guild_id, user.discord_id)
 
+            rate = await effective_rate(session, guild_id, member, "DEPOSIT")
+            chip_amount = round(amount * rate)
+
             req = ChipRequest(
                 guild_id=guild_id, user_id=user.discord_id,
-                kind="DEPOSIT", amount=amount, status="PENDING",
+                kind="DEPOSIT", amount=amount, converted_amount=chip_amount, status="PENDING",
             )
             session.add(req)
             await session.flush()
 
         ping = await self._withdraw_ping(interaction)
-        content = ping + render_request_content("DEPOSIT", member.id, amount)
+        content = ping + render_request_content("DEPOSIT", member.id, amount, chip_amount)
         view = build_request_view(req, guild_id, member.id, blocked)
         await channel.send(content=content, view=view)
 
         await interaction.followup.send(
             f"Deposit request for **{amount:,} Panars** submitted. An admin will "
-            f"take your Panars and credit **{fmt_chips(amount)}** to your balance "
+            f"take your Panars and credit **{fmt_chips(chip_amount)}** to your balance "
             "shortly.",
             ephemeral=True,
         )

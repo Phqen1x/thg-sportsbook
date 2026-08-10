@@ -6,8 +6,10 @@ import logging
 import math
 import random
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import AsyncGenerator
 
 import discord
@@ -31,6 +33,7 @@ from bot.database.models import (
     GameSetting,
     Market,
     MarketTemplate,
+    MarketTemplateTribute,
     Modifier,
     ModifierAssignment,
     Parlay,
@@ -70,6 +73,8 @@ from bot.odds.defaults import (
     game_default_odds,
     kill_boost_dr_factor,
     kill_quality_multiplier,
+    MULTI_OUTCOME_FACTORS,
+    multi_outcome_odds,
     pre_reaping_district_odds,
     prior_experience_factor,
     reputation_factor,
@@ -90,17 +95,25 @@ from bot.imaging.bet_slip import (
     render_straight_result_slip,
 )
 from bot.utils.checks import is_admin
+from bot.utils.economy import economy_totals
+from bot.utils.exchange_rates import (
+    clear_override, get_global_rate, list_overrides, set_global_rate, set_override,
+)
 from bot.utils.formatters import fmt_chips, fmt_odds, safe_defer
 from bot.utils.market_view import MarketPageView, MarketTypePageView, sort_markets
+from bot.utils.restrictions import is_public_bet_blocked, set_public_block
 
 # Leg-compatibility validation lives in the betting cog; reused here so admin and
 # auto-generated parlays obey the same conflict rules as member-built ones.
 from bot.cogs.betting import (
+    _multi_outcome_type_keys,
     _parlay_conflict,
     tribute_lookup_for_markets,
     PARLAY_PAYOUT_CAP,
 )
-from bot.cogs.display import DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES
+from bot.cogs.display import (
+    DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES, DEFAULT_ODDS_UPDATE_MESSAGE, DEFAULT_ODDS_UPDATE_THRESHOLD,
+)
 
 log = logging.getLogger("capitol.admin")
 
@@ -577,8 +590,12 @@ DIFFICULTY_CHOICES = [
 _DEATH_CAUSES = ["Natural Causes", "Mutt", "Another Tribute", "Trap/Event"]
 
 # Values must match _DEATH_CAUSES exactly so autocomplete selection maps 1:1 to
-# the cause stored on each DEATH_CAUSE market.
-_DEATH_CAUSE_SUGGESTIONS = _DEATH_CAUSES
+# the cause stored on each DEATH_CAUSE market. "Disqualified" is deliberately
+# excluded from _DEATH_CAUSES: it isn't an in-game outcome bettors could have
+# predicted, so no pre-game DEATH_CAUSE market is ever created for it — it
+# only exists as a /tribute kill suggestion, where it triggers voiding every
+# market on the tribute instead of resolving them.
+_DEATH_CAUSE_SUGGESTIONS = _DEATH_CAUSES + ["Disqualified"]
 
 # Each district fields at most two tributes, and never two of the same displayed
 # gender — one each of male / female / non-binary. Enforced on tribute creation,
@@ -1313,13 +1330,21 @@ async def _recalculate_markets(session) -> None:
 
     # Build a base-odds map for custom market types (difficulty baseline used as starting odds)
     tmpl_result = await session.execute(select(MarketTemplate))
+    all_templates = tmpl_result.scalars().all()
     custom_bases: dict[str, int] = {
         f"CUSTOM_{t.id}": (
             t.default_odds
             if t.default_odds is not None
             else DIFFICULTY_ODDS[t.difficulty]
         )
-        for t in tmpl_result.scalars().all()
+        for t in all_templates
+    }
+    # Multi-outcome roster templates (e.g. "Fifth Career Alliance Member") are
+    # priced by their own isolated pipeline (_recalculate_multi_outcome_markets)
+    # below, not by the generic per-tribute loop — skip them here so they don't
+    # get double-processed and overwritten by the group-influence/modifier stack.
+    multi_outcome_type_keys = {
+        f"CUSTOM_{t.id}" for t in all_templates if t.multi_outcome
     }
 
     # Load district aggregate records, global game count, and arena type for historical/death factors
@@ -1465,6 +1490,8 @@ async def _recalculate_markets(session) -> None:
     for market in markets:
         if market.tribute_a_id is None:
             continue  # global markets (e.g. ARENA_TYPE) have no tribute-driven odds
+        if market.type in multi_outcome_type_keys:
+            continue  # priced independently below, not by the generic modifier stack
         trib_a = next((t for t in all_tributes if t.id == market.tribute_a_id), None)
         trib_b = (
             next((t for t in all_tributes if t.id == market.tribute_b_id), None)
@@ -1593,6 +1620,52 @@ async def _recalculate_markets(session) -> None:
             ou_line=market.ou_line,
             ou_side=market.ou_side,
         )
+
+    await _recalculate_multi_outcome_markets(session, all_tributes, dr_map, all_dr)
+
+
+async def _recalculate_multi_outcome_markets(
+    session, all_tributes: list["Tribute"], dr_map: dict, all_dr: list
+) -> None:
+    """Reprice every OPEN/CLOSED, non-overridden Market row belonging to a
+    multi_outcome MarketTemplate (e.g. "Fifth Career Alliance Member").
+
+    Deliberately bypasses _compute_odds / apply_group_influence / the
+    solo_win_factors-alliance-influence stack above: pricing comes only from
+    MULTI_OUTCOME_FACTORS, normalised over each template's own eligible-tribute
+    set. This isolation is what keeps these markets from influencing, or being
+    influenced by, any other market's odds.
+    """
+    tmpl_result = await session.execute(
+        select(MarketTemplate).where(MarketTemplate.multi_outcome == True)
+    )
+    templates = tmpl_result.scalars().all()
+    if not templates:
+        return
+    tribute_map = {t.id: t for t in all_tributes}
+    for template in templates:
+        elig_result = await session.execute(
+            select(MarketTemplateTribute.tribute_id).where(
+                MarketTemplateTribute.template_id == template.id
+            )
+        )
+        eligible_ids = {row[0] for row in elig_result.all()}
+        eligible = [tribute_map[tid] for tid in eligible_ids if tid in tribute_map]
+        if not eligible:
+            continue
+        odds_by_id = multi_outcome_odds(
+            eligible, dr_map, all_dr, template.weight_overrides
+        )
+        mkt_result = await session.execute(
+            select(Market).where(
+                Market.type == f"CUSTOM_{template.id}",
+                Market.status.in_(["OPEN", "CLOSED"]),
+                Market.odds_override == False,
+            )
+        )
+        for market in mkt_result.scalars().all():
+            if market.tribute_a_id in odds_by_id:
+                market.odds = odds_by_id[market.tribute_a_id]
 
 
 async def _resolve_market(session, market: Market, result: bool | None) -> dict:
@@ -3904,6 +3977,20 @@ def _chunk_lines_into_fields(
         )
 
 
+def _add_economy_fields(embed: discord.Embed, economy: dict) -> None:
+    """Append the shared chip/Panar economy figures (see economy_totals) to a
+    stats embed, formatted for /admin stats overview."""
+    embed.add_field(name="💰 Chips Spent", value=fmt_chips(economy["chips_spent"]))
+    embed.add_field(name="🪙 Chips in Circulation", value=fmt_chips(economy["chips_circulating"]))
+    embed.add_field(name="⬇️ Panars Converted", value=fmt_chips(economy["panars_converted"]))
+    embed.add_field(name="⬆️ Chips Withdrawn", value=fmt_chips(economy["chips_withdrawn"]))
+    net = economy["net_panars"]
+    embed.add_field(
+        name="Net Panars",
+        value=f"{'+' if net >= 0 else ''}{fmt_chips(net)}",
+    )
+
+
 async def _reply(interaction: discord.Interaction, *args, **kwargs) -> None:
     try:
         if interaction.response.is_done():
@@ -5062,6 +5149,16 @@ class AdminCog(commands.Cog):
         description="Manage custom market types",
         default_permissions=_ADMIN_PERMS,
     )
+    market_type_tribute = app_commands.Group(
+        name="tribute",
+        description="Manage tribute eligibility for a multi-outcome market type",
+        parent=market_type,
+    )
+    market_type_weight = app_commands.Group(
+        name="weight",
+        description="Manage historical-factor weights for a multi-outcome market type",
+        parent=market_type,
+    )
     resolve = app_commands.Group(
         name="resolve",
         description="Bulk-resolve markets by type (placements, props, etc.)",
@@ -5111,6 +5208,11 @@ class AdminCog(commands.Cog):
         description="Manage odds modifiers",
         default_permissions=_ADMIN_PERMS,
     )
+    economy = app_commands.Group(
+        name="economy",
+        description="Chip/Panar exchange rates",
+        default_permissions=_ADMIN_PERMS,
+    )
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -5136,6 +5238,39 @@ class AdminCog(commands.Cog):
             pass
 
     # ── TRIBUTE COMMANDS ──────────────────────────────────────────────────────
+
+    async def _persist_asset(
+        self, interaction: discord.Interaction, attachment: discord.Attachment
+    ) -> tuple[str, str | None]:
+        """Save an uploaded attachment to local disk and return a stable /uploads/... URL
+        served by the web app.
+
+        Discord CDN attachment URLs — including ones reposted to another channel to make
+        them "permanent" — all carry a signed ``ex``/``is``/``hm`` expiry and go dead
+        roughly a day after being issued, so storing any ``cdn.discordapp.com`` URL
+        directly means the image silently stops loading once it expires. Persisting the
+        bytes locally (alongside the per-guild sqlite DB in ``data/``) avoids that
+        entirely. If the write fails, falls back to the attachment's own (expiring) URL
+        and returns a warning to surface to the admin.
+        """
+        from bot import config as cfg
+
+        try:
+            data = await attachment.read()
+            ext = Path(attachment.filename).suffix.lower()
+            if not re.fullmatch(r"\.[a-z0-9]{1,5}", ext):
+                ext = ""
+            filename = f"{uuid.uuid4().hex}{ext}"
+            cfg.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+            (cfg.UPLOADS_DIR / filename).write_bytes(data)
+            return f"/uploads/{filename}", None
+        except OSError as e:
+            log.warning(f"Failed to persist asset upload to {cfg.UPLOADS_DIR}: {e}")
+            return attachment.url, (
+                "Couldn't save this image to local storage, so it's stored at Discord's "
+                "temporary upload link and **will stop displaying in about a day**. "
+                "Check the bot's disk permissions and re-upload to fix this."
+            )
 
     @tribute.command(name="add", description="Add a new tribute to the Games")
     @app_commands.describe(
@@ -5177,7 +5312,11 @@ class AdminCog(commands.Cog):
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
-        resolved_face_claim = face_claim_file.url if face_claim_file else face_claim
+        asset_warning: str | None = None
+        if face_claim_file:
+            resolved_face_claim, asset_warning = await self._persist_asset(interaction, face_claim_file)
+        else:
+            resolved_face_claim = face_claim
         async with get_session() as session:
             if sade_champion:
                 existing_champ = await session.execute(
@@ -5289,6 +5428,8 @@ class AdminCog(commands.Cog):
         if resolved_face_claim:
             embed.set_thumbnail(url=resolved_face_claim)
         await interaction.followup.send(embed=embed, ephemeral=True)
+        if asset_warning:
+            await interaction.followup.send(f"⚠️ {asset_warning}", ephemeral=True)
 
     @tribute.command(name="edit", description="Edit an existing tribute")
     @app_commands.describe(
@@ -5341,7 +5482,11 @@ class AdminCog(commands.Cog):
                 )
                 return
 
-        resolved_face_claim = face_claim_file.url if face_claim_file else face_claim
+        asset_warning: str | None = None
+        if face_claim_file:
+            resolved_face_claim, asset_warning = await self._persist_asset(interaction, face_claim_file)
+        else:
+            resolved_face_claim = face_claim
         async with get_session() as session:
             t = await session.get(Tribute, int(tribute_id))
             if not t:
@@ -5395,6 +5540,8 @@ class AdminCog(commands.Cog):
         await interaction.followup.send(
             f"Tribute **{updated_name}** updated{sf_str}.", ephemeral=True
         )
+        if asset_warning:
+            await interaction.followup.send(f"⚠️ {asset_warning}", ephemeral=True)
 
     @tribute.command(
         name="set_score",
@@ -5550,7 +5697,7 @@ class AdminCog(commands.Cog):
             await interaction.followup.send(
                 "⚠️ Cause **Another Tribute** requires the killer — set `killed_by_id` "
                 "so the kill is credited, or pick an environmental cause "
-                "(Natural Causes / Mutt / Trap/Event).",
+                "(Natural Causes / Mutt / Trap/Event / Disqualified).",
                 ephemeral=True,
             )
             return
@@ -5584,6 +5731,11 @@ class AdminCog(commands.Cog):
             # death) — every bet made on them is voided and refunded rather than
             # resolved as a loss, since they never got a fair shot at the Games.
             void_scoreless_death = t.training_score is None
+            # Disqualification is a GM ruling, not an in-game outcome bettors
+            # could have predicted — void every market on this tribute (straight
+            # bets refunded, parlay legs voided) rather than resolving them as
+            # losses.
+            void_death = void_scoreless_death or cause == "Disqualified"
             killer_name = None
             killer_district = None
             killer_gender = None
@@ -5676,9 +5828,9 @@ class AdminCog(commands.Cog):
                 )
             )
             for mkt in a_mkts.scalars().all():
-                if void_scoreless_death:
-                    # Never trained/scored before dying — void every bet on them
-                    # instead of resolving it, win or lose.
+                if void_death:
+                    # Never trained/scored before dying, or disqualified — void
+                    # every bet on them instead of resolving it, win or lose.
                     await _resolve_market(session, mkt, None)
                 elif mkt.type in ("MISSES_FINAL_8", "MISSES_FINAL_5"):
                     await _resolve_market(session, mkt, True)
@@ -5733,7 +5885,7 @@ class AdminCog(commands.Cog):
                 )
             )
             for mkt in b_mkts.scalars().all():
-                if void_scoreless_death:
+                if void_death:
                     await _resolve_market(session, mkt, None)
                 elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
                     # tribute_b (the partner) just died — resolve if tribute_a placement is known.
@@ -7594,8 +7746,16 @@ class AdminCog(commands.Cog):
         difficulty="Sets default odds unless overridden",
         default_odds="American odds override (e.g. +500)",
         label_template="Label format — use {tribute} as placeholder",
+        multi_outcome="Roster market with one outcome per eligible tribute (e.g. 'Fifth Career Alliance Member'), priced from historical data instead of a flat difficulty odds",
+        eligibility_mode="Required when multi_outcome is set — how eligible tributes are chosen",
     )
-    @app_commands.choices(difficulty=DIFFICULTY_CHOICES)
+    @app_commands.choices(
+        difficulty=DIFFICULTY_CHOICES,
+        eligibility_mode=[
+            app_commands.Choice(name="Whitelist — starts empty, add tributes in", value="whitelist"),
+            app_commands.Choice(name="Blacklist — starts with everyone, remove tributes out", value="blacklist"),
+        ],
+    )
     @is_admin()
     async def market_type_create(
         self,
@@ -7605,8 +7765,17 @@ class AdminCog(commands.Cog):
         difficulty: app_commands.Choice[str],
         default_odds: int | None = None,
         label_template: str | None = None,
+        multi_outcome: bool = False,
+        eligibility_mode: app_commands.Choice[str] | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
+            return
+        if multi_outcome and eligibility_mode is None:
+            await interaction.followup.send(
+                "Multi-outcome market types require an `eligibility_mode` "
+                "(whitelist or blacklist).",
+                ephemeral=True,
+            )
             return
         async with get_session() as session:
             existing = await session.execute(
@@ -7624,10 +7793,19 @@ class AdminCog(commands.Cog):
                 default_odds=default_odds,
                 label_template=label_template,
                 active=True,
+                multi_outcome=multi_outcome,
+                eligibility_mode=eligibility_mode.value if eligibility_mode else None,
             )
             session.add(template)
             await session.flush()
             tid = template.id
+
+            elig_count = 0
+            if multi_outcome and eligibility_mode and eligibility_mode.value == "blacklist":
+                trib_result = await session.execute(select(Tribute))
+                for t in trib_result.scalars().all():
+                    session.add(MarketTemplateTribute(template_id=tid, tribute_id=t.id))
+                    elig_count += 1
 
         effective_odds = (
             default_odds
@@ -7642,9 +7820,28 @@ class AdminCog(commands.Cog):
         embed.add_field(name="ID", value=str(tid))
         if label_template:
             embed.add_field(name="Label Template", value=label_template, inline=False)
-        embed.set_footer(
-            text="Use /admin market add and search for this type to create markets from it."
-        )
+        if multi_outcome:
+            embed.add_field(name="Multi-Outcome", value=eligibility_mode.name, inline=False)
+            if eligibility_mode.value == "blacklist":
+                embed.add_field(
+                    name="Eligible Tributes",
+                    value=f"All {elig_count} current tributes. Use `/admin market_type tribute remove` "
+                    "to exclude specific ones.",
+                    inline=False,
+                )
+            else:
+                embed.add_field(
+                    name="Eligible Tributes",
+                    value="None yet — use `/admin market_type tribute add` to add tributes.",
+                    inline=False,
+                )
+            embed.set_footer(
+                text="Use /admin market_type generate once eligibility and weights are set."
+            )
+        else:
+            embed.set_footer(
+                text="Use /admin market add and search for this type to create markets from it."
+            )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @market_type.command(name="list", description="List all custom market types")
@@ -7773,6 +7970,411 @@ class AdminCog(commands.Cog):
 
         await interaction.followup.send(
             f"Custom market type **{name}** deleted.", ephemeral=True
+        )
+
+    # ── MULTI-OUTCOME MARKET TYPE: ELIGIBILITY ─────────────────────────────────
+
+    async def _require_multi_outcome_template(
+        self, interaction: discord.Interaction, session, template_id: str
+    ) -> MarketTemplate | None:
+        template = await session.get(MarketTemplate, int(template_id))
+        if not template:
+            await interaction.followup.send("Market type not found.", ephemeral=True)
+            return None
+        if not template.multi_outcome:
+            await interaction.followup.send(
+                f"**{template.name}** is not a multi-outcome market type.",
+                ephemeral=True,
+            )
+            return None
+        return template
+
+    @market_type_tribute.command(name="add", description="Add a tribute to a multi-outcome market type's eligible outcomes")
+    @app_commands.describe(template_id="Multi-outcome market type", tribute_id="Tribute to add")
+    @app_commands.autocomplete(template_id=market_template_autocomplete, tribute_id=tribute_autocomplete)
+    @is_admin()
+    async def market_type_tribute_add(
+        self, interaction: discord.Interaction, template_id: str, tribute_id: str
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            template = await self._require_multi_outcome_template(interaction, session, template_id)
+            if template is None:
+                return
+            trib = await session.get(Tribute, int(tribute_id))
+            if not trib:
+                await interaction.followup.send("Tribute not found.", ephemeral=True)
+                return
+            existing = await session.execute(
+                select(MarketTemplateTribute).where(
+                    MarketTemplateTribute.template_id == template.id,
+                    MarketTemplateTribute.tribute_id == trib.id,
+                )
+            )
+            if existing.scalars().first():
+                await interaction.followup.send(
+                    f"{trib.name} is already eligible for **{template.name}**.",
+                    ephemeral=True,
+                )
+                return
+            session.add(MarketTemplateTribute(template_id=template.id, tribute_id=trib.id))
+            name, trib_name = template.name, trib.name
+
+        await interaction.followup.send(
+            f"Added **{trib_name}** to **{name}**'s eligible tributes.", ephemeral=True
+        )
+
+    @market_type_tribute.command(name="remove", description="Remove a tribute from a multi-outcome market type's eligible outcomes")
+    @app_commands.describe(template_id="Multi-outcome market type", tribute_id="Tribute to remove")
+    @app_commands.autocomplete(template_id=market_template_autocomplete, tribute_id=tribute_autocomplete)
+    @is_admin()
+    async def market_type_tribute_remove(
+        self, interaction: discord.Interaction, template_id: str, tribute_id: str
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            template = await self._require_multi_outcome_template(interaction, session, template_id)
+            if template is None:
+                return
+            trib = await session.get(Tribute, int(tribute_id))
+            if not trib:
+                await interaction.followup.send("Tribute not found.", ephemeral=True)
+                return
+            elig_result = await session.execute(
+                select(MarketTemplateTribute).where(
+                    MarketTemplateTribute.template_id == template.id,
+                    MarketTemplateTribute.tribute_id == trib.id,
+                )
+            )
+            elig_row = elig_result.scalars().first()
+            if not elig_row:
+                await interaction.followup.send(
+                    f"{trib.name} isn't eligible for **{template.name}**.", ephemeral=True
+                )
+                return
+            await session.delete(elig_row)
+            # Close (not delete/void) any already-generated market for this
+            # tribute so no new bets land on an outcome that's no longer
+            # eligible — existing bets stay pending and simply won't be
+            # selected as a winner when the type is resolved.
+            mkt_result = await session.execute(
+                select(Market).where(
+                    Market.type == f"CUSTOM_{template.id}",
+                    Market.tribute_a_id == trib.id,
+                    Market.status.in_(["OPEN", "CLOSED"]),
+                )
+            )
+            mkt = mkt_result.scalars().first()
+            if mkt:
+                mkt.status = "CLOSED"
+            name, trib_name = template.name, trib.name
+
+        await interaction.followup.send(
+            f"Removed **{trib_name}** from **{name}**'s eligible tributes.", ephemeral=True
+        )
+
+    @market_type_tribute.command(name="list", description="List eligible tributes for a multi-outcome market type")
+    @app_commands.describe(template_id="Multi-outcome market type")
+    @app_commands.autocomplete(template_id=market_template_autocomplete)
+    @is_admin()
+    async def market_type_tribute_list(
+        self, interaction: discord.Interaction, template_id: str
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            template = await self._require_multi_outcome_template(interaction, session, template_id)
+            if template is None:
+                return
+            elig_result = await session.execute(
+                select(MarketTemplateTribute.tribute_id).where(
+                    MarketTemplateTribute.template_id == template.id
+                )
+            )
+            elig_ids = {row[0] for row in elig_result.all()}
+            trib_result = await session.execute(select(Tribute).order_by(Tribute.district))
+            eligible = [t for t in trib_result.scalars().all() if t.id in elig_ids]
+            name = template.name
+
+        if not eligible:
+            await interaction.followup.send(
+                f"**{name}** has no eligible tributes yet.", ephemeral=True
+            )
+            return
+        lines = [f"• D{t.district}{t.display_gender} {t.name} ({t.status})" for t in eligible]
+        embed = discord.Embed(
+            title=f"{name} — {len(eligible)} Eligible Tributes",
+            description="\n".join(lines),
+            color=0x4CAF50,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @market_type_tribute.command(name="sync", description="Blacklist-mode helper: add any tribute missing from eligibility (e.g. after a new reaping)")
+    @app_commands.describe(template_id="Multi-outcome market type (blacklist mode)")
+    @app_commands.autocomplete(template_id=market_template_autocomplete)
+    @is_admin()
+    async def market_type_tribute_sync(
+        self, interaction: discord.Interaction, template_id: str
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            template = await self._require_multi_outcome_template(interaction, session, template_id)
+            if template is None:
+                return
+            if template.eligibility_mode != "blacklist":
+                await interaction.followup.send(
+                    f"**{template.name}** is whitelist mode — add tributes explicitly "
+                    "with `/admin market_type tribute add`.",
+                    ephemeral=True,
+                )
+                return
+            elig_result = await session.execute(
+                select(MarketTemplateTribute.tribute_id).where(
+                    MarketTemplateTribute.template_id == template.id
+                )
+            )
+            elig_ids = {row[0] for row in elig_result.all()}
+            trib_result = await session.execute(select(Tribute))
+            added = 0
+            for t in trib_result.scalars().all():
+                if t.id not in elig_ids:
+                    session.add(MarketTemplateTribute(template_id=template.id, tribute_id=t.id))
+                    added += 1
+            name = template.name
+
+        await interaction.followup.send(
+            f"Synced **{name}** — added {added} newly-eligible tribute(s).", ephemeral=True
+        )
+
+    # ── MULTI-OUTCOME MARKET TYPE: HISTORICAL-FACTOR WEIGHTS ───────────────────
+
+    @market_type_weight.command(name="set", description="Prioritize (or deprioritize) a historical factor for a multi-outcome market type")
+    @app_commands.describe(
+        template_id="Multi-outcome market type",
+        factor="Historical factor to weight",
+        weight="Weight multiplier — 1.0 = default, 0 = ignore this factor entirely, 2.0 = double its pull",
+    )
+    @app_commands.choices(factor=[
+        app_commands.Choice(name=label, value=key)
+        for key, (label, _fn) in MULTI_OUTCOME_FACTORS.items()
+    ])
+    @app_commands.autocomplete(template_id=market_template_autocomplete)
+    @is_admin()
+    async def market_type_weight_set(
+        self,
+        interaction: discord.Interaction,
+        template_id: str,
+        factor: app_commands.Choice[str],
+        weight: app_commands.Range[float, 0.0, 10.0],
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            template = await self._require_multi_outcome_template(interaction, session, template_id)
+            if template is None:
+                return
+            overrides = dict(template.weight_overrides or {})
+            overrides[factor.value] = weight
+            template.weight_overrides = overrides
+            name = template.name
+
+        await interaction.followup.send(
+            f"**{name}** — {factor.name} weight set to {weight}.", ephemeral=True
+        )
+
+    @market_type_weight.command(name="list", description="Show effective historical-factor weights for a multi-outcome market type")
+    @app_commands.describe(template_id="Multi-outcome market type")
+    @app_commands.autocomplete(template_id=market_template_autocomplete)
+    @is_admin()
+    async def market_type_weight_list(
+        self, interaction: discord.Interaction, template_id: str
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            template = await self._require_multi_outcome_template(interaction, session, template_id)
+            if template is None:
+                return
+            overrides = template.weight_overrides or {}
+            name = template.name
+
+        lines = []
+        for key, (label, _fn) in MULTI_OUTCOME_FACTORS.items():
+            w = overrides.get(key, 1.0)
+            marker = " (overridden)" if key in overrides else ""
+            lines.append(f"• **{label}**: {w}{marker}")
+        embed = discord.Embed(
+            title=f"{name} — Historical Factor Weights",
+            description="\n".join(lines),
+            color=0x4CAF50,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @market_type_weight.command(name="reset", description="Reset one or all historical-factor weights to default (1.0)")
+    @app_commands.describe(
+        template_id="Multi-outcome market type",
+        factor="Factor to reset (omit to reset all factors)",
+    )
+    @app_commands.choices(factor=[
+        app_commands.Choice(name=label, value=key)
+        for key, (label, _fn) in MULTI_OUTCOME_FACTORS.items()
+    ])
+    @app_commands.autocomplete(template_id=market_template_autocomplete)
+    @is_admin()
+    async def market_type_weight_reset(
+        self,
+        interaction: discord.Interaction,
+        template_id: str,
+        factor: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            template = await self._require_multi_outcome_template(interaction, session, template_id)
+            if template is None:
+                return
+            if factor is None:
+                template.weight_overrides = {}
+            else:
+                overrides = dict(template.weight_overrides or {})
+                overrides.pop(factor.value, None)
+                template.weight_overrides = overrides
+            name = template.name
+
+        what = factor.name if factor else "all factors"
+        await interaction.followup.send(
+            f"**{name}** — reset {what} to default weight.", ephemeral=True
+        )
+
+    # ── MULTI-OUTCOME MARKET TYPE: GENERATE & RESOLVE ───────────────────────────
+
+    @market_type.command(name="generate", description="Create missing markets for a multi-outcome market type's eligible tributes")
+    @app_commands.describe(template_id="Multi-outcome market type", phase_id="Betting phase for newly-created markets")
+    @app_commands.autocomplete(template_id=market_template_autocomplete, phase_id=phase_autocomplete)
+    @is_admin()
+    async def market_type_generate(
+        self, interaction: discord.Interaction, template_id: str, phase_id: str | None = None
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            template = await self._require_multi_outcome_template(interaction, session, template_id)
+            if template is None:
+                return
+            pid = int(phase_id) if phase_id else None
+            if pid and not await session.get(BettingPhase, pid):
+                await interaction.followup.send("Phase not found.", ephemeral=True)
+                return
+
+            elig_result = await session.execute(
+                select(MarketTemplateTribute.tribute_id).where(
+                    MarketTemplateTribute.template_id == template.id
+                )
+            )
+            elig_ids = {row[0] for row in elig_result.all()}
+            trib_result = await session.execute(select(Tribute))
+            tribute_map = {t.id: t for t in trib_result.scalars().all()}
+            eligible = [tribute_map[tid] for tid in elig_ids if tid in tribute_map]
+            if not eligible:
+                await interaction.followup.send(
+                    f"**{template.name}** has no eligible tributes yet.", ephemeral=True
+                )
+                return
+
+            type_key = f"CUSTOM_{template.id}"
+            existing_result = await session.execute(
+                select(Market.tribute_a_id).where(Market.type == type_key)
+            )
+            existing_ids = {row[0] for row in existing_result.all()}
+
+            hist_result = await session.execute(select(DistrictRecord))
+            all_dr = list(hist_result.scalars().all())
+            dr_map = {r.district: r for r in all_dr}
+            odds_by_id = multi_outcome_odds(eligible, dr_map, all_dr, template.weight_overrides)
+
+            created = 0
+            for t in eligible:
+                if t.id in existing_ids:
+                    continue
+                tribute_str = f"D{t.district}{t.display_gender} {t.name}"
+                if template.label_template:
+                    label = template.label_template.replace("{tribute}", tribute_str)
+                else:
+                    label = f"{tribute_str} — {template.name}"
+                session.add(Market(
+                    type=type_key,
+                    label=label,
+                    tribute_a_id=t.id,
+                    phase_id=pid,
+                    odds=odds_by_id.get(t.id, DEFAULT_FALLBACK_ODDS),
+                ))
+                created += 1
+            name = template.name
+
+        await interaction.followup.send(
+            f"**{name}** — created {created} market(s) ({len(existing_ids)} already existed).",
+            ephemeral=True,
+        )
+
+    @market_type.command(name="resolve", description="Resolve a multi-outcome market type by picking the winning tribute(s)")
+    @app_commands.describe(
+        template_id="Multi-outcome market type",
+        tribute_a="Winning tribute",
+        tribute_b="Additional winning tribute (tie)",
+        tribute_c="Additional winning tribute (tie)",
+    )
+    @app_commands.autocomplete(
+        template_id=market_template_autocomplete,
+        tribute_a=tribute_autocomplete,
+        tribute_b=tribute_autocomplete,
+        tribute_c=tribute_autocomplete,
+    )
+    @is_admin()
+    async def market_type_resolve(
+        self,
+        interaction: discord.Interaction,
+        template_id: str,
+        tribute_a: str,
+        tribute_b: str | None = None,
+        tribute_c: str | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        winner_ids = {int(x) for x in (tribute_a, tribute_b, tribute_c) if x}
+        async with _collect_notifications() as notifs:
+            async with get_session() as session:
+                template = await self._require_multi_outcome_template(interaction, session, template_id)
+                if template is None:
+                    return
+                mkt_result = await session.execute(
+                    select(Market).where(
+                        Market.type == f"CUSTOM_{template.id}",
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                    )
+                )
+                markets = mkt_result.scalars().all()
+                if not markets:
+                    await interaction.followup.send(
+                        f"**{template.name}** has no unresolved markets.", ephemeral=True
+                    )
+                    return
+                resolved = 0
+                won = 0
+                for m in markets:
+                    result = m.tribute_a_id in winner_ids
+                    await _resolve_market(session, m, result)
+                    resolved += 1
+                    if result:
+                        won += 1
+                name = template.name
+
+        await _send_resolution_dms(self.bot, notifs)
+        await interaction.followup.send(
+            f"**{name}** resolved — {resolved} market(s) settled, {won} winning outcome(s).",
+            ephemeral=True,
         )
 
     # ── GAME COMMANDS ─────────────────────────────────────────────────────────
@@ -9082,9 +9684,17 @@ class AdminCog(commands.Cog):
     async def stats_overview(self, interaction: discord.Interaction) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
+        async with get_read_session() as session:
+            economy = await economy_totals(session, current_guild_id())
         tributes, phase_name, active = await self._load_stats_context()
         if not tributes:
-            await interaction.followup.send("No tributes in play.", ephemeral=True)
+            embed = discord.Embed(
+                title="🏟️ Games — Live Overview",
+                description="No tributes in play.",
+                color=0xC9A227,
+            )
+            _add_economy_fields(embed, economy)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         alive = [t for t in tributes if t.status == "ALIVE"]
@@ -9147,6 +9757,7 @@ class AdminCog(commands.Cog):
                 ),
                 inline=False,
             )
+        _add_economy_fields(embed, economy)
         embed.set_footer(
             text="Detail: /admin stats kills • /admin stats districts • /admin stats alliances"
         )
@@ -9483,7 +10094,8 @@ class AdminCog(commands.Cog):
             tribute_by_id = await tribute_lookup_for_markets(
                 session, existing_mkts + [new_mkt]
             )
-            conflict = _parlay_conflict(existing_mkts, new_mkt, tribute_by_id)
+            mo_types = await _multi_outcome_type_keys(session)
+            conflict = _parlay_conflict(existing_mkts, new_mkt, tribute_by_id, mo_types)
             if conflict:
                 await interaction.followup.send(conflict, ephemeral=True)
                 return
@@ -9943,6 +10555,63 @@ class AdminCog(commands.Cog):
         await interaction.followup.send(
             f"Alliance **{name}** created (ID: {aid}).", ephemeral=True
         )
+
+    @alliance.command(name="rename", description="Rename an alliance")
+    @app_commands.describe(alliance_id="Alliance to rename", new_name="New alliance name")
+    @app_commands.autocomplete(alliance_id=alliance_autocomplete)
+    @is_admin()
+    async def alliance_rename(
+        self, interaction: discord.Interaction, alliance_id: str, new_name: str
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            a = await session.get(Alliance, int(alliance_id))
+            if not a:
+                await interaction.followup.send("Alliance not found.", ephemeral=True)
+                return
+            old_name = a.name
+            a.name = new_name
+            await session.flush()
+
+            # Relabel already-created markets for this alliance — "cause" and
+            # "label" are baked in as static text at creation time and won't
+            # pick up the rename on their own.
+            m_result = await session.execute(
+                select(Market).where(
+                    Market.type.in_(_ALLIANCE_MARKET_TYPES | {"FIRST_IN_ALLIANCE_DEATH"}),
+                    Market.placement_num == a.id,
+                )
+            )
+            relabeled = 0
+            for mkt in m_result.scalars().all():
+                trib_a = (
+                    await session.get(Tribute, mkt.tribute_a_id)
+                    if mkt.tribute_a_id
+                    else None
+                )
+                trib_b = (
+                    await session.get(Tribute, mkt.tribute_b_id)
+                    if mkt.tribute_b_id
+                    else None
+                )
+                mkt.cause = new_name
+                mkt.label = _build_label(
+                    mkt.type,
+                    trib_a,
+                    trib_b,
+                    new_name,
+                    mkt.placement_num,
+                    mkt.top_n,
+                    mkt.ou_line,
+                    mkt.ou_side,
+                )
+                relabeled += 1
+
+        msg = f"Alliance **{old_name}** renamed to **{new_name}**."
+        if relabeled:
+            msg += f"\n{relabeled} market label(s) updated."
+        await interaction.followup.send(msg, ephemeral=True)
 
     @alliance.command(name="add_tribute", description="Add a tribute to an alliance")
     @app_commands.describe(alliance_id="Alliance to join", tribute_id="Tribute to add")
@@ -11280,12 +11949,64 @@ class AdminCog(commands.Cog):
         # Reset change-detection state so the next check establishes a fresh
         # baseline against the current board instead of comparing against
         # whatever was tracked before this (re)configuration.
-        await set_guild_setting(gid, "odds_updates_last_hash", None)
+        await set_guild_setting(gid, "odds_updates_last_snapshot", None)
         await set_guild_setting(gid, "odds_updates_last_checked_at", None)
 
         await interaction.followup.send(
             f"Live Tribute Odds updates will now post to {channel.mention} whenever the "
             f"board changes, checked every **{interval}** minute(s).",
+            ephemeral=True,
+        )
+
+    @settings.command(
+        name="odds_updates_message",
+        description="Set the message posted alongside live Tribute Odds board updates",
+    )
+    @app_commands.describe(
+        message=f'Message text (leave empty to reset to the default: "{DEFAULT_ODDS_UPDATE_MESSAGE}")',
+    )
+    @is_admin()
+    async def odds_updates_message(
+        self,
+        interaction: discord.Interaction,
+        message: app_commands.Range[str, 1, 500] | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.database.engine import set_guild_setting
+
+        await set_guild_setting(current_guild_id(), "odds_updates_message", message)
+        if message is None:
+            await interaction.followup.send(
+                f'Reset the odds-updates message to the default: "{DEFAULT_ODDS_UPDATE_MESSAGE}"',
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f'Odds updates will now post with the message: "{message}"',
+                ephemeral=True,
+            )
+
+    @settings.command(
+        name="odds_updates_threshold",
+        description="Set the minimum +/- odds swing for a tribute to appear in the odds-movers embed",
+    )
+    @app_commands.describe(
+        threshold=f"Minimum absolute odds change to include a tribute (default {DEFAULT_ODDS_UPDATE_THRESHOLD})",
+    )
+    @is_admin()
+    async def odds_updates_threshold(
+        self,
+        interaction: discord.Interaction,
+        threshold: app_commands.Range[int, 1, 10_000],
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.database.engine import set_guild_setting
+
+        await set_guild_setting(current_guild_id(), "odds_updates_threshold", threshold)
+        await interaction.followup.send(
+            f"Tributes must move by **±{threshold}** or more to show up in the odds-movers embed.",
             ephemeral=True,
         )
 
@@ -11775,18 +12496,11 @@ class AdminCog(commands.Cog):
                 )
             )
             restrictions = result.scalars().all()
-
-        if not restrictions:
-            await interaction.followup.send(
-                f"**{member.display_name}** has no betting restrictions.",
-                ephemeral=True,
+            role_ids = {r.id for r in member.roles}
+            public_blocked = await is_public_bet_blocked(
+                session, current_guild_id(), member.id, role_ids
             )
-            return
 
-        embed = discord.Embed(
-            title=f"Betting Restrictions — {member.display_name}",
-            color=0xE74C3C,
-        )
         lines = []
         for r in restrictions:
             if r.restriction_type == "ALL":
@@ -11799,8 +12513,115 @@ class AdminCog(commands.Cog):
                 lines.append(
                     f"• **Tribute ID {r.tribute_id}** — blocked from markets involving this tribute"
                 )
+        if public_blocked:
+            lines.append("• **Public parlays** — submissions are kept private (tail board)")
+
+        if not lines:
+            await interaction.followup.send(
+                f"**{member.display_name}** has no betting restrictions.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"Betting Restrictions — {member.display_name}",
+            color=0xE74C3C,
+        )
         embed.description = "\n".join(lines)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @restrict.command(
+        name="block_public_user",
+        description="Block a user from posting public parlays (tail board) — they can still bet privately",
+    )
+    @app_commands.describe(member="User to restrict from public posting")
+    @is_admin()
+    async def restrict_block_public_user(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            changed = await set_public_block(session, current_guild_id(), "USER", member.id, True)
+        if not changed:
+            await interaction.followup.send(
+                f"**{member.display_name}** is already blocked from posting public parlays.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"**{member.display_name}** is now blocked from posting public parlays — their "
+            "public submissions will be kept private instead.",
+            ephemeral=True,
+        )
+
+    @restrict.command(
+        name="unblock_public_user", description="Lift a user's public-parlay block"
+    )
+    @app_commands.describe(member="User to unblock")
+    @is_admin()
+    async def restrict_unblock_public_user(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            changed = await set_public_block(session, current_guild_id(), "USER", member.id, False)
+        if not changed:
+            await interaction.followup.send(
+                f"**{member.display_name}** does not have a public-parlay block.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"Public-parlay block lifted for **{member.display_name}**.", ephemeral=True
+        )
+
+    @restrict.command(
+        name="block_public_role",
+        description="Block everyone with a role from posting public parlays (tail board)",
+    )
+    @app_commands.describe(role="Role to restrict from public posting")
+    @is_admin()
+    async def restrict_block_public_role(
+        self, interaction: discord.Interaction, role: discord.Role
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            changed = await set_public_block(session, current_guild_id(), "ROLE", role.id, True)
+        if not changed:
+            await interaction.followup.send(
+                f"**@{role.name}** is already blocked from posting public parlays.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"**@{role.name}** is now blocked from posting public parlays — their public "
+            "submissions will be kept private instead.",
+            ephemeral=True,
+        )
+
+    @restrict.command(
+        name="unblock_public_role", description="Lift a role's public-parlay block"
+    )
+    @app_commands.describe(role="Role to unblock")
+    @is_admin()
+    async def restrict_unblock_public_role(
+        self, interaction: discord.Interaction, role: discord.Role
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            changed = await set_public_block(session, current_guild_id(), "ROLE", role.id, False)
+        if not changed:
+            await interaction.followup.send(
+                f"**@{role.name}** does not have a public-parlay block.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            f"Public-parlay block lifted for **@{role.name}**.", ephemeral=True
+        )
 
     @restrict.command(
         name="lock_tribute",
@@ -11886,6 +12707,162 @@ class AdminCog(commands.Cog):
             f"**{member.display_name}**'s sportsbook access has been restored.",
             ephemeral=True,
         )
+
+    # ── ECONOMY COMMANDS ──────────────────────────────────────────────────────
+
+    _RATE_DIRECTIONS = [
+        app_commands.Choice(name="Deposit (Panars → chips)", value="DEPOSIT"),
+        app_commands.Choice(name="Withdraw (chips → Panars)", value="WITHDRAW"),
+    ]
+
+    @economy.command(
+        name="set_global_rate", description="Set the server-wide chip/Panar exchange rate"
+    )
+    @app_commands.describe(
+        direction="Which exchange this rate applies to",
+        rate="Multiplier applied to the amount entered (1.0 = current 1:1 exchange)",
+    )
+    @app_commands.choices(direction=_RATE_DIRECTIONS)
+    @is_admin()
+    async def economy_set_global_rate(
+        self,
+        interaction: discord.Interaction,
+        direction: app_commands.Choice[str],
+        rate: app_commands.Range[float, 0.01, 100.0],
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        await set_global_rate(direction.value, rate)
+        await interaction.followup.send(
+            f"Global **{direction.name}** rate set to **{rate}**.", ephemeral=True
+        )
+
+    @economy.command(
+        name="set_role_rate", description="Override the exchange rate for everyone with a role"
+    )
+    @app_commands.describe(
+        direction="Which exchange this rate applies to",
+        role="Role to set a rate override for",
+        rate="Multiplier applied to the amount entered",
+    )
+    @app_commands.choices(direction=_RATE_DIRECTIONS)
+    @is_admin()
+    async def economy_set_role_rate(
+        self,
+        interaction: discord.Interaction,
+        direction: app_commands.Choice[str],
+        role: discord.Role,
+        rate: app_commands.Range[float, 0.01, 100.0],
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            await set_override(session, current_guild_id(), "ROLE", role.id, direction.value, rate)
+        await interaction.followup.send(
+            f"**@{role.name}**'s **{direction.name}** rate set to **{rate}**.", ephemeral=True
+        )
+
+    @economy.command(
+        name="set_user_rate", description="Override the exchange rate for one member"
+    )
+    @app_commands.describe(
+        direction="Which exchange this rate applies to",
+        member="Member to set a rate override for",
+        rate="Multiplier applied to the amount entered",
+    )
+    @app_commands.choices(direction=_RATE_DIRECTIONS)
+    @is_admin()
+    async def economy_set_user_rate(
+        self,
+        interaction: discord.Interaction,
+        direction: app_commands.Choice[str],
+        member: discord.Member,
+        rate: app_commands.Range[float, 0.01, 100.0],
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            await set_override(session, current_guild_id(), "USER", member.id, direction.value, rate)
+        await interaction.followup.send(
+            f"**{member.display_name}**'s **{direction.name}** rate set to **{rate}**.", ephemeral=True
+        )
+
+    @economy.command(
+        name="clear_role_rate", description="Remove a role's exchange-rate override"
+    )
+    @app_commands.describe(direction="Which exchange to clear", role="Role to clear")
+    @app_commands.choices(direction=_RATE_DIRECTIONS)
+    @is_admin()
+    async def economy_clear_role_rate(
+        self,
+        interaction: discord.Interaction,
+        direction: app_commands.Choice[str],
+        role: discord.Role,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            cleared = await clear_override(session, current_guild_id(), "ROLE", role.id, direction.value)
+        if not cleared:
+            await interaction.followup.send(
+                f"**@{role.name}** has no **{direction.name}** override.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            f"**@{role.name}**'s **{direction.name}** override cleared — back to the global rate.",
+            ephemeral=True,
+        )
+
+    @economy.command(
+        name="clear_user_rate", description="Remove a member's exchange-rate override"
+    )
+    @app_commands.describe(direction="Which exchange to clear", member="Member to clear")
+    @app_commands.choices(direction=_RATE_DIRECTIONS)
+    @is_admin()
+    async def economy_clear_user_rate(
+        self,
+        interaction: discord.Interaction,
+        direction: app_commands.Choice[str],
+        member: discord.Member,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        async with get_session() as session:
+            cleared = await clear_override(session, current_guild_id(), "USER", member.id, direction.value)
+        if not cleared:
+            await interaction.followup.send(
+                f"**{member.display_name}** has no **{direction.name}** override.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            f"**{member.display_name}**'s **{direction.name}** override cleared — back to the global rate.",
+            ephemeral=True,
+        )
+
+    @economy.command(
+        name="view_rates", description="View the global exchange rates and all overrides"
+    )
+    @is_admin()
+    async def economy_view_rates(self, interaction: discord.Interaction) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        deposit_rate = await get_global_rate("DEPOSIT")
+        withdraw_rate = await get_global_rate("WITHDRAW")
+        async with get_read_session() as session:
+            overrides = await list_overrides(session, current_guild_id())
+
+        embed = discord.Embed(title="Chip/Panar Exchange Rates", color=0x5B9BD5)
+        embed.add_field(name="Global Deposit Rate", value=str(deposit_rate))
+        embed.add_field(name="Global Withdraw Rate", value=str(withdraw_rate))
+        if overrides:
+            lines = []
+            for o in overrides:
+                target = f"<@&{o.target_id}>" if o.scope == "ROLE" else f"<@{o.target_id}>"
+                lines.append(f"• {o.direction.title()} — {target}: **{o.rate}**")
+            embed.add_field(name="Overrides", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="Overrides", value="None set.", inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

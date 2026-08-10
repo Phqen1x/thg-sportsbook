@@ -13,31 +13,39 @@ def render_request_content(
     kind: str,
     user_id: int,
     amount: int,
+    converted_amount: int,
     processed_by: discord.abc.User | None = None,
     processed_at: datetime | None = None,
 ) -> str:
     """Builds the withdraw/deposit request message body from scratch — used both
     for the initial post and to rebuild it after "Mark Done" is pressed, so the
-    text is never parsed back out of a previous version of itself."""
+    text is never parsed back out of a previous version of itself.
+
+    ``amount`` is what the member entered (chips for WITHDRAW, Panars for
+    DEPOSIT); ``converted_amount`` is the other currency, already converted at
+    whatever exchange rate applied when the request was created (see
+    bot.utils.exchange_rates.effective_rate) — frozen so it can't drift if an
+    admin changes rates before the request is marked done.
+    """
     mention = f"<@{user_id}>"
     if kind == "WITHDRAW":
         header = (
             f"💸 **Withdrawal request** — {mention} is converting **{fmt_chips(amount)}** "
-            "into Panars. Their chip balance has already been debited."
+            f"into **{converted_amount:,} Panars**. Their chip balance has already been debited."
         )
         commands = (
             "Run this to pay them out:\n"
-            f"`/admin1 award-deprive citizen:{mention} operation:Award resource:Panars amount:{amount}`"
+            f"`/admin1 award-deprive citizen:{mention} operation:Award resource:Panars amount:{converted_amount}`"
         )
     else:
         header = (
             f"🏦 **Deposit request** — {mention} wants to convert **{amount:,} Panars** "
-            "into chips."
+            f"into **{fmt_chips(converted_amount)}**."
         )
         commands = (
             "Take their Panars, then credit the chips:\n"
             f"`/admin1 award-deprive citizen:{mention} operation:Deprive resource:Panars amount:{amount}`\n"
-            f"`/settings chips_give user:{mention} amount:{amount}`"
+            f"`/settings chips_give user:{mention} amount:{converted_amount}`"
         )
     if processed_by is not None:
         ts = int((processed_at or datetime.now(timezone.utc)).timestamp())
@@ -150,11 +158,14 @@ class RequestDoneButton(
                 )
                 return
             req.status = "DONE"
-            guild_id, user_id, kind, amount = req.guild_id, req.user_id, req.kind, req.amount
+            guild_id, user_id, kind, amount, converted_amount = (
+                req.guild_id, req.user_id, req.kind, req.amount, req.converted_amount
+            )
             blocked = await is_fully_restricted(session, guild_id, user_id)
 
         content = render_request_content(
-            kind, user_id, amount, processed_by=member, processed_at=datetime.now(timezone.utc)
+            kind, user_id, amount, converted_amount,
+            processed_by=member, processed_at=datetime.now(timezone.utc),
         )
         new_view = build_request_view(None, guild_id, user_id, blocked)
         try:

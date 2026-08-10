@@ -135,6 +135,8 @@ def create_app() -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
     app.mount("/activity/static", StaticFiles(directory=str(ACTIVITY_DIR / "static")), name="activity-static")
+    config.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/uploads", StaticFiles(directory=str(config.UPLOADS_DIR)), name="uploads")
 
     app.include_router(activity.router)
     app.include_router(auth.router)
@@ -175,6 +177,13 @@ def create_app() -> FastAPI:
         if "Content-Security-Policy" not in response.headers:
             response.headers["Content-Security-Policy"] = _DASHBOARD_CSP
             response.headers["X-Frame-Options"] = "DENY"
+        # The Activity iframe is loaded through Discord's /.proxy edge, which will
+        # cache GET responses that don't say otherwise — the same proxy layer
+        # _VERSION above works around for static JS/CSS. Without this, admin edits
+        # (tribute renames, odds, etc.) can appear to "not save" in the Activity
+        # even after reloading, because the proxy keeps serving the old JSON.
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.get("/activity", response_class=HTMLResponse)

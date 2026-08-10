@@ -364,7 +364,7 @@ async function viewMarkets(view) {
 
   function sortMarkets(list) {
     const arr = [...list];
-    if (sortBy === "name") arr.sort((a, b) => a.label.localeCompare(b.label));
+    if (sortBy === "name" || sortBy === "default") arr.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
     else if (sortBy === "odds-fav") arr.sort((a, b) => (a.odds ?? Infinity) - (b.odds ?? Infinity));
     else if (sortBy === "odds-long") arr.sort((a, b) => (b.odds ?? -Infinity) - (a.odds ?? -Infinity));
     else if (sortBy === "popular") arr.sort((a, b) => (b.bet_count ?? 0) - (a.bet_count ?? 0));
@@ -833,6 +833,7 @@ async function viewAdmin(view) {
       <a href="${base}#admin/tributes" class="${sub === "tributes" ? "active" : ""}">Tributes</a>
       <a href="${base}#admin/banners"  class="${sub === "banners"  ? "active" : ""}">Banners</a>
       <a href="${base}#admin/parlays"  class="${sub === "parlays"  ? "active" : ""}">Parlays</a>
+      <a href="${base}#admin/rates"    class="${sub === "rates"    ? "active" : ""}">Rates</a>
     </div>
     <div id="admin-body"><div class="loading-inline">Loading…</div></div>`;
   const startBtn = $("#admin-start-game", view);
@@ -847,6 +848,7 @@ async function viewAdmin(view) {
   if (sub === "tributes") return adminTributes(body);
   if (sub === "banners")  return adminBanners(body);
   if (sub === "parlays")  return adminParlays(body);
+  if (sub === "rates")    return adminRates(body);
   return adminMarkets(body);
 }
 
@@ -891,8 +893,37 @@ async function adminMarkets(body) {
 }
 
 async function adminChips(body) {
-  const { users } = await api("/admin/users");
+  const [{ users }, economy] = await Promise.all([
+    api("/admin/users"),
+    api("/admin/economy").catch(() => null),
+  ]);
   body.innerHTML = `
+    ${economy ? `
+    <div class="card">
+      <div class="card-label">ECONOMY</div>
+      <div class="econ-grid">
+        <div class="econ-item">
+          <span class="econ-num">${fmtChips(economy.chips_spent)}</span>
+          <span class="econ-label">Chips Spent</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num">${fmtChips(economy.chips_circulating)}</span>
+          <span class="econ-label">In Circulation</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num odds-pos">${fmtChips(economy.panars_converted)}</span>
+          <span class="econ-label">Panars Converted</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num odds-neg">${fmtChips(economy.chips_withdrawn)}</span>
+          <span class="econ-label">Chips Withdrawn</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num ${economy.net_panars >= 0 ? "odds-pos" : "odds-neg"}">${economy.net_panars >= 0 ? "+" : ""}${fmtChips(economy.net_panars)}</span>
+          <span class="econ-label">Net Panars</span>
+        </div>
+      </div>
+    </div>` : ""}
     <div class="card admin-form">
       <div class="card-label">GIVE / TAKE</div>
       <input id="chip-id" class="input" placeholder="Discord user ID (click row below)">
@@ -1132,6 +1163,124 @@ async function adminParlays(body) {
         const r = await api(`/admin/parlays/${btn.dataset.tpl}`, { method: "DELETE" });
         toast(r.message);
         adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+}
+
+async function adminRates(body) {
+  const [rates, { blocks }] = await Promise.all([
+    api("/admin/exchange-rates"),
+    api("/admin/public-blocks"),
+  ]);
+
+  body.innerHTML = `
+    <div class="card admin-form">
+      <div class="card-label">GLOBAL RATES</div>
+      <input id="r-deposit" class="input" type="number" step="0.01" min="0.01" value="${rates.global_deposit_rate}" placeholder="Deposit rate (chips per Panar)">
+      <input id="r-withdraw" class="input" type="number" step="0.01" min="0.01" value="${rates.global_withdraw_rate}" placeholder="Withdraw rate (Panars per chip)">
+      <button class="btn btn-primary" id="r-save-global">Save Global Rates</button>
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">ADD RATE OVERRIDE</div>
+      <select id="r-scope" class="input">
+        <option value="USER">User</option>
+        <option value="ROLE">Role</option>
+      </select>
+      <input id="r-target" class="input" placeholder="Discord user ID or Role ID">
+      <select id="r-direction" class="input">
+        <option value="DEPOSIT">Deposit (Panars → chips)</option>
+        <option value="WITHDRAW">Withdraw (chips → Panars)</option>
+      </select>
+      <input id="r-rate" class="input" type="number" step="0.01" min="0.01" value="1.0" placeholder="Rate">
+      <button class="btn btn-primary" id="r-add-override">Add Override</button>
+    </div>
+
+    <div class="list">
+      ${rates.overrides.length ? rates.overrides.map((o) => `
+        <div class="card tail-card">
+          <div class="tail-head">
+            <span class="tail-name">${o.scope} ${esc(o.target_id)}</span>
+            <span class="badge">${o.direction}</span>
+          </div>
+          <div class="row-buttons">
+            <span style="flex:1;align-self:center;font-weight:700">${o.rate}</span>
+            <button class="btn btn-outline btn-sm" data-act="r-remove" data-id="${o.id}">Remove</button>
+          </div>
+        </div>`).join("") : `<div class="empty">No rate overrides set — everyone uses the global rates above.</div>`}
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">BLOCK PUBLIC PARLAYS</div>
+      <select id="b-scope" class="input">
+        <option value="USER">User</option>
+        <option value="ROLE">Role</option>
+      </select>
+      <input id="b-target" class="input" placeholder="Discord user ID or Role ID">
+      <button class="btn btn-primary" id="b-add">Block</button>
+      <div class="dim" style="width:100%">Blocked members can still bet — their public/tail-board submissions are just kept private instead.</div>
+    </div>
+
+    <div class="list">
+      ${blocks.length ? blocks.map((b) => `
+        <div class="card tail-card">
+          <div class="row-buttons">
+            <span style="flex:1;align-self:center;font-weight:700">${b.scope} ${esc(b.target_id)}</span>
+            <button class="btn btn-outline btn-sm" data-act="b-remove" data-id="${b.id}">Unblock</button>
+          </div>
+        </div>`).join("") : `<div class="empty">No public-parlay blocks set.</div>`}
+    </div>`;
+
+  $("#r-save-global", body).addEventListener("click", async () => {
+    const deposit_rate = Number($("#r-deposit", body).value);
+    const withdraw_rate = Number($("#r-withdraw", body).value);
+    if (!deposit_rate || !withdraw_rate) return toast("Enter both rates.", "error");
+    try {
+      const r = await api("/admin/exchange-rates/global", { method: "POST", body: { deposit_rate, withdraw_rate } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  $("#r-add-override", body).addEventListener("click", async () => {
+    const scope = $("#r-scope", body).value;
+    const target_id = $("#r-target", body).value.trim();
+    const direction = $("#r-direction", body).value;
+    const rate = Number($("#r-rate", body).value);
+    if (!target_id || !rate) return toast("Enter a target ID and rate.", "error");
+    try {
+      const r = await api("/admin/exchange-rates", { method: "POST", body: { scope, target_id, direction, rate } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  body.querySelectorAll('[data-act="r-remove"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/exchange-rates/${btn.dataset.id}`, { method: "DELETE" });
+        toast(r.message);
+        adminRates(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
+  $("#b-add", body).addEventListener("click", async () => {
+    const scope = $("#b-scope", body).value;
+    const target_id = $("#b-target", body).value.trim();
+    if (!target_id) return toast("Enter a target ID.", "error");
+    try {
+      const r = await api("/admin/public-blocks", { method: "POST", body: { scope, target_id } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  body.querySelectorAll('[data-act="b-remove"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/public-blocks/${btn.dataset.id}`, { method: "DELETE" });
+        toast(r.message);
+        adminRates(body);
       } catch (e) { toast(e.message, "error"); }
     }));
 }

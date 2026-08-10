@@ -33,6 +33,18 @@
     </div>
 
     <div class="form-group">
+      <label class="form-label">Global Deposit Rate (chips credited per Panar)</label>
+      <input type="number" name="deposit_rate" class="form-control" step="0.01" min="0.01" value="{{ deposit_rate }}">
+      <div class="form-help">1.0 = 1 Panar deposited credits 1 chip (the original exchange). Role/user overrides are managed on the Restrictions page.</div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Global Withdraw Rate (Panars paid per chip)</label>
+      <input type="number" name="withdraw_rate" class="form-control" step="0.01" min="0.01" value="{{ withdraw_rate }}">
+      <div class="form-help">1.0 = withdrawing 1 chip pays out 1 Panar (the original exchange).</div>
+    </div>
+
+    <div class="form-group">
       <label class="form-label">Capitol Announcement (shown on odds board)</label>
       <input type="text" name="capitol_announcement" class="form-control" value="{{ announcement | replace('\"', '') }}" placeholder="e.g. May the odds be ever in your favor!">
     </div>

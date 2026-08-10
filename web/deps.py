@@ -60,6 +60,31 @@ async def _live_is_admin(discord_id: int, guild_id: int | None = None) -> bool:
     return admin
 
 
+_role_cache: dict[tuple[int, int | None], tuple[set[int], float]] = {}
+_ROLE_TTL = 300  # re-check Discord roles every 5 minutes
+
+
+async def live_role_ids(discord_id: int, guild_id: int | None = None) -> set[int]:
+    """Return the member's current Discord role ids, hitting Discord at most
+    once per _ROLE_TTL seconds. Used to check role-scoped PublicBetRestriction
+    blocks against the submitter's actual current roles — the bot checks this
+    live via discord.py's in-memory Member cache, but web/Activity requests
+    have no such cache, so this mirrors _live_is_admin's TTL-cached pattern
+    instead of hitting Discord on every parlay submission."""
+    cache_key = (discord_id, guild_id)
+    cached = _role_cache.get(cache_key)
+    if cached and time.monotonic() - cached[1] < _ROLE_TTL:
+        return cached[0]
+    from web import discord_api
+    try:
+        member = await discord_api.get_member(discord_id, guild_id=guild_id)
+        role_ids = {int(x) for x in member.get("roles", [])} if member else set()
+    except Exception:
+        role_ids = set()
+    _role_cache[cache_key] = (role_ids, time.monotonic())
+    return role_ids
+
+
 async def optional_user(request: Request) -> SessionUser | None:
     u = await _session_or_none(request)
     if u:

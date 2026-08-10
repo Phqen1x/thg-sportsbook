@@ -159,6 +159,18 @@ async def _migrate_schema() -> None:
             await conn.execute(text(
                 "ALTER TABLE market_templates ADD COLUMN is_builtin BOOLEAN NOT NULL DEFAULT 0"
             ))
+        if "multi_outcome" not in existing:
+            await conn.execute(text(
+                "ALTER TABLE market_templates ADD COLUMN multi_outcome BOOLEAN NOT NULL DEFAULT 0"
+            ))
+        if "eligibility_mode" not in existing:
+            await conn.execute(text(
+                "ALTER TABLE market_templates ADD COLUMN eligibility_mode VARCHAR(10)"
+            ))
+        if "weight_overrides" not in existing:
+            await conn.execute(text(
+                "ALTER TABLE market_templates ADD COLUMN weight_overrides JSON"
+            ))
 
         rows = await conn.execute(text("PRAGMA table_info(tributes)"))
         trib_col_rows = rows.fetchall()
@@ -615,6 +627,15 @@ async def _migrate_schema() -> None:
                     {"gid": _gid},
                 )
 
+        rows = await conn.execute(text("PRAGMA table_info(chip_requests)"))
+        if "converted_amount" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text("ALTER TABLE chip_requests ADD COLUMN converted_amount INTEGER"))
+            # Backfill existing rows as 1:1 — the rate every past request was
+            # actually created under, before per-role/user rates existed.
+            await conn.execute(text(
+                "UPDATE chip_requests SET converted_amount = amount WHERE converted_amount IS NULL"
+            ))
+
 
 _BUILTIN_MARKET_TYPES = [
     ("TRIBUTE_WINS",            "Tribute Wins (Victor)",                "HARD",      "Tribute wins the entire Hunger Games and is declared Victor."),
@@ -682,6 +703,11 @@ _BUILTIN_MARKET_TYPES = [
     ("GAMES_FEAST",             "Games Features a Feast",               "MODERATE",  "The Games will feature a Cornucopia feast event. Resolves manually."),
     ("GAMES_BETRAYAL",          "Games Features a Betrayal",            "MODERATE",  "The Games will feature a notable alliance betrayal. Resolves manually."),
     ("DISTRICT_PARTNER_KILL",   "Games Features a District Partner Kill","HARD",     "Any tribute kills their own district partner during the Games. Auto-resolves at game end."),
+    # ── District-partner comparison markets ────────────────────────────────────
+    ("PARTNER_SCORE_HIGHER",    "Scores Higher Than District Partner",  "MODERATE",  "This tribute scores higher than their district partner in training. Auto-resolves when Pre-Games ends."),
+    ("PARTNER_SCORE_LOWER",     "Scores Lower Than District Partner",   "MODERATE",  "This tribute scores lower than their district partner in training. Auto-resolves when Pre-Games ends."),
+    ("PARTNER_PLACE_HIGHER",    "Places Higher Than District Partner",  "MODERATE",  "This tribute finishes in a higher placement than their district partner. Auto-resolves at game end."),
+    ("PARTNER_PLACE_LOWER",     "Places Lower Than District Partner",   "MODERATE",  "This tribute finishes in a lower placement than their district partner. Auto-resolves at game end."),
 ]
 
 

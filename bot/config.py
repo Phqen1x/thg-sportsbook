@@ -36,6 +36,13 @@ WEB_BASE_URL: str | None = (os.environ.get("WEB_BASE_URL") or "").rstrip("/") or
 # sportsbook_<guild_id>.db alongside this path. The filename here is never used
 # directly (the bot is fully multi-guild; each server gets its own DB).
 DB_PATH: str = os.environ.get("DB_PATH") or str(BASE_DIR / "data" / "sportsbook.db")
+# Uploaded assets (e.g. tribute face claims) are saved here and served by the web app
+# at /uploads/<filename>. Discord's CDN attachment URLs — including ones reposted to a
+# "permanent" channel — all carry a signed ex/is/hm expiry and go dead after ~24h, so
+# uploads must be persisted locally rather than storing any cdn.discordapp.com URL.
+UPLOADS_DIR: Path = Path(
+    os.environ.get("UPLOADS_DIR") or str(Path(DB_PATH).parent / "uploads")
+)
 FONTS_DIR: Path = Path(
     os.environ.get("FONTS_DIR") or str(BASE_DIR / "assets" / "fonts")
 )

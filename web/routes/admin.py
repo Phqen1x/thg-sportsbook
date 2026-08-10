@@ -9,10 +9,13 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import func, select, text
 
 from bot.database.models import (
-    Alliance, Bet, BettingPhase, Market, Modifier, ModifierAssignment,
-    Parlay, ParlayTemplate, ParlayTemplateLeg, Tribute, User,
+    Alliance, Bet, BettingPhase, ExchangeRateOverride, Market, Modifier, ModifierAssignment,
+    Parlay, ParlayTemplate, ParlayTemplateLeg, PublicBetRestriction, Tribute, User,
 )
 from bot.odds.calculator import parlay_payout
+from bot.utils.economy import economy_totals
+from bot.utils.exchange_rates import clear_override, list_overrides, set_override
+from bot.utils.restrictions import list_public_blocks, set_public_block
 from web import config as _web_config
 from web.audit import post_admin_action
 from web.database import get_db, get_request_guild
@@ -99,12 +102,13 @@ async def dashboard(request: Request, user: SessionUser = Depends(require_admin)
         phases = (await db.execute(select(BettingPhase).order_by(BettingPhase.sort_order))).scalars().all()
         phase_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='current_phase_id'"))).fetchone()
         active_phase_id = json.loads(phase_row[0]) if phase_row else None
+        economy = await economy_totals(db, _GUILD_ID())
 
     return request.app.state.templates.TemplateResponse("admin/index.html", {
         "request": request, "user": user,
         "alive": alive, "dead": dead, "open_mkts": open_mkts,
         "total_bets": total_bets, "pending_bets": pending_bets, "total_users": total_users,
-        "phases": phases, "active_phase_id": active_phase_id,
+        "phases": phases, "active_phase_id": active_phase_id, "economy": economy,
         "success": success, "error": error,
     })
 
@@ -787,6 +791,8 @@ async def settings(request: Request, user: SessionUser = Depends(require_admin),
         cashout_allowed = settings_map.get("cashout_allowed", "false")
         cashout_rate = settings_map.get("cashout_rate", "0.65")
         default_chips_setting = settings_map.get("default_chips", str(1000))
+        deposit_rate = settings_map.get("deposit_rate", "1.0")
+        withdraw_rate = settings_map.get("withdraw_rate", "1.0")
 
     return request.app.state.templates.TemplateResponse("admin/settings.html", {
         "request": request, "user": user,
@@ -795,6 +801,8 @@ async def settings(request: Request, user: SessionUser = Depends(require_admin),
         "cashout_allowed": cashout_allowed,
         "cashout_rate": cashout_rate,
         "default_chips": default_chips_setting,
+        "deposit_rate": deposit_rate,
+        "withdraw_rate": withdraw_rate,
         "success": success, "error": error,
     })
 
@@ -806,6 +814,8 @@ async def settings_save(
     cashout_allowed: Annotated[str, Form()] = "",
     cashout_rate: Annotated[str, Form()] = "0.65",
     default_chips: Annotated[str, Form()] = "1000",
+    deposit_rate: Annotated[str, Form()] = "1.0",
+    withdraw_rate: Annotated[str, Form()] = "1.0",
     capitol_announcement: Annotated[str, Form()] = "",
 ):
     async with get_db() as db:
@@ -816,12 +826,95 @@ async def settings_save(
         await upsert("cashout_allowed", "true" if cashout_allowed == "on" else "false")
         await upsert("cashout_rate", cashout_rate)
         await upsert("default_chips", default_chips)
+        await upsert("deposit_rate", deposit_rate)
+        await upsert("withdraw_rate", withdraw_rate)
         if capitol_announcement:
             import json
             await upsert("capitol_announcement", json.dumps(capitol_announcement))
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Settings saved", {"theme": active_theme, "cashout": "on" if cashout_allowed == "on" else "off"}))
     return _redirect("/admin/settings", msg="Settings+saved.")
+
+
+# ── Restrictions (rate overrides + public-parlay blocks) ───────────────────────
+
+@router.get("/restrictions")
+async def restrictions(request: Request, user: SessionUser = Depends(require_admin), success: str = "", error: str = ""):
+    async with get_db() as db:
+        overrides = await list_overrides(db, _GUILD_ID())
+        blocks = await list_public_blocks(db, _GUILD_ID())
+
+    return request.app.state.templates.TemplateResponse("admin/restrictions.html", {
+        "request": request, "user": user,
+        "overrides": overrides, "blocks": blocks,
+        "success": success, "error": error,
+    })
+
+
+@router.post("/restrictions/rates/set")
+async def restrictions_rate_set(
+    user: SessionUser = Depends(require_admin),
+    scope: Annotated[str, Form()] = "USER",
+    target_id: Annotated[str, Form()] = "",
+    direction: Annotated[str, Form()] = "DEPOSIT",
+    rate: Annotated[float, Form()] = 1.0,
+):
+    if scope not in ("ROLE", "USER") or direction not in ("DEPOSIT", "WITHDRAW"):
+        return _redirect("/admin/restrictions", error="Invalid+scope+or+direction.")
+    try:
+        tid = int(target_id)
+    except ValueError:
+        return _redirect("/admin/restrictions", error="Target+ID+must+be+a+number.")
+    if rate <= 0:
+        return _redirect("/admin/restrictions", error="Rate+must+be+positive.")
+    async with get_db() as db:
+        await set_override(db, _GUILD_ID(), scope, tid, direction, rate)
+        await db.commit()
+    asyncio.create_task(post_admin_action(user, "Exchange rate override set", {
+        "scope": scope, "target_id": str(tid), "direction": direction, "rate": str(rate),
+    }))
+    return _redirect("/admin/restrictions", msg="Rate+override+saved.")
+
+
+@router.post("/restrictions/rates/{override_id}/delete")
+async def restrictions_rate_delete(override_id: int, user: SessionUser = Depends(require_admin)):
+    async with get_db() as db:
+        row = await db.get(ExchangeRateOverride, override_id)
+        if row:
+            await db.delete(row)
+            await db.commit()
+    asyncio.create_task(post_admin_action(user, "Exchange rate override removed", {"id": str(override_id)}))
+    return _redirect("/admin/restrictions", msg="Rate+override+removed.")
+
+
+@router.post("/restrictions/public-block/set")
+async def restrictions_public_block_set(
+    user: SessionUser = Depends(require_admin),
+    scope: Annotated[str, Form()] = "USER",
+    target_id: Annotated[str, Form()] = "",
+):
+    if scope not in ("ROLE", "USER"):
+        return _redirect("/admin/restrictions", error="Invalid+scope.")
+    try:
+        tid = int(target_id)
+    except ValueError:
+        return _redirect("/admin/restrictions", error="Target+ID+must+be+a+number.")
+    async with get_db() as db:
+        await set_public_block(db, _GUILD_ID(), scope, tid, True)
+        await db.commit()
+    asyncio.create_task(post_admin_action(user, "Public-parlay block added", {"scope": scope, "target_id": str(tid)}))
+    return _redirect("/admin/restrictions", msg="Public-parlay+block+added.")
+
+
+@router.post("/restrictions/public-block/{block_id}/delete")
+async def restrictions_public_block_delete(block_id: int, user: SessionUser = Depends(require_admin)):
+    async with get_db() as db:
+        row = await db.get(PublicBetRestriction, block_id)
+        if row:
+            await db.delete(row)
+            await db.commit()
+    asyncio.create_task(post_admin_action(user, "Public-parlay block removed", {"id": str(block_id)}))
+    return _redirect("/admin/restrictions", msg="Public-parlay+block+removed.")
 
 
 # ── Parlay Templates ───────────────────────────────────────────────────────────

@@ -38,6 +38,10 @@ _TYPE_ORDER: dict[str, int] = {
     "EXACT_TRAINING_SCORE":      22,
     "COMBINED_DISTRICT_SCORE":   23,
     "TRAINING_SCORE_OU":         24,
+    "PARTNER_SCORE_HIGHER":      24,
+    "PARTNER_SCORE_LOWER":       24,
+    "PARTNER_PLACE_HIGHER":      24,
+    "PARTNER_PLACE_LOWER":       24,
     # Game-level props
     "BLOODBATH_KILLS_OU":        30,
     "BLOODBATH_DEATHS_OU":       30,
@@ -105,6 +109,10 @@ _TYPE_LABELS: dict[str, str] = {
     "EXACT_TRAINING_SCORE":      "Exact Training Score",
     "COMBINED_DISTRICT_SCORE":   "Combined District Score",
     "TRAINING_SCORE_OU":         "Training Score Over/Under",
+    "PARTNER_SCORE_HIGHER":      "Partner Score Higher",
+    "PARTNER_SCORE_LOWER":       "Partner Score Lower",
+    "PARTNER_PLACE_HIGHER":      "Partner Place Higher",
+    "PARTNER_PLACE_LOWER":       "Partner Place Lower",
     # Game-level props
     "BLOODBATH_KILLS_OU":        "Bloodbath Kills Over/Under",
     "BLOODBATH_DEATHS_OU":       "Bloodbath Deaths Over/Under",

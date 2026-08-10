@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, ForeignKey,
-    Integer, PrimaryKeyConstraint, String, func
+    Integer, JSON, PrimaryKeyConstraint, String, UniqueConstraint, func
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -239,7 +239,37 @@ class MarketTemplate(Base):
     type_key: Mapped[str | None] = mapped_column(String(30), nullable=True, unique=True)
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Roster-style templates (e.g. "Fifth Career Alliance Member"): one Market row
+    # per eligible tribute instead of a single instance, priced from
+    # MULTI_OUTCOME_FACTORS instead of the standard win/kill/placement formulas.
+    multi_outcome: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # "whitelist" | "blacklist" — only meaningful when multi_outcome is True.
+    eligibility_mode: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # {factor_key: weight}; a missing key defaults to weight 1.0 at compute time.
+    weight_overrides: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    eligible_tributes: Mapped[list["MarketTemplateTribute"]] = relationship(
+        "MarketTemplateTribute", back_populates="template", cascade="all, delete-orphan"
+    )
+
+
+class MarketTemplateTribute(Base):
+    """Eligibility row for a multi_outcome MarketTemplate: this tribute is one of
+    the mutually-exclusive outcomes the template's markets can resolve to."""
+    __tablename__ = "market_template_tributes"
+    __table_args__ = (UniqueConstraint("template_id", "tribute_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    template_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("market_templates.id", ondelete="CASCADE"), nullable=False
+    )
+    tribute_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tributes.id", ondelete="CASCADE"), nullable=False
+    )
+
+    template: Mapped["MarketTemplate"] = relationship("MarketTemplate", back_populates="eligible_tributes")
+    tribute: Mapped["Tribute"] = relationship("Tribute")
 
 
 class GameSetting(Base):
@@ -264,6 +294,12 @@ class ChipRequest(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     kind: Mapped[str] = mapped_column(String(10), nullable=False)  # WITHDRAW | DEPOSIT
     amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Amount in the *other* currency, frozen at request time using the rate in
+    # effect then (chips for DEPOSIT, panars for WITHDRAW) — like Bet.odds_at_placement,
+    # this must not drift if an admin changes exchange rates before the request
+    # is marked done, and lets render_request_content rebuild the message later
+    # without recomputing anything.
+    converted_amount: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(10), default="PENDING", nullable=False)  # PENDING | DONE
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
@@ -365,3 +401,44 @@ class TributeLock(Base):
         Integer, ForeignKey("tributes.id", ondelete="SET NULL"), nullable=True
     )
     locked_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ExchangeRateOverride(Base):
+    """Per-role or per-user override of the global chip<->Panar conversion rate.
+
+    ``direction`` is "DEPOSIT" (panars -> chips, used by /deposit) or "WITHDRAW"
+    (chips -> panars, used by /withdraw). ``rate`` is a multiplier applied to the
+    amount the member enters, e.g. a WITHDRAW rate of 1.1 means 1 chip pays out
+    1.1 Panars. Resolution order at use time: user override > highest-Discord-role
+    override (mirrors how Discord's own permission overwrites resolve conflicts)
+    > global GameSetting default ("deposit_rate" / "withdraw_rate", 1.0 if unset).
+    """
+    __tablename__ = "exchange_rate_overrides"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "scope", "target_id", "direction"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scope: Mapped[str] = mapped_column(String(5), nullable=False)  # ROLE | USER
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)  # role id or discord user id
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)  # DEPOSIT | WITHDRAW
+    rate: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class PublicBetRestriction(Base):
+    """Blocks a role or user from posting PUBLIC parlays (listed on the tail
+    board). Distinct from BettingRestriction: a blocked member can still bet
+    normally — a blocked public submission is silently downgraded to private
+    rather than rejected outright."""
+    __tablename__ = "public_bet_restrictions"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "scope", "target_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scope: Mapped[str] = mapped_column(String(5), nullable=False)  # ROLE | USER
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

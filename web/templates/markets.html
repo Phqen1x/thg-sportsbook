@@ -214,7 +214,7 @@
   function sortRows(list) {
     const arr = [...list];
     const odds = (r) => r.dataset.odds === "" ? null : Number(r.dataset.odds);
-    if (sortBy === "name") arr.sort((a, b) => a.dataset.label.localeCompare(b.dataset.label));
+    if (sortBy === "name" || sortBy === "default") arr.sort((a, b) => a.dataset.label.localeCompare(b.dataset.label, undefined, { numeric: true }));
     else if (sortBy === "odds-fav") arr.sort((a, b) => (odds(a) ?? Infinity) - (odds(b) ?? Infinity));
     else if (sortBy === "odds-long") arr.sort((a, b) => (odds(b) ?? -Infinity) - (odds(a) ?? -Infinity));
     else if (sortBy === "popular") arr.sort((a, b) => Number(b.dataset.bets) - Number(a.dataset.bets));

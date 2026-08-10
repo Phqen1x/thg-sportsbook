@@ -21,17 +21,22 @@ from bot.cogs.betting import (
 )
 from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
 from bot.database.models import (
-    Alliance, Bet, BettingPhase, DistrictRecord, Market, Parlay, PendingParlayLeg,
-    ParlayTemplate, ParlayTemplateLeg, Tribute, User,
+    Alliance, Bet, BettingPhase, DistrictRecord, ExchangeRateOverride, Market, Parlay,
+    PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, PublicBetRestriction, Tribute, User,
 )
 from bot.odds.calculator import (
     combined_american, parlay_payout, resolve_cashout, straight_payout,
 )
-from bot.utils.restrictions import is_fully_restricted
+from bot.utils.economy import economy_totals
+from bot.utils.exchange_rates import get_global_rate, list_overrides, set_global_rate, set_override
+from bot.utils.restrictions import (
+    is_fully_restricted, is_public_bet_blocked, list_public_blocks, set_public_block,
+)
 from web import config, discord_api
 from web.activity_auth import bearer_admin, bearer_user, mint_token
 from web.audit import post_admin_action, post_bet_log
 from web.database import get_db, get_request_guild, set_request_guild
+from web.deps import live_role_ids
 from web.routes.public import _parlay_flavor
 from web.session import SessionUser
 
@@ -706,6 +711,10 @@ async def parlay_submit(
         odds_list = [m.odds for m in leg_markets]
         total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
 
+        role_ids = await live_role_ids(user.discord_id, user.guild_id)
+        downgraded = is_public and await is_public_bet_blocked(db, _GUILD_ID(), user.discord_id, role_ids)
+        is_public = is_public and not downgraded
+
         p = Parlay(
             guild_id=_GUILD_ID(),
             user_id=user.discord_id,
@@ -733,8 +742,10 @@ async def parlay_submit(
         labels = [m.label for m in leg_markets]
 
     asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout))
-    return {"ok": True, "total_payout": total_payout, "chips": chips_left,
-            "message": f"Parlay submitted! Potential payout: {total_payout:,} chips."}
+    message = f"Parlay submitted! Potential payout: {total_payout:,} chips."
+    if downgraded:
+        message += " Kept private — public posting is restricted for you."
+    return {"ok": True, "total_payout": total_payout, "chips": chips_left, "message": message}
 
 
 @router.post("/parlay/feature")
@@ -1045,9 +1056,17 @@ async def tail_member_parlay(
         odds_list = [m.odds for m in leg_markets]
         total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
 
+        # Tailed copies are private by default; record provenance (unless the
+        # member tailed their own board listing) so the original poster gets
+        # credit on the "Most Tailed Parlays" leaderboard — mirrors the bot's
+        # `/parlay tail` flow in bot/cogs/betting.py.
+        tailed_from_user_id = source.user_id if source.user_id != user.discord_id else None
+        tailed_from_parlay_id = source.id if tailed_from_user_id is not None else None
+
         p = Parlay(
             guild_id=_GUILD_ID(), user_id=user.discord_id, total_wager=wager, total_payout=total_payout,
             status="PENDING", is_public=False,
+            tailed_from_user_id=tailed_from_user_id, tailed_from_parlay_id=tailed_from_parlay_id,
         )
         db.add(p)
         await db.flush()
@@ -1337,6 +1356,123 @@ async def admin_parlays_delete(tpl_id: int, admin: SessionUser = Depends(bearer_
     return {"ok": True, "message": "Template deleted."}
 
 
+# ── Exchange rates + public-parlay blocks ──────────────────────────────────────
+# Named to avoid colliding with the existing /admin/economy (aggregate totals, below).
+
+def _override_dict(o: ExchangeRateOverride) -> dict:
+    return {"id": o.id, "scope": o.scope, "target_id": str(o.target_id), "direction": o.direction, "rate": o.rate}
+
+
+def _block_dict(b: PublicBetRestriction) -> dict:
+    return {"id": b.id, "scope": b.scope, "target_id": str(b.target_id)}
+
+
+@router.get("/admin/exchange-rates")
+async def admin_exchange_rates(admin: SessionUser = Depends(bearer_admin)):
+    deposit_rate = await get_global_rate("DEPOSIT")
+    withdraw_rate = await get_global_rate("WITHDRAW")
+    async with get_db() as db:
+        overrides = await list_overrides(db, _GUILD_ID())
+    return {
+        "global_deposit_rate": deposit_rate,
+        "global_withdraw_rate": withdraw_rate,
+        "overrides": [_override_dict(o) for o in overrides],
+    }
+
+
+@router.post("/admin/exchange-rates/global")
+async def admin_exchange_rates_global(
+    admin: SessionUser = Depends(bearer_admin),
+    deposit_rate: Annotated[float, Body()] = 1.0,
+    withdraw_rate: Annotated[float, Body()] = 1.0,
+):
+    if deposit_rate <= 0 or withdraw_rate <= 0:
+        raise HTTPException(status_code=400, detail="Rates must be positive.")
+    await set_global_rate("DEPOSIT", deposit_rate)
+    await set_global_rate("WITHDRAW", withdraw_rate)
+    asyncio.create_task(post_admin_action(
+        admin, "Global exchange rates updated",
+        {"deposit_rate": str(deposit_rate), "withdraw_rate": str(withdraw_rate)},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Global rates updated."}
+
+
+@router.post("/admin/exchange-rates")
+async def admin_exchange_rates_set(
+    admin: SessionUser = Depends(bearer_admin),
+    scope: Annotated[str, Body()] = "USER",
+    target_id: Annotated[str, Body()] = "",
+    direction: Annotated[str, Body()] = "DEPOSIT",
+    rate: Annotated[float, Body()] = 1.0,
+):
+    if scope not in ("ROLE", "USER") or direction not in ("DEPOSIT", "WITHDRAW"):
+        raise HTTPException(status_code=400, detail="Invalid scope or direction.")
+    if rate <= 0:
+        raise HTTPException(status_code=400, detail="Rate must be positive.")
+    try:
+        tid = int(target_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Target ID must be a number.")
+    async with get_db() as db:
+        await set_override(db, _GUILD_ID(), scope, tid, direction, rate)
+        await db.commit()
+    asyncio.create_task(post_admin_action(
+        admin, "Exchange rate override set",
+        {"scope": scope, "target_id": str(tid), "direction": direction, "rate": str(rate)},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Rate override saved."}
+
+
+@router.delete("/admin/exchange-rates/{override_id}")
+async def admin_exchange_rates_delete(override_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        row = await db.get(ExchangeRateOverride, override_id)
+        if row:
+            await db.delete(row)
+            await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Exchange rate override removed", {"id": str(override_id)}, source="Discord Activity"))
+    return {"ok": True, "message": "Override removed."}
+
+
+@router.get("/admin/public-blocks")
+async def admin_public_blocks(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        blocks = await list_public_blocks(db, _GUILD_ID())
+    return {"blocks": [_block_dict(b) for b in blocks]}
+
+
+@router.post("/admin/public-blocks")
+async def admin_public_blocks_set(
+    admin: SessionUser = Depends(bearer_admin),
+    scope: Annotated[str, Body()] = "USER",
+    target_id: Annotated[str, Body()] = "",
+):
+    if scope not in ("ROLE", "USER"):
+        raise HTTPException(status_code=400, detail="Invalid scope.")
+    try:
+        tid = int(target_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Target ID must be a number.")
+    async with get_db() as db:
+        await set_public_block(db, _GUILD_ID(), scope, tid, True)
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Public-parlay block added", {"scope": scope, "target_id": str(tid)}, source="Discord Activity"))
+    return {"ok": True, "message": "Block added."}
+
+
+@router.delete("/admin/public-blocks/{block_id}")
+async def admin_public_blocks_delete(block_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        row = await db.get(PublicBetRestriction, block_id)
+        if row:
+            await db.delete(row)
+            await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Public-parlay block removed", {"id": str(block_id)}, source="Discord Activity"))
+    return {"ok": True, "message": "Block removed."}
+
+
 @router.get("/admin/users")
 async def admin_users(admin: SessionUser = Depends(bearer_admin)):
     async with get_db() as db:
@@ -1344,6 +1480,13 @@ async def admin_users(admin: SessionUser = Depends(bearer_admin)):
             select(User).where(User.guild_id == _GUILD_ID()).order_by(User.chips.desc())
         )).scalars().all()
     return {"users": [_user_dict(u) for u in users]}
+
+
+@router.get("/admin/economy")
+async def admin_economy(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        economy = await economy_totals(db, _GUILD_ID())
+    return economy
 
 
 @router.get("/admin/game/status")
