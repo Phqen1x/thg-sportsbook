@@ -915,7 +915,7 @@ def district_default_odds(
         m = int(math.floor(line)) + 1
         p_over = _poisson_at_least(m, lam)
         prob = p_over if ou_side == "OVER" else 1.0 - p_over
-        return prob_to_american(prob)
+        return prob_to_american(max(0.01, min(0.99, prob)))
 
     if market_type == "DISTRICT_BOTH_BLOODBATH":
         sum_inv = sum(1.0 / max(s, 1) for s in alive_all_scores) or 1.0
