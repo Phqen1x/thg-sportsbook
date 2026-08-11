@@ -34,6 +34,51 @@
 </div>
 
 <div class="section-header mt-3">
+  <h2>Economy</h2>
+</div>
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="stat-num">{{ economy.chips_spent | fmt_chips }}</div>
+    <div class="stat-label">Chips Spent</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num">{{ economy.chips_circulating | fmt_chips }}</div>
+    <div class="stat-label">Chips in Circulation</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num text-pos">{{ economy.panars_converted | fmt_chips }}</div>
+    <div class="stat-label">Panars Converted</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num text-dim">{{ economy.chips_withdrawn | fmt_chips }}</div>
+    <div class="stat-label">Chips Withdrawn</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num {{ 'text-pos' if economy.net_panars >= 0 else 'text-neg' }}">
+      {{ '+' if economy.net_panars >= 0 else '' }}{{ economy.net_panars | fmt_chips }}
+    </div>
+    <div class="stat-label">Net Panars</div>
+  </div>
+</div>
+
+<div class="section-header mt-3">
+  <h2>Payout Caps</h2>
+</div>
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="stat-num">{{ payout_caps.single | fmt_chips }}</div>
+    <div class="stat-label">Single Bet Cap</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num">{{ payout_caps.parlay | fmt_chips }}</div>
+    <div class="stat-label">Parlay Cap</div>
+  </div>
+  <div class="stat-card">
+    <a href="/admin/settings" class="btn btn-sm btn-outline">Edit Caps</a>
+  </div>
+</div>
+
+<div class="section-header mt-3">
   <h2>Game Phase</h2>
 </div>
 <div class="card">

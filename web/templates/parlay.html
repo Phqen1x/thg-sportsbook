@@ -80,6 +80,10 @@
       </div>
       <button type="submit" class="btn btn-primary btn-full mt-2">Submit Parlay</button>
     </form>
+
+    {% if user.is_admin %}
+    <button type="button" class="btn btn-outline btn-full mt-1" onclick="openFeatureParlayModal()">Feature Parlay</button>
+    {% endif %}
     {% else %}
     <div class="alert">Add at least 2 legs to submit a parlay.</div>
     {% endif %}
@@ -105,6 +109,29 @@
     <a href="/tail" class="btn btn-outline btn-full mt-1">Tail a Pre-Built Parlay</a>
   </div>
 </div>
+
+{% if user.is_admin %}
+<div id="feature-parlay-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-title">Feature Parlay</div>
+    <p class="text-dim">Turns your current slip into a no-wager GM parlay on the tail board and clears your slip.</p>
+    <form method="post" action="/parlay/feature">
+      <div class="form-group">
+        <label class="form-label">Name</label>
+        <input type="text" name="name" class="form-control" maxlength="100" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description (optional)</label>
+        <textarea name="description" class="form-control" maxlength="500"></textarea>
+      </div>
+      <div class="btn-group mt-2">
+        <button type="submit" class="btn btn-primary">Feature</button>
+        <button type="button" class="btn btn-outline" onclick="closeFeatureParlayModal()">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
@@ -126,6 +153,13 @@ function updateParlayPayout(val) {
 function setParlayWager(n) {
   const input = document.querySelector('#parlay-form input[name=wager]');
   if (input) { input.value = n; updateParlayPayout(n); }
+}
+
+function openFeatureParlayModal() {
+  document.getElementById('feature-parlay-modal').classList.remove('hidden');
+}
+function closeFeatureParlayModal() {
+  document.getElementById('feature-parlay-modal').classList.add('hidden');
 }
 
 updateParlayPayout(100);

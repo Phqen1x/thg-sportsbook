@@ -8,23 +8,37 @@ and odds maths are reused unchanged from ``bot/``.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import func, select, text
 
-from bot.cogs.betting import _parlay_conflict, MAX_PARLAY_LEGS, PARLAY_PAYOUT_CAP
+from bot.cogs.betting import (
+    _betting_paused, _parlay_conflict, _single_cap_error, _parlay_cap_error,
+    add_markets_to_pending_slip, tribute_lookup_for_markets,
+    BETTING_BLOCKED_MSG, BETTING_PAUSED_MSG, MAX_PARLAY_LEGS,
+)
+from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
 from bot.database.models import (
-    Alliance, Bet, BettingPhase, DistrictRecord, Market, Parlay, PendingParlayLeg,
-    ParlayTemplate, ParlayTemplateLeg, Tribute, User,
+    Alliance, Bet, BettingPhase, DistrictRecord, ExchangeRateOverride, Market, Parlay,
+    PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, PublicBetRestriction, Tribute, User,
 )
 from bot.odds.calculator import (
-    cashout_value, combined_american, parlay_payout, straight_payout,
+    combined_american, parlay_payout, resolve_cashout, straight_payout,
+)
+from bot.utils.economy import economy_totals
+from bot.utils.exchange_rates import get_global_rate, list_overrides, set_global_rate, set_override
+from bot.utils.payout_caps import get_payout_cap, set_payout_cap
+from bot.utils.restrictions import (
+    is_fully_restricted, is_public_bet_blocked, list_public_blocks, set_public_block,
 )
 from web import config, discord_api
 from web.activity_auth import bearer_admin, bearer_user, mint_token
-from web.database import get_db
+from web.audit import post_admin_action, post_bet_log
+from web.database import get_db, get_request_guild, set_request_guild
+from web.deps import live_role_ids
 from web.routes.public import _parlay_flavor
 from web.session import SessionUser
 
@@ -114,59 +128,150 @@ def _parlay_dict(p: Parlay) -> dict:
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
 
+_GUILD_ID = get_request_guild
+
+
+async def _paused() -> bool:
+    """Wrap _betting_paused() with the guild-context bind it needs.
+
+    _betting_paused() reaches the DB through bot.database.engine (get_setting ->
+    get_session()), which resolves the active guild from *its own* contextvar —
+    separate from web/database.py's request-guild context that the rest of this
+    module uses. Without binding it first, current_guild_id() reads 0 and
+    get_session() raises "No guild context set", which isn't an HTTPException
+    and so surfaces as a bare 500 instead of the intended paused-betting message."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    return await _betting_paused()
+
+
+async def _single_cap_error_activity(amount: int, odds: int) -> str | None:
+    """Guild-context-bound wrapper — see _paused() for why this is needed.
+    Strips the Discord-markdown ** the shared helper wraps chip amounts in,
+    since this surface renders errors as plain text."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    err = await _single_cap_error(amount, odds)
+    return err.replace("**", "") if err else None
+
+
+async def _parlay_cap_error_activity(wager: int, odds_list: list[int]) -> str | None:
+    """Guild-context-bound wrapper — see _paused() for why this is needed.
+    Strips the Discord-markdown ** the shared helper wraps chip amounts in,
+    since this surface renders errors as plain text."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    err = await _parlay_cap_error(wager, odds_list)
+    return err.replace("**", "") if err else None
+
+
+async def _fetch_user(db, discord_id: int) -> User | None:
+    result = await db.execute(
+        select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == discord_id)
+    )
+    return result.scalar_one_or_none()
+
+
 async def _get_or_create_user(db, session_user: SessionUser) -> User:
-    u = await db.get(User, session_user.discord_id)
+    result = await db.execute(
+        select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == session_user.discord_id)
+    )
+    u = result.scalar_one_or_none()
     if u is None:
         default_raw = (await db.execute(
             text("SELECT value FROM game_settings WHERE key='default_chips'")
         )).fetchone()
         default = json.loads(default_raw[0]) if default_raw else config.DEFAULT_CHIPS
-        u = User(discord_id=session_user.discord_id, username=session_user.username, chips=default)
+        u = User(
+            guild_id=_GUILD_ID(), discord_id=session_user.discord_id,
+            username=session_user.username, chips=default,
+        )
         db.add(u)
         await db.flush()
     return u
 
 
 async def _phase_name(db) -> str | None:
-    row = (await db.execute(text("SELECT value FROM game_settings WHERE key='active_phase_id'"))).fetchone()
+    row = (await db.execute(text("SELECT value FROM game_settings WHERE key='current_phase_id'"))).fetchone()
     if not row:
         return None
     phase = await db.get(BettingPhase, int(row[0]))
     return phase.name if phase else None
 
 
-async def _cashout_rate(db, market: Market | None) -> float:
-    if market and market.cashout_rate is not None:
-        return market.cashout_rate
-    row = (await db.execute(text("SELECT value FROM game_settings WHERE key='cashout_rate'"))).fetchone()
-    return float(row[0]) if row else 0.65
-
-
-async def _cashout_globally_off(db) -> bool:
+async def _cashout_settings(db) -> tuple[bool, float, dict]:
+    """Global cashout settings, shared by the bet/parlay cashout preview + POST routes."""
     row = (await db.execute(text("SELECT value FROM game_settings WHERE key='cashout_allowed'"))).fetchone()
-    return bool(row) and row[0].lower() == "false"
+    global_allowed = (row[0].lower() == "true") if row else False
+    rate_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='cashout_rate'"))).fetchone()
+    global_rate = float(rate_row[0]) if rate_row else 0.65
+    by_type_row = (await db.execute(text("SELECT value FROM game_settings WHERE key='cashout_by_type'"))).fetchone()
+    cashout_by_type: dict = json.loads(by_type_row[0]) if by_type_row else {}
+    return global_allowed, global_rate, cashout_by_type
+
+
+def _bet_cashout_preview(bet: Bet, market: Market | None, settings: tuple[bool, float, dict]) -> tuple[bool, int]:
+    global_allowed, global_rate, cashout_by_type = settings
+    type_override = cashout_by_type.get(market.type) if market else None
+    return resolve_cashout(
+        wager=bet.wager, payout_if_win=bet.payout_if_win,
+        global_allowed=global_allowed, global_rate=global_rate,
+        item_allowed=market.cashout_allowed if market else None,
+        item_rate=market.cashout_rate if market else None,
+        type_allowed=type_override["allowed"] if type_override else None,
+        type_rate=type_override.get("rate") if type_override else None,
+    )
+
+
+def _parlay_cashout_preview(parlay: Parlay, settings: tuple[bool, float, dict]) -> tuple[bool, int]:
+    global_allowed, global_rate, _by_type = settings
+    return resolve_cashout(
+        wager=parlay.total_wager, payout_if_win=parlay.total_payout,
+        global_allowed=global_allowed, global_rate=global_rate,
+        item_allowed=parlay.cashout_allowed, item_rate=parlay.cashout_rate,
+    )
 
 
 # ── Auth handshake ───────────────────────────────────────────────────────────
 
 @router.post("/token")
-async def token(code: Annotated[str, Body(embed=True)]):
+async def token(
+    code: Annotated[str, Body(embed=True)],
+    guild_id: Annotated[str | None, Body(embed=True)] = None,
+):
     """Exchange the Embedded App SDK OAuth code for a signed activity token.
 
     Identity is read from Discord with the access token and admin status is checked
     server-side with the bot token — neither is supplied by the client.
+    The ``guild_id`` the activity is running in is provided by the client so that
+    the correct per-guild database is used for all subsequent API calls.
+    guild_id is sent as a string because Discord snowflakes exceed JS Number.MAX_SAFE_INTEGER.
     """
+    # Parse guild_id safely — the client sends it as a string to avoid JS float precision loss.
+    gid: int | None = int(guild_id) if guild_id else None
+
     if not config.DISCORD_CLIENT_ID or not config.DISCORD_CLIENT_SECRET:
         raise HTTPException(status_code=500, detail="Discord OAuth is not configured.")
+
+    # Lock the Activity to a single server when GUILD_ID is configured. Without
+    # this check the client-reported guild_id (whichever server the Activity was
+    # actually launched from) was trusted as-is, so the Activity would happily
+    # authenticate — and spin up a fresh per-guild database for — any server the
+    # bot is in, regardless of GUILD_ID in .env.
+    if config.GUILD_ID and gid != config.GUILD_ID:
+        raise HTTPException(
+            status_code=403,
+            detail="This Activity is only available in the official server.",
+        )
     try:
         tokens = await discord_api.exchange_code_activity(code)
         access_token = tokens["access_token"]
         user_data = await discord_api.get_user(access_token)
         uid = int(user_data["id"])
-        member = await discord_api.get_member(uid)
+        member = await discord_api.get_member(uid, guild_id=gid)
         if member is None:
             raise HTTPException(status_code=403, detail="You must be a member of the server to use this.")
-        is_admin = await discord_api.check_admin(member)
+        is_admin = await discord_api.check_admin(member, guild_id=gid)
     except HTTPException:
         raise
     except Exception:
@@ -177,9 +282,14 @@ async def token(code: Annotated[str, Body(embed=True)]):
         username=user_data.get("global_name") or user_data.get("username", "Unknown"),
         avatar=user_data.get("avatar"),
         is_admin=is_admin,
+        guild_id=gid,
     )
-    # Ensure the user row exists with their current display name.
+    # Point DB context at the activity's guild so _get_or_create_user uses the right file.
+    set_request_guild(gid or 0)
     async with get_db() as db:
+        from bot.database.engine import get_tribute_lock, TRIBUTE_LOCK_MESSAGE
+        if await get_tribute_lock(db, gid or 0, uid) is not None:
+            raise HTTPException(status_code=403, detail=TRIBUTE_LOCK_MESSAGE)
         db_user = await _get_or_create_user(db, user)
         db_user.username = user.username
         await db.commit()
@@ -205,23 +315,24 @@ async def me(user: SessionUser = Depends(bearer_user)):
         db_user = await _get_or_create_user(db, user)
         await db.commit()
 
-        bets = (await db.execute(
-            select(Bet).where(Bet.user_id == user.discord_id, Bet.parlay_id.is_(None))
-        )).scalars().all()
-        parlays = (await db.execute(
-            select(Parlay).where(Parlay.user_id == user.discord_id)
-        )).scalars().all()
-
-        won = sum(b.payout_if_win for b in bets if b.status == "WON")
-        won += sum(p.total_payout for p in parlays if p.status == "WON")
+        # ROI must be derived from the same total_won/total_wagered counters the
+        # /balance Discord command reads, not re-derived from bets/parlays here —
+        # a separate recomputation drifted out of sync with the persisted totals
+        # (e.g. legacy rows scoped differently) and was showing -100% ROI for
+        # users total_won already correctly credited chips for.
         wagered = db_user.total_wagered
-        roi = ((won - wagered) / wagered * 100) if wagered else 0.0
+        roi = ((db_user.total_won - wagered) / wagered * 100) if wagered else 0.0
 
     return {
         **_user_dict(db_user),
         "is_admin": user.is_admin,
         "avatar_url": user.avatar_url,
         "roi": round(roi, 1),
+        # Exposed here (rather than only on the admin-gated /admin/payout-caps
+        # endpoint) so the bet/parlay wager UI can preview an accurate payout —
+        # every member already fetches /me on load and after each bet.
+        "single_payout_cap": await get_payout_cap("SINGLE"),
+        "parlay_payout_cap": await get_payout_cap("PARLAY"),
     }
 
 
@@ -292,15 +403,38 @@ async def tributes(user: SessionUser = Depends(bearer_user)):
 
 
 @router.get("/leaderboard")
-async def leaderboard(user: SessionUser = Depends(bearer_user)):
+async def leaderboard(user: SessionUser = Depends(bearer_user), category: str = "CHIPS"):
+    if category not in dict(LEADERBOARD_CATEGORIES):
+        category = "CHIPS"
+    gid = _GUILD_ID()
+
     async with get_db() as db:
-        users = (await db.execute(
-            select(User).order_by(User.chips.desc()).limit(100)
-        )).scalars().all()
+        title, kind, rows = await _leaderboard_rows(db, gid, category, 100)
+
+        usernames: dict[int, str] = {}
+        ids = {uid for uid, _ in rows}
+        if ids:
+            user_result = await db.execute(
+                select(User.discord_id, User.username).where(
+                    User.guild_id == gid, User.discord_id.in_(ids)
+                )
+            )
+            usernames = {uid: name for uid, name in user_result.all()}
+
     return {
+        "category": category,
+        "title": title,
+        "value_kind": kind,
+        "categories": [{"value": v, "label": l} for v, l in LEADERBOARD_CATEGORIES],
         "users": [
-            {"rank": i + 1, **_user_dict(u), "is_me": u.discord_id == user.discord_id}
-            for i, u in enumerate(users)
+            {
+                "rank": i + 1,
+                "discord_id": str(uid),
+                "username": usernames.get(uid, "Member"),
+                "value": value,
+                "is_me": uid == user.discord_id,
+            }
+            for i, (uid, value) in enumerate(rows)
         ],
     }
 
@@ -310,12 +444,15 @@ async def my_bets(user: SessionUser = Depends(bearer_user)):
     async with get_db() as db:
         straight_bets = (await db.execute(
             select(Bet)
-            .where(Bet.user_id == user.discord_id, Bet.parlay_id.is_(None))
+            .where(
+                Bet.guild_id == _GUILD_ID(), Bet.user_id == user.discord_id,
+                Bet.parlay_id.is_(None),
+            )
             .order_by(Bet.placed_at.desc())
         )).scalars().all()
         parlays = (await db.execute(
             select(Parlay)
-            .where(Parlay.user_id == user.discord_id)
+            .where(Parlay.guild_id == _GUILD_ID(), Parlay.user_id == user.discord_id)
             .order_by(Parlay.placed_at.desc())
         )).scalars().all()
 
@@ -335,8 +472,21 @@ async def my_bets(user: SessionUser = Depends(bearer_user)):
             mkts = (await db.execute(select(Market).where(Market.id.in_(market_ids)))).scalars().all()
             markets_map = {m.id: m for m in mkts}
 
+        settings = await _cashout_settings(db)
+        straight_out = []
+        for b in straight_bets:
+            d = _bet_dict(b)
+            if b.status == "PENDING":
+                allowed, amount = _bet_cashout_preview(b, markets_map.get(b.market_id), settings)
+                d["cashout_preview"] = amount if allowed else None
+            straight_out.append(d)
+        for p, po in zip(parlays, parlay_out):
+            if p.status == "PENDING":
+                allowed, amount = _parlay_cashout_preview(p, settings)
+                po["cashout_preview"] = amount if allowed else None
+
     return {
-        "straight_bets": [_bet_dict(b) for b in straight_bets],
+        "straight_bets": straight_out,
         "parlays": parlay_out,
         "markets": {str(mid): _market_dict(m) for mid, m in markets_map.items()},
     }
@@ -352,6 +502,8 @@ async def place_bet(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if await _paused():
+        raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
         market = await db.get(Market, market_id)
@@ -359,11 +511,14 @@ async def place_bet(
             raise HTTPException(status_code=400, detail="Market is not open for betting.")
 
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
         if db_user.chips < wager:
             raise HTTPException(status_code=400, detail="Insufficient chips.")
 
         existing = (await db.execute(
             select(Bet).where(
+                Bet.guild_id == _GUILD_ID(),
                 Bet.user_id == user.discord_id,
                 Bet.market_id == market_id,
                 Bet.status == "PENDING",
@@ -373,8 +528,13 @@ async def place_bet(
         if existing:
             raise HTTPException(status_code=400, detail="You already have a pending bet on this market.")
 
+        cap_err = await _single_cap_error_activity(wager, market.odds)
+        if cap_err:
+            raise HTTPException(status_code=400, detail=cap_err)
+
         payout = straight_payout(wager, market.odds)
         bet = Bet(
+            guild_id=_GUILD_ID(),
             user_id=user.discord_id,
             market_id=market_id,
             wager=wager,
@@ -387,7 +547,9 @@ async def place_bet(
         db.add(bet)
         await db.commit()
         chips_left = db_user.chips
+        market_label = market.label
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "BET", [market_label], wager, payout))
     return {"ok": True, "payout_if_win": payout, "chips": chips_left,
             "message": f"Bet placed! Win {payout:,} chips if correct."}
 
@@ -396,16 +558,16 @@ async def place_bet(
 async def cashout_bet(bet_id: int, user: SessionUser = Depends(bearer_user)):
     async with get_db() as db:
         bet = await db.get(Bet, bet_id)
-        if not bet or bet.user_id != user.discord_id or bet.status != "PENDING":
+        if not bet or bet.user_id != user.discord_id or bet.guild_id != _GUILD_ID() or bet.status != "PENDING":
             raise HTTPException(status_code=400, detail="Bet not found or not cashout-eligible.")
 
         market = await db.get(Market, bet.market_id)
-        if await _cashout_globally_off(db) and not (market and market.cashout_allowed):
+        settings = await _cashout_settings(db)
+        allowed, amount = _bet_cashout_preview(bet, market, settings)
+        if not allowed:
             raise HTTPException(status_code=400, detail="Cashout is not currently allowed.")
 
-        rate = await _cashout_rate(db, market)
-        amount = cashout_value(bet.wager, bet.payout_if_win, rate)
-        db_user = await db.get(User, user.discord_id)
+        db_user = await _fetch_user(db, user.discord_id)
         if db_user:
             db_user.chips += amount
         bet.status = "CASHED_OUT"
@@ -421,14 +583,15 @@ async def cashout_bet(bet_id: int, user: SessionUser = Depends(bearer_user)):
 async def cashout_parlay(parlay_id: int, user: SessionUser = Depends(bearer_user)):
     async with get_db() as db:
         parlay = await db.get(Parlay, parlay_id)
-        if not parlay or parlay.user_id != user.discord_id or parlay.status != "PENDING":
+        if not parlay or parlay.user_id != user.discord_id or parlay.guild_id != _GUILD_ID() or parlay.status != "PENDING":
             raise HTTPException(status_code=400, detail="Parlay not found or not cashout-eligible.")
-        if await _cashout_globally_off(db):
+
+        settings = await _cashout_settings(db)
+        allowed, amount = _parlay_cashout_preview(parlay, settings)
+        if not allowed:
             raise HTTPException(status_code=400, detail="Cashout is not currently allowed.")
 
-        rate = await _cashout_rate(db, None)
-        amount = cashout_value(parlay.total_wager, parlay.total_payout, rate)
-        db_user = await db.get(User, user.discord_id)
+        db_user = await _fetch_user(db, user.discord_id)
         if db_user:
             db_user.chips += amount
         parlay.status = "CASHED_OUT"
@@ -455,7 +618,7 @@ async def parlay_view(user: SessionUser = Depends(bearer_user)):
 
         legs = (await db.execute(
             select(PendingParlayLeg)
-            .where(PendingParlayLeg.user_id == user.discord_id)
+            .where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
             .order_by(PendingParlayLeg.added_at)
         )).scalars().all()
 
@@ -490,7 +653,9 @@ async def parlay_add(market_id: int, user: SessionUser = Depends(bearer_user)):
             raise HTTPException(status_code=400, detail="Market is not open.")
 
         existing_legs = (await db.execute(
-            select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+            select(PendingParlayLeg).where(
+                PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id,
+            )
         )).scalars().all()
 
         if len(existing_legs) >= MAX_PARLAY_LEGS:
@@ -504,11 +669,12 @@ async def parlay_add(market_id: int, user: SessionUser = Depends(bearer_user)):
             if mkt:
                 existing_markets.append(mkt)
 
-        conflict = _parlay_conflict(existing_markets, market)
+        tribute_by_id = await tribute_lookup_for_markets(db, existing_markets + [market])
+        conflict = _parlay_conflict(existing_markets, market, tribute_by_id)
         if conflict:
             raise HTTPException(status_code=400, detail=conflict)
 
-        db.add(PendingParlayLeg(user_id=user.discord_id, market_id=market_id))
+        db.add(PendingParlayLeg(guild_id=_GUILD_ID(), user_id=user.discord_id, market_id=market_id))
         await db.commit()
 
     return {"ok": True, "message": "Market added to parlay slip."}
@@ -518,7 +684,7 @@ async def parlay_add(market_id: int, user: SessionUser = Depends(bearer_user)):
 async def parlay_remove(leg_id: int, user: SessionUser = Depends(bearer_user)):
     async with get_db() as db:
         leg = await db.get(PendingParlayLeg, leg_id)
-        if leg and leg.user_id == user.discord_id:
+        if leg and leg.user_id == user.discord_id and leg.guild_id == _GUILD_ID():
             await db.delete(leg)
             await db.commit()
     return {"ok": True}
@@ -528,7 +694,9 @@ async def parlay_remove(leg_id: int, user: SessionUser = Depends(bearer_user)):
 async def parlay_clear(user: SessionUser = Depends(bearer_user)):
     async with get_db() as db:
         legs = (await db.execute(
-            select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+            select(PendingParlayLeg).where(
+                PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id,
+            )
         )).scalars().all()
         for leg in legs:
             await db.delete(leg)
@@ -544,13 +712,17 @@ async def parlay_submit(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if await _paused():
+        raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
 
         legs_raw = (await db.execute(
             select(PendingParlayLeg)
-            .where(PendingParlayLeg.user_id == user.discord_id)
+            .where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
             .order_by(PendingParlayLeg.added_at)
         )).scalars().all()
 
@@ -568,9 +740,17 @@ async def parlay_submit(
             raise HTTPException(status_code=400, detail="Insufficient chips.")
 
         odds_list = [m.odds for m in leg_markets]
-        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+        cap_err = await _parlay_cap_error_activity(wager, odds_list)
+        if cap_err:
+            raise HTTPException(status_code=400, detail=cap_err)
+        total_payout = parlay_payout(wager, odds_list)
+
+        role_ids = await live_role_ids(user.discord_id, user.guild_id)
+        downgraded = is_public and await is_public_bet_blocked(db, _GUILD_ID(), user.discord_id, role_ids)
+        is_public = is_public and not downgraded
 
         p = Parlay(
+            guild_id=_GUILD_ID(),
             user_id=user.discord_id,
             total_wager=wager,
             total_payout=total_payout,
@@ -582,6 +762,7 @@ async def parlay_submit(
 
         for mkt in leg_markets:
             db.add(Bet(
+                guild_id=_GUILD_ID(),
                 user_id=user.discord_id, parlay_id=p.id, market_id=mkt.id,
                 wager=wager, odds_at_placement=mkt.odds, payout_if_win=0, status="PENDING",
             ))
@@ -592,9 +773,56 @@ async def parlay_submit(
             await db.delete(l)
         await db.commit()
         chips_left = db_user.chips
+        labels = [m.label for m in leg_markets]
 
-    return {"ok": True, "total_payout": total_payout, "chips": chips_left,
-            "message": f"Parlay submitted! Potential payout: {total_payout:,} chips."}
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout))
+    message = f"Parlay submitted! Potential payout: {total_payout:,} chips."
+    if downgraded:
+        message += " Kept private — public posting is restricted for you."
+    return {"ok": True, "total_payout": total_payout, "chips": chips_left, "message": message}
+
+
+@router.post("/parlay/feature")
+async def parlay_feature(
+    user: SessionUser = Depends(bearer_user),
+    name: Annotated[str, Body()] = "",
+    description: Annotated[str, Body()] = "",
+):
+    """Admin-only: turn the caller's current parlay slip into a GM-featured,
+    tailable, no-wager tail-board entry — same underlying model as the bot's
+    `/admin parlay save_slip`, just reachable from the Activity's Parlay tab."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="Name is required.")
+
+    async with get_db() as db:
+        legs = (await db.execute(
+            select(PendingParlayLeg)
+            .where(PendingParlayLeg.guild_id == _GUILD_ID(), PendingParlayLeg.user_id == user.discord_id)
+            .order_by(PendingParlayLeg.added_at)
+        )).scalars().all()
+        if len(legs) < 2:
+            raise HTTPException(status_code=400, detail="Your slip needs at least 2 legs to feature.")
+
+        tpl = ParlayTemplate(
+            name=name.strip()[:100],
+            description=(description.strip()[:500] or None),
+            source="ADMIN",
+            active=True,
+        )
+        db.add(tpl)
+        await db.flush()
+        for i, leg in enumerate(legs):
+            db.add(ParlayTemplateLeg(template_id=tpl.id, market_id=leg.market_id, sort_order=i))
+            await db.delete(leg)
+        await db.commit()
+        tpl_id, tpl_name = tpl.id, tpl.name
+
+    asyncio.create_task(post_admin_action(
+        user, "Featured parlay created", {"name": tpl_name}, source="Discord Activity",
+    ))
+    return {"ok": True, "message": f"Featured parlay #{tpl_id} is now live on the tail board.", "id": tpl_id}
 
 
 # ── Member: tail board ───────────────────────────────────────────────────────
@@ -623,10 +851,11 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
                 if mkt:
                     leg_markets.append(mkt)
             tpl_leg_markets[tpl.id] = leg_markets
-            odds_list = [m.odds for m in leg_markets if m.status == "OPEN"]
+            odds_list = [m.odds for m in leg_markets]
             combined = combined_american(odds_list) if len(odds_list) >= 2 else None
             out.append({
                 "id": tpl.id,
+                "kind": "template",
                 "name": tpl.name,
                 "description": tpl.description,
                 "difficulty": tpl.difficulty,
@@ -670,6 +899,49 @@ async def tail_board(user: SessionUser = Depends(bearer_user)):
             entry["name"] = name
             entry["description"] = desc
 
+        # Public, still-pending member parlays are also tailable (matches
+        # /parlay tail in the bot and the /tail page on the web dashboard) —
+        # they live in a separate id space from ParlayTemplate, so callers use
+        # entry["kind"] to route tail/add-to-slip requests to the right endpoint.
+        mp_rows = (await db.execute(
+            select(Parlay)
+            .where(Parlay.guild_id == _GUILD_ID(), Parlay.status == "PENDING", Parlay.is_public == True)  # noqa: E712
+            .order_by(Parlay.placed_at.desc())
+            .limit(15)
+        )).scalars().all()
+
+        for mp in mp_rows:
+            legs = (await db.execute(
+                select(Bet).where(Bet.parlay_id == mp.id).order_by(Bet.id)
+            )).scalars().all()
+            leg_markets = []
+            ok = True
+            for b in legs:
+                mkt = await db.get(Market, b.market_id)
+                if not mkt or mkt.status != "OPEN":
+                    ok = False
+                    break
+                leg_markets.append(mkt)
+            if not ok or len(leg_markets) < 2:
+                continue
+
+            owner = (await db.execute(
+                select(User).where(User.guild_id == _GUILD_ID(), User.discord_id == mp.user_id)
+            )).scalar_one_or_none()
+            owner_name = owner.username if owner else "Member"
+            odds_list = [m.odds for m in leg_markets]
+
+            out.append({
+                "id": mp.id,
+                "kind": "member",
+                "name": mp.name or f"{owner_name}'s Parlay #{mp.id}",
+                "description": f"Tailing {owner_name}'s {len(leg_markets)}-leg parlay",
+                "difficulty": "MEMBER",
+                "source": "MEMBER",
+                "combined_odds": combined_american(odds_list),
+                "legs": [_market_dict(m) for m in leg_markets],
+            })
+
     return {"chips": db_user.chips, "templates": out}
 
 
@@ -681,6 +953,8 @@ async def tail_parlay(
 ):
     if wager < 1:
         raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if await _paused():
+        raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
     async with get_db() as db:
         tpl = await db.get(ParlayTemplate, template_id)
@@ -688,6 +962,8 @@ async def tail_parlay(
             raise HTTPException(status_code=404, detail="Template not found.")
 
         db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
 
         legs = (await db.execute(
             select(ParlayTemplateLeg)
@@ -708,14 +984,20 @@ async def tail_parlay(
             raise HTTPException(status_code=400, detail="Insufficient chips.")
 
         odds_list = [m.odds for m in leg_markets]
-        total_payout = min(parlay_payout(wager, odds_list), PARLAY_PAYOUT_CAP)
+        cap_err = await _parlay_cap_error_activity(wager, odds_list)
+        if cap_err:
+            raise HTTPException(status_code=400, detail=cap_err)
+        total_payout = parlay_payout(wager, odds_list)
 
-        p = Parlay(user_id=user.discord_id, total_wager=wager, total_payout=total_payout,
-                   status="PENDING", is_public=False)
+        p = Parlay(
+            guild_id=_GUILD_ID(), user_id=user.discord_id, total_wager=wager, total_payout=total_payout,
+            status="PENDING", is_public=False,
+        )
         db.add(p)
         await db.flush()
         for mkt in leg_markets:
             db.add(Bet(
+                guild_id=_GUILD_ID(),
                 user_id=user.discord_id, parlay_id=p.id, market_id=mkt.id,
                 wager=wager, odds_at_placement=mkt.odds, payout_if_win=0, status="PENDING",
             ))
@@ -723,9 +1005,163 @@ async def tail_parlay(
         db_user.total_wagered += wager
         await db.commit()
         chips_left = db_user.chips
+        labels = [m.label for m in leg_markets]
 
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout, is_tail=True))
     return {"ok": True, "total_payout": total_payout, "chips": chips_left,
             "message": f"Parlay tailed! Potential payout: {total_payout:,} chips."}
+
+
+@router.post("/tail/{template_id}/add-to-slip")
+async def add_template_to_slip(template_id: int, user: SessionUser = Depends(bearer_user)):
+    """Copy a tail-board template's legs into the caller's own parlay slip so
+    they can edit (add/remove legs, change wager) before submitting, instead of
+    only being able to tail the template as a fixed package."""
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, template_id)
+        if not tpl or not tpl.active:
+            raise HTTPException(status_code=404, detail="Template not found.")
+
+        tpl_legs = (await db.execute(
+            select(ParlayTemplateLeg)
+            .where(ParlayTemplateLeg.template_id == template_id)
+            .order_by(ParlayTemplateLeg.sort_order)
+        )).scalars().all()
+
+        tpl_markets = []
+        for leg in tpl_legs:
+            mkt = await db.get(Market, leg.market_id)
+            if mkt and mkt.status == "OPEN":
+                tpl_markets.append(mkt)
+        if not tpl_markets:
+            raise HTTPException(status_code=400, detail="No open markets in this parlay to add.")
+
+        added, skipped = await add_markets_to_pending_slip(
+            db, _GUILD_ID(), user.discord_id, tpl_markets
+        )
+        await db.commit()
+
+    if added == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't add any legs — they're already in your slip or conflict with what's there.",
+        )
+    message = f"Added {added} leg{'s' if added != 1 else ''} to your parlay slip."
+    if skipped:
+        message += f" Skipped {skipped} (already in slip or conflicting)."
+    return {"ok": True, "message": message, "added": added, "skipped": skipped}
+
+
+@router.post("/tail/parlay/{parlay_id}")
+async def tail_member_parlay(
+    parlay_id: int,
+    user: SessionUser = Depends(bearer_user),
+    wager: Annotated[int, Body(embed=True)] = 0,
+):
+    """Tail another member's public, still-pending parlay — lives in its own id
+    space from ParlayTemplate, hence the separate /tail/parlay/ route."""
+    if wager < 1:
+        raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if await _paused():
+        raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
+
+    async with get_db() as db:
+        source = await db.get(Parlay, parlay_id)
+        if not source or not source.is_public or source.status != "PENDING":
+            raise HTTPException(status_code=404, detail="Parlay not found or no longer available.")
+
+        db_user = await _get_or_create_user(db, user)
+        if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
+            raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
+
+        legs = (await db.execute(
+            select(Bet).where(Bet.parlay_id == parlay_id).order_by(Bet.id)
+        )).scalars().all()
+
+        leg_markets = []
+        for b in legs:
+            mkt = await db.get(Market, b.market_id)
+            if not mkt or mkt.status != "OPEN":
+                raise HTTPException(status_code=400, detail="One or more markets in this parlay are no longer open.")
+            leg_markets.append(mkt)
+
+        if len(leg_markets) < 2:
+            raise HTTPException(status_code=400, detail="Parlay has insufficient open markets.")
+        if db_user.chips < wager:
+            raise HTTPException(status_code=400, detail="Insufficient chips.")
+
+        odds_list = [m.odds for m in leg_markets]
+        cap_err = await _parlay_cap_error_activity(wager, odds_list)
+        if cap_err:
+            raise HTTPException(status_code=400, detail=cap_err)
+        total_payout = parlay_payout(wager, odds_list)
+
+        # Tailed copies are private by default; record provenance (unless the
+        # member tailed their own board listing) so the original poster gets
+        # credit on the "Most Tailed Parlays" leaderboard — mirrors the bot's
+        # `/parlay tail` flow in bot/cogs/betting.py.
+        tailed_from_user_id = source.user_id if source.user_id != user.discord_id else None
+        tailed_from_parlay_id = source.id if tailed_from_user_id is not None else None
+
+        p = Parlay(
+            guild_id=_GUILD_ID(), user_id=user.discord_id, total_wager=wager, total_payout=total_payout,
+            status="PENDING", is_public=False,
+            tailed_from_user_id=tailed_from_user_id, tailed_from_parlay_id=tailed_from_parlay_id,
+        )
+        db.add(p)
+        await db.flush()
+        for mkt in leg_markets:
+            db.add(Bet(
+                guild_id=_GUILD_ID(),
+                user_id=user.discord_id, parlay_id=p.id, market_id=mkt.id,
+                wager=wager, odds_at_placement=mkt.odds, payout_if_win=0, status="PENDING",
+            ))
+        db_user.chips -= wager
+        db_user.total_wagered += wager
+        await db.commit()
+        chips_left = db_user.chips
+        labels = [m.label for m in leg_markets]
+
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout, is_tail=True))
+    return {"ok": True, "total_payout": total_payout, "chips": chips_left,
+            "message": f"Parlay tailed! Potential payout: {total_payout:,} chips."}
+
+
+@router.post("/tail/parlay/{parlay_id}/add-to-slip")
+async def add_member_parlay_to_slip(parlay_id: int, user: SessionUser = Depends(bearer_user)):
+    """Copy a public member parlay's legs into the caller's own parlay slip so
+    they can edit it before submitting, instead of only being able to tail it."""
+    async with get_db() as db:
+        source = await db.get(Parlay, parlay_id)
+        if not source or not source.is_public or source.status != "PENDING":
+            raise HTTPException(status_code=404, detail="Parlay not found or no longer available.")
+
+        legs = (await db.execute(
+            select(Bet).where(Bet.parlay_id == parlay_id).order_by(Bet.id)
+        )).scalars().all()
+
+        leg_markets = []
+        for b in legs:
+            mkt = await db.get(Market, b.market_id)
+            if mkt and mkt.status == "OPEN":
+                leg_markets.append(mkt)
+        if not leg_markets:
+            raise HTTPException(status_code=400, detail="No open markets in this parlay to add.")
+
+        added, skipped = await add_markets_to_pending_slip(
+            db, _GUILD_ID(), user.discord_id, leg_markets
+        )
+        await db.commit()
+
+    if added == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't add any legs — they're already in your slip or conflict with what's there.",
+        )
+    message = f"Added {added} leg{'s' if added != 1 else ''} to your parlay slip."
+    if skipped:
+        message += f" Skipped {skipped} (already in slip or conflicting)."
+    return {"ok": True, "message": message, "added": added, "skipped": skipped}
 
 
 # ── Admin: live-game operations ──────────────────────────────────────────────
@@ -744,13 +1180,13 @@ async def _settle_parlay(db, parlay_id: int) -> None:
         active = [l for l in legs if l.status != "VOIDED"]
         if all(l.status == "WON" for l in active) and active:
             parlay.status = "WON"
-            db_user = await db.get(User, parlay.user_id)
+            db_user = await _fetch_user(db, parlay.user_id)
             if db_user:
                 db_user.chips += parlay.total_payout
                 db_user.total_won += parlay.total_payout
         elif all(l.status == "VOIDED" for l in legs):
             parlay.status = "WON"
-            db_user = await db.get(User, parlay.user_id)
+            db_user = await _fetch_user(db, parlay.user_id)
             if db_user:
                 db_user.chips += parlay.total_wager
 
@@ -798,6 +1234,7 @@ async def admin_banners_add(
                 {"v": json.dumps(existing)},
             )
         await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Banner added", {"title": title.strip()[:80]}, source="Discord Activity"))
     return {"ok": True, "message": "Banner added.", "banner": banner}
 
 
@@ -813,14 +1250,353 @@ async def admin_banners_delete(banner_id: str, admin: SessionUser = Depends(bear
                 {"v": json.dumps(updated)},
             )
             await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Banner removed", {"banner_id": banner_id}, source="Discord Activity"))
     return {"ok": True, "message": "Banner removed."}
+
+
+@router.get("/admin/parlays")
+async def admin_parlays_list(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        templates_raw = (await db.execute(
+            select(ParlayTemplate).order_by(ParlayTemplate.created_at.desc())
+        )).scalars().all()
+        out = []
+        for tpl in templates_raw:
+            legs = (await db.execute(
+                select(ParlayTemplateLeg)
+                .where(ParlayTemplateLeg.template_id == tpl.id)
+                .order_by(ParlayTemplateLeg.sort_order)
+            )).scalars().all()
+            leg_out = []
+            odds_list = []
+            for leg in legs:
+                mkt = await db.get(Market, leg.market_id)
+                if not mkt:
+                    continue
+                leg_out.append({"leg_id": leg.id, "market_id": mkt.id, "label": mkt.label, "odds": mkt.odds})
+                if mkt.status == "OPEN":
+                    odds_list.append(mkt.odds)
+            out.append({
+                "id": tpl.id,
+                "name": tpl.name,
+                "description": tpl.description,
+                "difficulty": tpl.difficulty,
+                "active": tpl.active,
+                "source": tpl.source,
+                "combined_odds": combined_american(odds_list) if len(odds_list) >= 2 else None,
+                "legs": leg_out,
+            })
+    return {"templates": out}
+
+
+@router.post("/admin/parlays/create")
+async def admin_parlays_create(
+    admin: SessionUser = Depends(bearer_admin),
+    name: Annotated[str, Body()] = "",
+    description: Annotated[str, Body()] = "",
+):
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="Name is required.")
+    async with get_db() as db:
+        tpl = ParlayTemplate(
+            name=name.strip()[:100],
+            description=(description.strip() or None),
+            source="ADMIN",
+            active=False,
+        )
+        db.add(tpl)
+        await db.commit()
+        await db.refresh(tpl)
+    asyncio.create_task(post_admin_action(admin, "Parlay template created", {"name": tpl.name}, source="Discord Activity"))
+    return {"ok": True, "message": "Template created.", "id": tpl.id}
+
+
+@router.post("/admin/parlays/{tpl_id}/add-leg")
+async def admin_parlays_add_leg(
+    tpl_id: int,
+    admin: SessionUser = Depends(bearer_admin),
+    market_id: Annotated[int, Body()] = 0,
+):
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, tpl_id)
+        if not tpl:
+            raise HTTPException(status_code=404, detail="Template not found.")
+        new_mkt = await db.get(Market, market_id)
+        if not new_mkt:
+            raise HTTPException(status_code=404, detail="Market not found.")
+
+        existing_legs = (await db.execute(
+            select(ParlayTemplateLeg)
+            .where(ParlayTemplateLeg.template_id == tpl_id)
+            .order_by(ParlayTemplateLeg.sort_order)
+        )).scalars().all()
+        if any(leg.market_id == market_id for leg in existing_legs):
+            raise HTTPException(status_code=400, detail="That market is already a leg on this template.")
+
+        existing_markets = []
+        for leg in existing_legs:
+            mkt = await db.get(Market, leg.market_id)
+            if mkt:
+                existing_markets.append(mkt)
+
+        tribute_by_id = await tribute_lookup_for_markets(db, existing_markets + [new_mkt])
+        conflict = _parlay_conflict(existing_markets, new_mkt, tribute_by_id)
+        if conflict:
+            raise HTTPException(status_code=400, detail=conflict)
+
+        leg = ParlayTemplateLeg(template_id=tpl_id, market_id=market_id, sort_order=len(existing_legs))
+        db.add(leg)
+        await db.commit()
+    asyncio.create_task(post_admin_action(
+        admin, "Parlay template leg added", {"template": tpl.name, "market_id": str(market_id)}, source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Leg added."}
+
+
+@router.post("/admin/parlays/{tpl_id}/remove-leg")
+async def admin_parlays_remove_leg(
+    tpl_id: int,
+    admin: SessionUser = Depends(bearer_admin),
+    leg_id: Annotated[int, Body()] = 0,
+):
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, tpl_id)
+        leg = await db.get(ParlayTemplateLeg, leg_id)
+        if not tpl or not leg or leg.template_id != tpl_id:
+            raise HTTPException(status_code=404, detail="Leg not found.")
+        await db.delete(leg)
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Parlay template leg removed", {"template": tpl.name}, source="Discord Activity"))
+    return {"ok": True, "message": "Leg removed."}
+
+
+@router.post("/admin/parlays/{tpl_id}/toggle")
+async def admin_parlays_toggle(tpl_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, tpl_id)
+        if not tpl:
+            raise HTTPException(status_code=404, detail="Template not found.")
+        tpl.active = not tpl.active
+        await db.commit()
+        active = tpl.active
+    asyncio.create_task(post_admin_action(admin, "Parlay template toggled", {"template": tpl.name, "active": str(active)}, source="Discord Activity"))
+    return {"ok": True, "message": f"Template {'activated' if active else 'deactivated'}.", "active": active}
+
+
+@router.delete("/admin/parlays/{tpl_id}")
+async def admin_parlays_delete(tpl_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        tpl = await db.get(ParlayTemplate, tpl_id)
+        if not tpl:
+            raise HTTPException(status_code=404, detail="Template not found.")
+        name = tpl.name
+        await db.delete(tpl)
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Parlay template deleted", {"template": name}, source="Discord Activity"))
+    return {"ok": True, "message": "Template deleted."}
+
+
+# ── Exchange rates + public-parlay blocks ──────────────────────────────────────
+# Named to avoid colliding with the existing /admin/economy (aggregate totals, below).
+
+def _override_dict(o: ExchangeRateOverride) -> dict:
+    return {"id": o.id, "scope": o.scope, "target_id": str(o.target_id), "direction": o.direction, "rate": o.rate}
+
+
+def _block_dict(b: PublicBetRestriction) -> dict:
+    return {"id": b.id, "scope": b.scope, "target_id": str(b.target_id)}
+
+
+@router.get("/admin/payout-caps")
+async def admin_payout_caps(admin: SessionUser = Depends(bearer_admin)):
+    return {
+        "single_payout_cap": await get_payout_cap("SINGLE"),
+        "parlay_payout_cap": await get_payout_cap("PARLAY"),
+    }
+
+
+@router.post("/admin/payout-caps")
+async def admin_payout_caps_set(
+    admin: SessionUser = Depends(bearer_admin),
+    single_payout_cap: Annotated[int, Body()] = 0,
+    parlay_payout_cap: Annotated[int, Body()] = 0,
+):
+    if single_payout_cap <= 0 or parlay_payout_cap <= 0:
+        raise HTTPException(status_code=400, detail="Payout caps must be positive.")
+    await set_payout_cap("SINGLE", single_payout_cap)
+    await set_payout_cap("PARLAY", parlay_payout_cap)
+    asyncio.create_task(post_admin_action(
+        admin, "Payout caps updated",
+        {"single": str(single_payout_cap), "parlay": str(parlay_payout_cap)},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Payout caps updated."}
+
+
+@router.get("/admin/exchange-rates")
+async def admin_exchange_rates(admin: SessionUser = Depends(bearer_admin)):
+    deposit_rate = await get_global_rate("DEPOSIT")
+    withdraw_rate = await get_global_rate("WITHDRAW")
+    async with get_db() as db:
+        overrides = await list_overrides(db, _GUILD_ID())
+    return {
+        "global_deposit_rate": deposit_rate,
+        "global_withdraw_rate": withdraw_rate,
+        "overrides": [_override_dict(o) for o in overrides],
+    }
+
+
+@router.post("/admin/exchange-rates/global")
+async def admin_exchange_rates_global(
+    admin: SessionUser = Depends(bearer_admin),
+    deposit_rate: Annotated[float, Body()] = 1.0,
+    withdraw_rate: Annotated[float, Body()] = 1.0,
+):
+    if deposit_rate <= 0 or withdraw_rate <= 0:
+        raise HTTPException(status_code=400, detail="Rates must be positive.")
+    await set_global_rate("DEPOSIT", deposit_rate)
+    await set_global_rate("WITHDRAW", withdraw_rate)
+    asyncio.create_task(post_admin_action(
+        admin, "Global exchange rates updated",
+        {"deposit_rate": str(deposit_rate), "withdraw_rate": str(withdraw_rate)},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Global rates updated."}
+
+
+@router.post("/admin/exchange-rates")
+async def admin_exchange_rates_set(
+    admin: SessionUser = Depends(bearer_admin),
+    scope: Annotated[str, Body()] = "USER",
+    target_id: Annotated[str, Body()] = "",
+    direction: Annotated[str, Body()] = "DEPOSIT",
+    rate: Annotated[float, Body()] = 1.0,
+):
+    if scope not in ("ROLE", "USER") or direction not in ("DEPOSIT", "WITHDRAW"):
+        raise HTTPException(status_code=400, detail="Invalid scope or direction.")
+    if rate <= 0:
+        raise HTTPException(status_code=400, detail="Rate must be positive.")
+    try:
+        tid = int(target_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Target ID must be a number.")
+    async with get_db() as db:
+        await set_override(db, _GUILD_ID(), scope, tid, direction, rate)
+        await db.commit()
+    asyncio.create_task(post_admin_action(
+        admin, "Exchange rate override set",
+        {"scope": scope, "target_id": str(tid), "direction": direction, "rate": str(rate)},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Rate override saved."}
+
+
+@router.delete("/admin/exchange-rates/{override_id}")
+async def admin_exchange_rates_delete(override_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        row = await db.get(ExchangeRateOverride, override_id)
+        if row:
+            await db.delete(row)
+            await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Exchange rate override removed", {"id": str(override_id)}, source="Discord Activity"))
+    return {"ok": True, "message": "Override removed."}
+
+
+@router.get("/admin/public-blocks")
+async def admin_public_blocks(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        blocks = await list_public_blocks(db, _GUILD_ID())
+    return {"blocks": [_block_dict(b) for b in blocks]}
+
+
+@router.post("/admin/public-blocks")
+async def admin_public_blocks_set(
+    admin: SessionUser = Depends(bearer_admin),
+    scope: Annotated[str, Body()] = "USER",
+    target_id: Annotated[str, Body()] = "",
+):
+    if scope not in ("ROLE", "USER"):
+        raise HTTPException(status_code=400, detail="Invalid scope.")
+    try:
+        tid = int(target_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Target ID must be a number.")
+    async with get_db() as db:
+        await set_public_block(db, _GUILD_ID(), scope, tid, True)
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Public-parlay block added", {"scope": scope, "target_id": str(tid)}, source="Discord Activity"))
+    return {"ok": True, "message": "Block added."}
+
+
+@router.delete("/admin/public-blocks/{block_id}")
+async def admin_public_blocks_delete(block_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        row = await db.get(PublicBetRestriction, block_id)
+        if row:
+            await db.delete(row)
+            await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Public-parlay block removed", {"id": str(block_id)}, source="Discord Activity"))
+    return {"ok": True, "message": "Block removed."}
 
 
 @router.get("/admin/users")
 async def admin_users(admin: SessionUser = Depends(bearer_admin)):
     async with get_db() as db:
-        users = (await db.execute(select(User).order_by(User.chips.desc()))).scalars().all()
+        users = (await db.execute(
+            select(User).where(User.guild_id == _GUILD_ID()).order_by(User.chips.desc())
+        )).scalars().all()
     return {"users": [_user_dict(u) for u in users]}
+
+
+@router.get("/admin/economy")
+async def admin_economy(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        economy = await economy_totals(db, _GUILD_ID())
+    return economy
+
+
+@router.get("/admin/game/status")
+async def admin_game_status(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        active_raw = (await db.execute(
+            text("SELECT value FROM game_settings WHERE key='game_active'")
+        )).fetchone()
+        game_active = bool(active_raw) and json.loads(active_raw[0])
+        phase_name = await _phase_name(db)
+    return {"game_active": game_active, "phase_name": phase_name}
+
+
+@router.post("/admin/game/start")
+async def admin_game_start(admin: SessionUser = Depends(bearer_admin)):
+    # _start_game() lives in the bot cog and is shared verbatim with the
+    # /game start Discord command so the two never drift. It reaches the DB
+    # through bot.database.engine (get_setting/set_setting/get_session), which
+    # resolves the guild from its own contextvar rather than web/database.py's
+    # — bind that here, scoped to this request's task, before calling in.
+    from bot.cogs.admin import _start_game
+    from bot.database.engine import set_guild_context
+
+    set_guild_context(get_request_guild())
+    result = await _start_game()
+    if result.get("error") == "already_active":
+        raise HTTPException(
+            status_code=400,
+            detail="The Games are already running. End them first before starting a new one.",
+        )
+
+    message = f"Opened {result['opened']} market(s)"
+    if result["phase_name"]:
+        message += f" ({result['phase_name']} phase)"
+    message += ". May the odds be ever in your favor."
+    if result["auto_parlays"]:
+        message += f" {result['auto_parlays']} auto-parlay(s) posted to the tailing board."
+
+    asyncio.create_task(post_admin_action(
+        admin, "Game started",
+        {"phase": result["phase_name"] or "—", "markets opened": str(result["opened"])},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": message, **result}
 
 
 @router.post("/admin/market/{market_id}/open")
@@ -831,6 +1607,7 @@ async def admin_market_open(market_id: int, admin: SessionUser = Depends(bearer_
             raise HTTPException(status_code=404, detail="Market not found.")
         m.status = "OPEN"
         await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Market opened", {"market": m.label}, source="Discord Activity"))
     return {"ok": True, "message": "Market opened."}
 
 
@@ -842,6 +1619,7 @@ async def admin_market_close(market_id: int, admin: SessionUser = Depends(bearer
             raise HTTPException(status_code=404, detail="Market not found.")
         m.status = "CLOSED"
         await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Market closed", {"market": m.label}, source="Discord Activity"))
     return {"ok": True, "message": "Market closed."}
 
 
@@ -869,12 +1647,12 @@ async def admin_market_resolve(
         for bet in bets:
             if bool_result is None:
                 bet.status = "VOIDED"
-                db_user = await db.get(User, bet.user_id)
+                db_user = await _fetch_user(db, bet.user_id)
                 if db_user:
                     db_user.chips += bet.wager
             elif bool_result and bet.parlay_id is None:
                 bet.status = "WON"
-                db_user = await db.get(User, bet.user_id)
+                db_user = await _fetch_user(db, bet.user_id)
                 if db_user:
                     db_user.chips += bet.payout_if_win
                     db_user.total_won += bet.payout_if_win
@@ -888,6 +1666,7 @@ async def admin_market_resolve(
         settled = len(bets)
 
     label = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
+    asyncio.create_task(post_admin_action(admin, "Market resolved", {"market": m.label, "result": label, "bets settled": str(settled)}, source="Discord Activity"))
     return {"ok": True, "message": f"Market resolved as {label}. {settled} bets settled."}
 
 
@@ -904,12 +1683,13 @@ async def admin_chips_give(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid Discord ID.")
     async with get_db() as db:
-        db_user = await db.get(User, uid)
+        db_user = await _fetch_user(db, uid)
         if not db_user:
             raise HTTPException(status_code=404, detail="User not found in database.")
         db_user.chips += amount
         await db.commit()
         name = db_user.username
+    asyncio.create_task(post_admin_action(admin, "Chips given", {"user": name, "amount": f"{amount:,}"}, source="Discord Activity"))
     return {"ok": True, "message": f"Gave {amount:,} chips to {name}."}
 
 
@@ -926,12 +1706,13 @@ async def admin_chips_take(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid Discord ID.")
     async with get_db() as db:
-        db_user = await db.get(User, uid)
+        db_user = await _fetch_user(db, uid)
         if not db_user:
             raise HTTPException(status_code=404, detail="User not found.")
         db_user.chips = max(0, db_user.chips - amount)
         await db.commit()
         name = db_user.username
+    asyncio.create_task(post_admin_action(admin, "Chips taken", {"user": name, "amount": f"{amount:,}"}, source="Discord Activity"))
     return {"ok": True, "message": f"Took {amount:,} chips from {name}."}
 
 
@@ -947,6 +1728,7 @@ async def admin_tribute_kill(
         t = await db.get(Tribute, tribute_id)
         if not t or t.status != "ALIVE":
             raise HTTPException(status_code=400, detail="Tribute not found or already dead.")
+        in_bloodbath = await _phase_name(db) == "Bloodbath"
         t.status = "DEAD"
         t.death_cause = death_cause
         t.placement = placement if placement > 0 else None
@@ -955,8 +1737,11 @@ async def admin_tribute_kill(
             t.killed_by_id = int(killed_by_id)
             if killer:
                 killer.kills = (killer.kills or 0) + 1
+                if in_bloodbath:
+                    killer.bloodbath_kills = (killer.bloodbath_kills or 0) + 1
         await db.commit()
         name = t.name
+    asyncio.create_task(post_admin_action(admin, "Tribute eliminated", {"tribute": name, "cause": death_cause}, source="Discord Activity"))
     return {"ok": True, "message": f"{name} has been eliminated."}
 
 
@@ -970,6 +1755,7 @@ async def admin_tribute_victor(tribute_id: int, admin: SessionUser = Depends(bea
         t.placement = 1
         await db.commit()
         name = t.name
+    asyncio.create_task(post_admin_action(admin, "Victor crowned", {"tribute": name}, source="Discord Activity"))
     return {"ok": True, "message": f"{name} crowned Victor!"}
 
 
@@ -979,16 +1765,20 @@ async def admin_tribute_unkill(tribute_id: int, admin: SessionUser = Depends(bea
         t = await db.get(Tribute, tribute_id)
         if not t or t.status == "ALIVE":
             raise HTTPException(status_code=400, detail="Tribute not found or already alive.")
+        in_bloodbath = await _phase_name(db) == "Bloodbath"
         if t.killed_by_id:
             killer = await db.get(Tribute, t.killed_by_id)
             if killer:
                 killer.kills = max(0, (killer.kills or 1) - 1)
+                if in_bloodbath and (killer.bloodbath_kills or 0) > 0:
+                    killer.bloodbath_kills -= 1
         t.status = "ALIVE"
         t.death_cause = None
         t.placement = None
         t.killed_by_id = None
         await db.commit()
         name = t.name
+    asyncio.create_task(post_admin_action(admin, "Tribute revived", {"tribute": name}, source="Discord Activity"))
     return {"ok": True, "message": f"{name} revived."}
 
 
@@ -1001,6 +1791,7 @@ async def admin_market_reopen(market_id: int, admin: SessionUser = Depends(beare
         m.status = "CLOSED"
         m.result = None
         await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Market reopened", {"market": m.label}, source="Discord Activity"))
     return {"ok": True, "message": "Market reopened as Closed."}
 
 
@@ -1017,6 +1808,7 @@ async def admin_market_set_odds(
         m.odds = odds
         m.odds_override = True
         await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Market odds set", {"market": m.label, "odds": f"{odds:+d}"}, source="Discord Activity"))
     return {"ok": True, "message": f"Odds set to {odds:+d}."}
 
 
@@ -1030,6 +1822,7 @@ async def admin_market_clear_override(market_id: int, admin: SessionUser = Depen
         m.odds_override = False
         await _recalculate_markets(db)
         await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Market override cleared", {"market": m.label}, source="Discord Activity"))
     return {"ok": True, "message": "Override cleared and odds recalculated."}
 
 
@@ -1039,6 +1832,7 @@ async def admin_markets_recalc(admin: SessionUser = Depends(bearer_admin)):
     async with get_db() as db:
         await _recalculate_markets(db)
         await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Odds recalculated", source="Discord Activity"))
     return {"ok": True, "message": "Odds recalculated."}
 
 
@@ -1050,6 +1844,7 @@ async def admin_markets_bulk_close(admin: SessionUser = Depends(bearer_admin)):
             m.status = "CLOSED"
         await db.commit()
         count = len(markets)
+    asyncio.create_task(post_admin_action(admin, "Bulk market close", {"markets closed": str(count)}, source="Discord Activity"))
     return {"ok": True, "message": f"Closed {count} open markets."}
 
 
@@ -1061,11 +1856,14 @@ async def admin_chips_give_all(
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive.")
     async with get_db() as db:
-        users = (await db.execute(select(User))).scalars().all()
+        users = (await db.execute(
+            select(User).where(User.guild_id == _GUILD_ID())
+        )).scalars().all()
         for u in users:
             u.chips += amount
         await db.commit()
         count = len(users)
+    asyncio.create_task(post_admin_action(admin, "Chips given to all", {"amount": f"{amount:,}", "players": str(count)}, source="Discord Activity"))
     return {"ok": True, "message": f"Gave {amount:,} chips to {count} players."}
 
 
@@ -1082,10 +1880,11 @@ async def admin_chips_set(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid Discord ID.")
     async with get_db() as db:
-        db_user = await db.get(User, uid)
+        db_user = await _fetch_user(db, uid)
         if not db_user:
             raise HTTPException(status_code=404, detail="User not found.")
         db_user.chips = amount
         await db.commit()
         name = db_user.username
+    asyncio.create_task(post_admin_action(admin, "Chips set", {"user": name, "amount": f"{amount:,}"}, source="Discord Activity"))
     return {"ok": True, "message": f"Set {name} balance to {amount:,}."}

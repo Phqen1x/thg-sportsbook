@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -14,6 +16,8 @@ from web import config
 from web.csrf import make_csrf, verify_csrf
 from web.routes import activity, auth, public, member, admin
 from web.session import COOKIE
+
+log = logging.getLogger(__name__)
 
 HERE = Path(__file__).parent
 ACTIVITY_DIR = HERE / "activity"
@@ -69,6 +73,10 @@ async def _lifespan(app: FastAPI):
             "WEB_SECRET_KEY is set to the insecure default. "
             "Set a strong random value in your .env before running in production."
         )
+    from bot.database.engine import init_db
+    from web.database import available_guilds
+    for gid in available_guilds():
+        await init_db(gid)
     yield
 
 
@@ -78,6 +86,17 @@ def fmt_odds(n: int) -> str:
 
 def fmt_chips(n: int) -> str:
     return f"{n:,}"
+
+
+# Market types where tribute_a/tribute_b are combined into one joint outcome
+# (e.g. their scores summed) rather than pitted head-to-head — these read as
+# "Tribute A and Tribute B", not "Tribute A vs Tribute B". Keep in sync with
+# the identical set in web/activity/static/app.js.
+COMBINED_PAIR_MARKET_TYPES = {"COMBINED_DISTRICT_SCORE"}
+
+
+def pair_word(market_type: str) -> str:
+    return "and" if market_type in COMBINED_PAIR_MARKET_TYPES else "vs"
 
 
 def _render_activity_index(in_discord: bool) -> HTMLResponse:
@@ -110,11 +129,14 @@ def create_app() -> FastAPI:
     templates.env.globals["abs"] = abs
     templates.env.globals["static_v"] = _WEB_VERSION
     templates.env.globals["csrf_token"] = lambda req: make_csrf(req.cookies.get(COOKIE, ""))
+    templates.env.globals["pair_word"] = pair_word
 
     app.state.templates = templates
 
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
     app.mount("/activity/static", StaticFiles(directory=str(ACTIVITY_DIR / "static")), name="activity-static")
+    config.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/uploads", StaticFiles(directory=str(config.UPLOADS_DIR)), name="uploads")
 
     app.include_router(activity.router)
     app.include_router(auth.router)
@@ -155,6 +177,13 @@ def create_app() -> FastAPI:
         if "Content-Security-Policy" not in response.headers:
             response.headers["Content-Security-Policy"] = _DASHBOARD_CSP
             response.headers["X-Frame-Options"] = "DENY"
+        # The Activity iframe is loaded through Discord's /.proxy edge, which will
+        # cache GET responses that don't say otherwise — the same proxy layer
+        # _VERSION above works around for static JS/CSS. Without this, admin edits
+        # (tribute renames, odds, etc.) can appear to "not save" in the Activity
+        # even after reloading, because the proxy keeps serving the old JSON.
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.get("/activity", response_class=HTMLResponse)
@@ -164,10 +193,20 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(401)
     async def auth_redirect(request: Request, exc: HTTPException):
-        # API clients (the Activity) expect JSON; browsers get the login redirect.
+        # API clients (the Activity) expect JSON; browsers get an explicit
+        # "must log in" page rather than being silently bounced into Discord's
+        # OAuth flow, so it's clear *why* they can't see the page's content.
         if request.url.path.startswith("/api/"):
             return JSONResponse({"detail": exc.detail or "Authentication required"}, status_code=401)
-        return RedirectResponse(f"/auth/login")
+        return templates.TemplateResponse(
+            "error.html",
+            {
+                "request": request, "user": None, "code": 401,
+                "message": exc.detail or "You must be logged in to view this page.",
+                "cta_url": "/auth/login", "cta_label": "Log In with Discord",
+            },
+            status_code=401,
+        )
 
     @app.exception_handler(403)
     async def forbidden(request: Request, exc: HTTPException):
@@ -187,6 +226,21 @@ def create_app() -> FastAPI:
             "error.html",
             {"request": request, "user": None, "code": 404, "message": "Page not found."},
             status_code=404,
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception(request: Request, exc: Exception):
+        log.error(
+            "Unhandled exception on %s %s\n%s",
+            request.method, request.url.path,
+            traceback.format_exc(),
+        )
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"detail": "Internal server error"}, status_code=500)
+        return templates.TemplateResponse(
+            "error.html",
+            {"request": request, "user": None, "code": 500, "message": "An unexpected error occurred. Please try again."},
+            status_code=500,
         )
 
     return app

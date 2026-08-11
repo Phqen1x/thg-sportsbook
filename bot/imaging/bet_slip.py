@@ -55,7 +55,7 @@ def _draw_header(draw: ImageDraw.ImageDraw, img: Image.Image, w: int, submitted:
 
     title_font = cinzel(24)
     sub_font = rajdhani(14)
-    draw_text_centered(draw, "CAPITOL SPORTSBOOK", title_font, c["header_gold"], w // 2, 20)
+    draw_text_centered(draw, "PANEM SPORTSBOOK", title_font, c["header_gold"], w // 2, 20)
     draw_text_centered(draw, "PARLAY BET SLIP", sub_font, c["text_dim"], w // 2, 58)
 
 
@@ -290,7 +290,7 @@ def render_straight_result_slip(
     draw.rectangle((4, HEADER_H - 4, WIDTH - 4, HEADER_H), fill=c["header_dark"])
     draw.rectangle((4, HEADER_H, WIDTH - 4, HEADER_H + 3), fill=c["card_border"])
     paste_logo(img, PAD, (HEADER_H - 56) // 2, 56)
-    draw_text_centered(draw, "CAPITOL SPORTSBOOK", cinzel(24), c["header_gold"], WIDTH // 2, 20)
+    draw_text_centered(draw, "PANEM SPORTSBOOK", cinzel(24), c["header_gold"], WIDTH // 2, 20)
     draw_text_centered(draw, "STRAIGHT BET RESULT", rajdhani(14), c["text_dim"], WIDTH // 2, 58)
 
     cur_y = HEADER_H + 16
@@ -367,7 +367,7 @@ def render_parlay_result_slip(
     draw.rectangle((4, HEADER_H - 4, WIDTH - 4, HEADER_H), fill=c["header_dark"])
     draw.rectangle((4, HEADER_H, WIDTH - 4, HEADER_H + 3), fill=c["card_border"])
     paste_logo(img, PAD, (HEADER_H - 56) // 2, 56)
-    draw_text_centered(draw, "CAPITOL SPORTSBOOK", cinzel(24), c["header_gold"], WIDTH // 2, 20)
+    draw_text_centered(draw, "PANEM SPORTSBOOK", cinzel(24), c["header_gold"], WIDTH // 2, 20)
     draw_text_centered(draw, "PARLAY BET RESULT", rajdhani(14), c["text_dim"], WIDTH // 2, 58)
 
     rc = _result_color(status, c)

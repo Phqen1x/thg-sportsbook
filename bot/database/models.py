@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, ForeignKey,
-    Integer, String, func
+    Integer, JSON, PrimaryKeyConstraint, String, UniqueConstraint, func
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -62,6 +62,10 @@ class Tribute(Base):
     # highest_placement = best finish across all prior games (2–24; lower is better).
     times_played: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     highest_placement: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Kills scored specifically while the Bloodbath phase was active (subset of
+    # `kills`), used to resolve BLOODBATH_KILLS_OU / ANY_BB_DOUBLE_KILL correctly
+    # regardless of when the admin actually triggers the Bloodbath→Arena transition.
+    bloodbath_kills: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     @property
@@ -109,34 +113,45 @@ class Market(Base):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (PrimaryKeyConstraint("guild_id", "discord_id"),)
 
-    discord_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    discord_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     username: Mapped[str] = mapped_column(String(100), nullable=False)
     chips: Mapped[int] = mapped_column(Integer, default=1000, nullable=False)
     total_wagered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_won: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    bets: Mapped[list["Bet"]] = relationship("Bet", back_populates="user")
-    parlays: Mapped[list["Parlay"]] = relationship("Parlay", back_populates="user")
-    pending_legs: Mapped[list["PendingParlayLeg"]] = relationship("PendingParlayLeg", back_populates="user")
-
 
 class Parlay(Base):
     __tablename__ = "parlays"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.discord_id"), nullable=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Optional member-supplied title, shown on the tail board in place of the
+    # default "{username}'s Parlay #{id}" when set.
+    name: Mapped[str | None] = mapped_column(String(80), nullable=True)
     total_wager: Mapped[int] = mapped_column(Integer, nullable=False)
     total_payout: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(10), default="PENDING", nullable=False)
     cashout_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Per-parlay cashout override, same pattern as Market.cashout_allowed/rate —
+    # NULL defers to the global cashout_allowed/cashout_rate GameSetting.
+    cashout_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    cashout_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     # When True the parlay is listed on the public tailing board so other members
     # can copy it. Members can opt out at submit time; tailed copies default off.
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Set when this parlay was created via the tail board's "Tail & Bet" flow off
+    # another member's public parlay — lets us DM the original poster on resolve.
+    tailed_from_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tailed_from_parlay_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("parlays.id"), nullable=True
+    )
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    user: Mapped["User"] = relationship("User", back_populates="parlays")
     legs: Mapped[list["Bet"]] = relationship("Bet", back_populates="parlay")
 
 
@@ -144,7 +159,8 @@ class Bet(Base):
     __tablename__ = "bets"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.discord_id"), nullable=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     parlay_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("parlays.id"), nullable=True)
     market_id: Mapped[int] = mapped_column(Integer, ForeignKey("markets.id"), nullable=False)
     wager: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -154,7 +170,6 @@ class Bet(Base):
     cashout_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    user: Mapped["User"] = relationship("User", back_populates="bets")
     parlay: Mapped["Parlay | None"] = relationship("Parlay", back_populates="legs")
     market: Mapped["Market"] = relationship("Market", back_populates="bets")
 
@@ -163,11 +178,11 @@ class PendingParlayLeg(Base):
     __tablename__ = "pending_parlay_legs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.discord_id"), nullable=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     market_id: Mapped[int] = mapped_column(Integer, ForeignKey("markets.id"), nullable=False)
     added_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    user: Mapped["User"] = relationship("User", back_populates="pending_legs")
     market: Mapped["Market"] = relationship("Market")
 
 
@@ -224,7 +239,37 @@ class MarketTemplate(Base):
     type_key: Mapped[str | None] = mapped_column(String(30), nullable=True, unique=True)
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Roster-style templates (e.g. "Fifth Career Alliance Member"): one Market row
+    # per eligible tribute instead of a single instance, priced from
+    # MULTI_OUTCOME_FACTORS instead of the standard win/kill/placement formulas.
+    multi_outcome: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # "whitelist" | "blacklist" — only meaningful when multi_outcome is True.
+    eligibility_mode: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # {factor_key: weight}; a missing key defaults to weight 1.0 at compute time.
+    weight_overrides: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    eligible_tributes: Mapped[list["MarketTemplateTribute"]] = relationship(
+        "MarketTemplateTribute", back_populates="template", cascade="all, delete-orphan"
+    )
+
+
+class MarketTemplateTribute(Base):
+    """Eligibility row for a multi_outcome MarketTemplate: this tribute is one of
+    the mutually-exclusive outcomes the template's markets can resolve to."""
+    __tablename__ = "market_template_tributes"
+    __table_args__ = (UniqueConstraint("template_id", "tribute_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    template_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("market_templates.id", ondelete="CASCADE"), nullable=False
+    )
+    tribute_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tributes.id", ondelete="CASCADE"), nullable=False
+    )
+
+    template: Mapped["MarketTemplate"] = relationship("MarketTemplate", back_populates="eligible_tributes")
+    tribute: Mapped["Tribute"] = relationship("Tribute")
 
 
 class GameSetting(Base):
@@ -232,6 +277,31 @@ class GameSetting(Base):
 
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[str] = mapped_column(String(500), nullable=False)
+
+
+class ChipRequest(Base):
+    """A /withdraw or /deposit request posted to the withdraw channel.
+
+    Tracked so the "Mark Done" button on the posted message can survive a bot
+    restart — the button's custom_id only carries this row's id, and the rest
+    of the message content is regenerated from these fields rather than
+    parsed back out of the message text.
+    """
+    __tablename__ = "chip_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)  # WITHDRAW | DEPOSIT
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Amount in the *other* currency, frozen at request time using the rate in
+    # effect then (chips for DEPOSIT, panars for WITHDRAW) — like Bet.odds_at_placement,
+    # this must not drift if an admin changes exchange rates before the request
+    # is marked done, and lets render_request_content rebuild the message later
+    # without recomputing anything.
+    converted_amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(10), default="PENDING", nullable=False)  # PENDING | DONE
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
 class DistrictRecord(Base):
@@ -306,9 +376,69 @@ class BettingRestriction(Base):
     __tablename__ = "betting_restrictions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     restriction_type: Mapped[str] = mapped_column(String(10), nullable=False)
     district: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tribute_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("tributes.id", ondelete="CASCADE"), nullable=True
     )
+
+
+class TributeLock(Base):
+    """A Discord user playing as an in-game Tribute, locked out of all
+    sportsbook interaction (bot commands, the Activity, and the website) to
+    prevent betting on themselves or their own outcome. Distinct from
+    Tribute.discord_user_id, which just links a roster character to a member
+    for flavor/odds purposes (e.g. seniority) and carries no access
+    restriction on its own."""
+    __tablename__ = "tribute_locks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tribute_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("tributes.id", ondelete="SET NULL"), nullable=True
+    )
+    locked_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ExchangeRateOverride(Base):
+    """Per-role or per-user override of the global chip<->Panar conversion rate.
+
+    ``direction`` is "DEPOSIT" (panars -> chips, used by /deposit) or "WITHDRAW"
+    (chips -> panars, used by /withdraw). ``rate`` is a multiplier applied to the
+    amount the member enters, e.g. a WITHDRAW rate of 1.1 means 1 chip pays out
+    1.1 Panars. Resolution order at use time: user override > highest-Discord-role
+    override (mirrors how Discord's own permission overwrites resolve conflicts)
+    > global GameSetting default ("deposit_rate" / "withdraw_rate", 1.0 if unset).
+    """
+    __tablename__ = "exchange_rate_overrides"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "scope", "target_id", "direction"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scope: Mapped[str] = mapped_column(String(5), nullable=False)  # ROLE | USER
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)  # role id or discord user id
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)  # DEPOSIT | WITHDRAW
+    rate: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class PublicBetRestriction(Base):
+    """Blocks a role or user from posting PUBLIC parlays (listed on the tail
+    board). Distinct from BettingRestriction: a blocked member can still bet
+    normally — a blocked public submission is silently downgraded to private
+    rather than rejected outright."""
+    __tablename__ = "public_bet_restrictions"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "scope", "target_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scope: Mapped[str] = mapped_column(String(5), nullable=False)  # ROLE | USER
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

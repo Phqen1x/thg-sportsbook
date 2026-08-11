@@ -133,7 +133,7 @@ def on_page(canvas, doc):
     canvas.rect(0, 0, LETTER[0], 28, fill=1, stroke=0)
     canvas.setFont("Helvetica", 8)
     canvas.setFillColor(MID_GRAY)
-    canvas.drawString(0.75 * inch, 10, "THE CAPITOL SPORTSBOOK  ·  ODDS GUIDE")
+    canvas.drawString(0.75 * inch, 10, "THE PANEM SPORTSBOOK  ·  ODDS GUIDE")
     canvas.drawRightString(LETTER[0] - 0.75 * inch, 10, f"Page {doc.page - 1}")
     canvas.restoreState()
 
@@ -144,7 +144,7 @@ def build_cover():
     story = []
 
     story.append(Spacer(1, 1.6 * inch))
-    story.append(Paragraph("THE CAPITOL SPORTSBOOK", COVER_TITLE))
+    story.append(Paragraph("THE PANEM SPORTSBOOK", COVER_TITLE))
     story.append(Spacer(1, 0.1 * inch))
     story.append(HRFlowable(width="60%", thickness=2, color=GOLD,
                              hAlign="CENTER", spaceAfter=14))
@@ -560,7 +560,7 @@ def build():
         rightMargin=0.75 * inch,
         topMargin=0.6 * inch,
         bottomMargin=0.6 * inch,
-        title="Capitol Sportsbook — Odds Guide",
+        title="Panem Sportsbook — Odds Guide",
         author="The Capitol",
     )
 

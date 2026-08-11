@@ -1,7 +1,7 @@
 name: thg-sportsbook
 base: core24
 version: "0.1.0"
-summary: THG Capitol Sportsbook Discord Bot
+summary: THG Panem Sportsbook Discord Bot
 description: |
   A Discord betting/sportsbook bot for The Hunger Games server simulations.
 
@@ -22,6 +22,7 @@ description: |
     WEB_PORT=443
 
   The database persists in $SNAP_COMMON/data/sportsbook.db across upgrades.
+  Uploaded face-claim images persist alongside it in $SNAP_COMMON/data/uploads.
 
 grade: stable
 confinement: strict
@@ -71,6 +72,5 @@ apps:
       - network-bind
 
 environment:
-  DB_PATH: $SNAP_COMMON/data/sportsbook.db
   FONTS_DIR: $SNAP/assets/fonts
   DOTENV_PATH: $SNAP_COMMON/.env

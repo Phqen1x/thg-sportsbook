@@ -71,9 +71,52 @@ def straight_payout(wager: int, odds: int) -> int:
     return max(wager, round(wager * american_to_decimal(odds)))
 
 
+def max_wager_for_cap(decimal_odds: float, cap: int) -> int:
+    """Largest integer wager whose payout at ``decimal_odds`` (see straight_payout
+    / parlay_payout — always max(wager, round(wager * decimal_odds))) stays within
+    ``cap``. Used to tell a member exactly how much they *could* wager when their
+    attempted amount would breach a payout cap, rather than just rejecting it."""
+    if cap <= 0 or decimal_odds <= 0:
+        return 0
+    wager = int(cap / decimal_odds)
+    while wager > 0 and round(wager * decimal_odds) > cap:
+        wager -= 1
+    return max(wager, 0)
+
+
 def cashout_value(original_wager: int, payout_if_win: int, rate: float) -> int:
     profit = payout_if_win - original_wager
     return max(1, round(original_wager + profit * rate))
+
+
+def resolve_cashout(
+    *,
+    wager: int,
+    payout_if_win: int,
+    global_allowed: bool,
+    global_rate: float,
+    item_allowed: bool | None = None,
+    item_rate: float | None = None,
+    type_allowed: bool | None = None,
+    type_rate: float | None = None,
+) -> tuple[bool, int]:
+    """Resolve cashout eligibility + amount via item -> type -> global precedence.
+
+    ``item_*`` is the most specific override (a single Market or Parlay row);
+    ``type_*`` is the market-type-level override (unused for parlays, which have
+    no type tier). Returns ``(allowed, amount)`` — amount is 0 when not allowed.
+    """
+    if item_allowed is not None:
+        allowed = item_allowed
+        rate = item_rate if item_rate is not None else global_rate
+    elif type_allowed is not None:
+        allowed = type_allowed
+        rate = type_rate if type_rate is not None else global_rate
+    else:
+        allowed = global_allowed
+        rate = global_rate
+    amount = cashout_value(wager, payout_if_win, rate) if allowed else 0
+    return allowed, amount
 
 
 def implied_probability(odds: int) -> float:

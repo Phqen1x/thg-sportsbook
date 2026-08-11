@@ -65,11 +65,14 @@ async def post_audit_log(
     interaction: discord.Interaction,
     target: discord.Member | discord.User | None = None,
 ) -> None:
-    from bot.database.engine import get_guild_setting
+    from bot.database.engine import get_guild_setting, current_guild_id, set_guild_context
 
     if not interaction.guild_id:
         return
-    raw = await get_guild_setting(interaction.guild_id, "log_channel_id")
+    # on_app_command_completion dispatches in a separate task, so the command's
+    # guild context did not propagate here — bind it from the interaction.
+    set_guild_context(interaction.guild_id)
+    raw = await get_guild_setting(current_guild_id(), "log_channel_id")
     if not raw:
         return
     channel = bot.get_channel(int(raw))
@@ -102,5 +105,132 @@ async def post_audit_log(
     )
     try:
         await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def _log_channel(bot: commands.Bot, guild_id: int) -> discord.TextChannel | None:
+    import json
+
+    from bot.database.engine import get_guild_setting
+
+    raw = await get_guild_setting(guild_id, "log_channel_id")
+    if not raw:
+        return None
+    # Values are JSON-encoded, and a cleared setting is stored as the string
+    # "null" — which is truthy, so `int(raw)` would blow up on it if we didn't
+    # decode through json.loads first.
+    channel_id = json.loads(raw)
+    if channel_id is None:
+        return None
+    channel = bot.get_channel(channel_id)
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def post_bet_log(
+    bot: commands.Bot,
+    member: discord.Member,
+    kind: str,
+    markets: list[str],
+    wager: int,
+    payout: int,
+    is_tail: bool = False,
+) -> None:
+    """Logs a member-placed straight bet or parlay submission — every one,
+    regardless of entry point (slash command, web dashboard, Discord Activity,
+    or tailing another parlay)."""
+    from bot.utils.action_views import build_request_view
+    from bot.utils.formatters import fmt_chips
+
+    guild_id = member.guild.id
+    channel = await _log_channel(bot, guild_id)
+    if channel is None:
+        return
+
+    title = "Parlay Submitted" if kind == "PARLAY" else "Bet Placed"
+    if is_tail:
+        title += " (Tail)"
+    embed = discord.Embed(title=title, color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Member", value=f"{member.mention} (`{member.id}`)", inline=False)
+    embed.add_field(
+        name="Market" if len(markets) == 1 else "Markets",
+        value="\n".join(markets)[:1024] or "—",
+        inline=False,
+    )
+    embed.add_field(name="Wager", value=fmt_chips(wager), inline=True)
+    embed.add_field(name="Potential Payout", value=fmt_chips(payout), inline=True)
+    embed.set_footer(text=f"{member.display_name} • {member.id}")
+
+    # A blocked member can never reach this call (placement is rejected first),
+    # so the button always starts in the "Block" state.
+    view = build_request_view(None, guild_id, member.id, blocked=False)
+    try:
+        await channel.send(embed=embed, view=view)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def post_win_log(
+    bot: commands.Bot,
+    guild_id: int,
+    user_id: int,
+    kind: str,
+    markets: list[str],
+    wager: int,
+    payout: int,
+) -> None:
+    """Logs a resolved WON bet/parlay and, if the payout clears the
+    configurable big-win threshold, pings the guild's admin role."""
+    import json
+
+    from bot.database.engine import get_guild_setting, get_read_session
+    from bot.utils.formatters import fmt_chips
+    from bot.utils.restrictions import is_fully_restricted
+
+    channel = await _log_channel(bot, guild_id)
+    if channel is None:
+        return
+
+    async with get_read_session() as session:
+        blocked = await is_fully_restricted(session, guild_id, user_id)
+
+    user = bot.get_user(user_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(user_id)
+        except discord.HTTPException:
+            user = None
+
+    title = "Parlay Won" if kind == "PARLAY" else "Bet Won"
+    embed = discord.Embed(title=title, color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+    if user is not None:
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(name="Member", value=f"{user.mention} (`{user_id}`)", inline=False)
+        embed.set_footer(text=f"{user.display_name} • {user_id}")
+    else:
+        embed.add_field(name="Member", value=f"<@{user_id}> (`{user_id}`)", inline=False)
+    embed.add_field(
+        name="Market" if len(markets) == 1 else "Markets",
+        value="\n".join(markets)[:1024] or "—",
+        inline=False,
+    )
+    embed.add_field(name="Wager", value=fmt_chips(wager), inline=True)
+    embed.add_field(name="Payout", value=fmt_chips(payout), inline=True)
+
+    from bot.utils.action_views import build_request_view
+    view = build_request_view(None, guild_id, user_id, blocked)
+
+    content = None
+    threshold_raw = await get_guild_setting(guild_id, "big_win_threshold")
+    threshold = json.loads(threshold_raw) if threshold_raw else 500_000
+    if payout >= threshold:
+        role_raw = await get_guild_setting(guild_id, "admin_role_id")
+        if role_raw:
+            role_id = json.loads(role_raw)
+            content = f"<@&{role_id}> — big win alert!"
+
+    try:
+        await channel.send(content=content, embed=embed, view=view)
     except (discord.Forbidden, discord.HTTPException):
         pass

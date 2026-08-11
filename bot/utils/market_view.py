@@ -38,6 +38,10 @@ _TYPE_ORDER: dict[str, int] = {
     "EXACT_TRAINING_SCORE":      22,
     "COMBINED_DISTRICT_SCORE":   23,
     "TRAINING_SCORE_OU":         24,
+    "PARTNER_SCORE_HIGHER":      24,
+    "PARTNER_SCORE_LOWER":       24,
+    "PARTNER_PLACE_HIGHER":      24,
+    "PARTNER_PLACE_LOWER":       24,
     # Game-level props
     "BLOODBATH_KILLS_OU":        30,
     "BLOODBATH_DEATHS_OU":       30,
@@ -69,8 +73,6 @@ _TYPE_ORDER: dict[str, int] = {
     # Alliance markets
     "ALLIANCE_VICTOR":           54,
     "ALLIANCE_KILLS_OU":         55,
-    "ALLIANCE_ALL_BLOODBATH":    56,
-    "ALLIANCE_WIPED_BLOODBATH":  56,
     "ALLIANCE_ALL_FINAL_8":      57,
     "ALLIANCE_ONE_FINAL_8":      57,
     "ALLIANCE_ALL_FINAL_5":      57,
@@ -107,6 +109,10 @@ _TYPE_LABELS: dict[str, str] = {
     "EXACT_TRAINING_SCORE":      "Exact Training Score",
     "COMBINED_DISTRICT_SCORE":   "Combined District Score",
     "TRAINING_SCORE_OU":         "Training Score Over/Under",
+    "PARTNER_SCORE_HIGHER":      "Partner Score Higher",
+    "PARTNER_SCORE_LOWER":       "Partner Score Lower",
+    "PARTNER_PLACE_HIGHER":      "Partner Place Higher",
+    "PARTNER_PLACE_LOWER":       "Partner Place Lower",
     # Game-level props
     "BLOODBATH_KILLS_OU":        "Bloodbath Kills Over/Under",
     "BLOODBATH_DEATHS_OU":       "Bloodbath Deaths Over/Under",
@@ -124,7 +130,7 @@ _TYPE_LABELS: dict[str, str] = {
     "GAMES_BETRAYAL":            "Games Features a Betrayal",
     "DISTRICT_PARTNER_KILL":     "District Partner Kill",
     # District markets
-    "DISTRICT_VICTOR":           "District Victor",
+    "DISTRICT_VICTOR":           "District Futures",
     "DISTRICT_KILLS_OU":         "District Kills Over/Under",
     "DISTRICT_BOTH_BLOODBATH":   "District Both Bloodbath",
     "DISTRICT_WIPED_BLOODBATH":  "District Wiped in Bloodbath",
@@ -138,8 +144,6 @@ _TYPE_LABELS: dict[str, str] = {
     # Alliance markets
     "ALLIANCE_VICTOR":           "Alliance Victor",
     "ALLIANCE_KILLS_OU":         "Alliance Kills Over/Under",
-    "ALLIANCE_ALL_BLOODBATH":    "Alliance All Bloodbath",
-    "ALLIANCE_WIPED_BLOODBATH":  "Alliance Wiped in Bloodbath",
     "ALLIANCE_ALL_FINAL_8":      "Alliance All Make Final 8",
     "ALLIANCE_ONE_FINAL_8":      "Alliance One Makes Final 8",
     "ALLIANCE_ALL_FINAL_5":      "Alliance All Make Final 5",

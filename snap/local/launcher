@@ -8,5 +8,10 @@ if [ ! -f "$SNAP_COMMON/.env" ]; then
     exit 1
 fi
 
+# Anchor the (writable) data directory. The bot is fully multi-guild and names
+# its own per-server files sportsbook_<guild_id>.db here; the filename below is
+# only used to locate the directory.
+export DB_PATH="${DB_PATH:-$SNAP_COMMON/data/sportsbook.db}"
+
 cd "$SNAP_COMMON"
 exec "$SNAP/bin/thg-sportsbook"

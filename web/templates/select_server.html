@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Select Server — Panem Sportsbook{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Select Server</h1>
+  <p class="text-dim">You have access to multiple servers. Choose which one to view.</p>
+</div>
+
+<div class="tail-grid" style="max-width:480px">
+  {% for guild in guilds %}
+  <form method="post" action="/select-server">
+    <input type="hidden" name="guild_id" value="{{ guild.id }}">
+    <button type="submit" class="card tail-card btn-full" style="text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);padding:1rem 1.25rem;">
+      <div class="tail-title">{{ guild.name }}</div>
+      <div class="text-dim" style="font-size:0.8rem">ID: {{ guild.id }}</div>
+    </button>
+  </form>
+  {% endfor %}
+</div>
+{% endblock %}

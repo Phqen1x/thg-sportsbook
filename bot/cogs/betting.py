@@ -9,28 +9,76 @@ from discord.ext import commands
 from sqlalchemy import select
 
 from bot import config
-from bot.database.engine import get_session, get_setting
+from bot.database.engine import get_session, get_setting, current_guild_id
 from bot.database.models import (
-    Bet, BettingRestriction, Market, Parlay, ParlayTemplate, ParlayTemplateLeg,
-    PendingParlayLeg, Tribute, User,
+    Alliance, Bet, BettingRestriction, ChipRequest, Market, MarketTemplate, Parlay,
+    ParlayTemplate, ParlayTemplateLeg, PendingParlayLeg, Tribute, User,
 )
 from bot.imaging.bet_slip import ParlayLegData, render_parlay_slip
 from bot.imaging.my_bets import (
-    BetRowData, ParlayData, render_my_bets, render_tail_board, render_tail_detail
+    BetRowData, ParlayData, render_my_bets, render_tail_board, render_tail_detail,
+    TAIL_BOARD_PER_PAGE,
 )
 from bot.imaging.base import render_async, buf_to_discord_file
 from bot.odds.calculator import (
-    straight_payout, parlay_payout, combined_american, cashout_value
+    straight_payout, parlay_payout, combined_american, resolve_cashout,
+    american_to_decimal, max_wager_for_cap,
 )
+from bot.utils.action_views import build_request_view, render_request_content
+from bot.utils.exchange_rates import effective_rate
+from bot.utils.audit import post_bet_log
+from bot.utils.payout_caps import get_payout_cap
+from bot.utils.restrictions import is_fully_restricted, is_public_bet_blocked
 from bot.utils.formatters import fmt_chips, fmt_odds, fmt_odds_with_mult, safe_defer
+from bot.utils.market_view import _TYPE_LABELS, _TYPE_ORDER, _type_section
 
 log = logging.getLogger("capitol.betting")
 
 MAX_PARLAY_LEGS = 10
-PARLAY_PAYOUT_CAP = 10_000_000
 
 # Minimum chips a member may withdraw or deposit in a single panars exchange.
 EXCHANGE_MIN = 5000
+
+BETTING_PAUSED_MSG = (
+    "🛑 Betting is currently paused by an admin. Try again once it's resumed."
+)
+
+BETTING_BLOCKED_MSG = (
+    "🚫 Your betting privileges have been temporarily suspended by a Gamemaker."
+)
+
+
+async def _betting_paused() -> bool:
+    raw = await get_setting("betting_paused")
+    return json.loads(raw) if raw else False
+
+
+async def _single_cap_error(amount: int, odds: int) -> str | None:
+    """None if a straight bet of ``amount`` at ``odds`` stays within the single-bet
+    payout cap; otherwise a message naming the largest wager that would still
+    qualify, so the member knows exactly what they can do instead of just being
+    told no."""
+    cap = await get_payout_cap("SINGLE")
+    if straight_payout(amount, odds) <= cap:
+        return None
+    max_wager = max_wager_for_cap(american_to_decimal(odds), cap)
+    return (
+        f"You can't wager more than **{fmt_chips(max_wager)}** on this bet — "
+        f"you can't win more than **{fmt_chips(cap)}**."
+    )
+
+
+async def _parlay_cap_error(wager: int, legs_odds: list[int]) -> str | None:
+    """Same as _single_cap_error but for a parlay's combined odds."""
+    cap = await get_payout_cap("PARLAY")
+    if parlay_payout(wager, legs_odds) <= cap:
+        return None
+    max_wager = max_wager_for_cap(american_to_decimal(combined_american(legs_odds)), cap)
+    return (
+        f"You can't wager more than **{fmt_chips(max_wager)}** on this parlay — "
+        f"you can't win more than **{fmt_chips(cap)}**."
+    )
+
 
 _MAKES_MILESTONES = {"MAKES_FINAL_8", "MAKES_FINAL_5"}
 _ALL_MILESTONES = {
@@ -70,8 +118,6 @@ _DISTRICT_MARKET_TYPES = {
 _ALLIANCE_MARKET_TYPES = {
     "ALLIANCE_VICTOR",
     "ALLIANCE_KILLS_OU",
-    "ALLIANCE_ALL_BLOODBATH",
-    "ALLIANCE_WIPED_BLOODBATH",
     "ALLIANCE_ALL_FINAL_8",
     "ALLIANCE_ONE_FINAL_8",
     "ALLIANCE_ALL_FINAL_5",
@@ -259,6 +305,7 @@ def _alliance_milestone_conflict(existing_markets: list[Market], new_mkt: Market
 # come true. We rank the stages a tribute can reach; a market that GUARANTEES the
 # tribute reaches some stage conflicts with one that GUARANTEES it is eliminated
 # before that same stage.
+_SURVIVAL_BLOODBATH = 0
 _SURVIVAL_FINAL_8 = 1
 _SURVIVAL_FINAL_5 = 2
 _SURVIVAL_FINALE = 3
@@ -286,6 +333,7 @@ def _survival_reaches(m: Market) -> int | None:
     return {
         "MAKES_FINAL_5": _SURVIVAL_FINAL_5,
         "MAKES_FINAL_8": _SURVIVAL_FINAL_8,
+        "BLOODBATH_SURVIVOR": _SURVIVAL_BLOODBATH,
     }.get(m.type)
 
 
@@ -296,6 +344,7 @@ def _survival_eliminated_before(m: Market) -> int | None:
     return {
         "MISSES_FINAL_5": _SURVIVAL_FINAL_5,
         "MISSES_FINAL_8": _SURVIVAL_FINAL_8,
+        "TRIBUTE_KILLED_BLOODBATH": _SURVIVAL_BLOODBATH,
     }.get(m.type)
 
 
@@ -383,8 +432,9 @@ def _training_score_conflict(existing_markets: list[Market], new_mkt: Market) ->
 
     A tribute has a single training score, so on the SAME tribute we reject two
     exact-score bets, an exact-score bet the over/under leg would contradict, and
-    any over+under pair. Across DIFFERENT tributes we reject two exact-score bets
-    on the same score value (only one tribute can land that exact number)."""
+    any over+under pair. Different tributes CAN land the exact same training
+    score, so two exact-score bets naming the same value for different tributes
+    are allowed to coexist."""
     if new_mkt.type not in _TRAINING_TYPES:
         return None
     for m in existing_markets:
@@ -422,17 +472,104 @@ def _training_score_conflict(existing_markets: list[Market], new_mkt: Market) ->
                     "You can't parlay an over and an under training-score bet on "
                     "the same tribute."
                 )
-        elif (
-            m.type == _TRAINING_EXACT
-            and new_mkt.type == _TRAINING_EXACT
-            and m.placement_num is not None
-            and m.placement_num == new_mkt.placement_num
-        ):
+    return None
+
+
+_DISTRICT_SCORE_TYPE = "COMBINED_DISTRICT_SCORE"
+
+
+def _district_score_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Block two different exact combined-score guesses for the same district.
+
+    A district's combined training score is one single number, so two markets
+    naming different totals for the same tribute pair can never both win. The pair
+    is compared as an unordered set since a/b ordering in the DB doesn't matter
+    (see COMBINED_DISTRICT_SCORE market creation in admin.py)."""
+    if new_mkt.type != _DISTRICT_SCORE_TYPE:
+        return None
+    if new_mkt.tribute_a_id is None or new_mkt.tribute_b_id is None:
+        return None
+    new_pair = frozenset((new_mkt.tribute_a_id, new_mkt.tribute_b_id))
+    for m in existing_markets:
+        if m.type != _DISTRICT_SCORE_TYPE:
+            continue
+        if m.tribute_a_id is None or m.tribute_b_id is None:
+            continue
+        if frozenset((m.tribute_a_id, m.tribute_b_id)) != new_pair:
+            continue
+        if m.placement_num != new_mkt.placement_num:
             return (
-                f"You can't parlay two bets on tributes scoring exactly "
-                f"{new_mkt.placement_num} in training — pick a different score for one of them."
+                "You can't parlay two different district combined-score guesses "
+                "for the same district — only one exact total can be correct."
             )
     return None
+
+
+# The guessed_sum range for COMBINED_DISTRICT_SCORE runs 2–24 (see market
+# creation in admin.py) — 2 is the theoretical floor of a two-tribute combined
+# training score.
+_DISTRICT_SCORE_FLOOR = 2
+
+
+def _district_score_vs_highest_conflict(
+    existing_markets: list[Market],
+    new_mkt: Market,
+    tribute_by_id: dict[int, "Tribute"] | None,
+) -> str | None:
+    """Block a district's rock-bottom combined-score guess from sharing a parlay
+    with that same district being bet to have the field's HIGHEST combined score.
+
+    2 is the lowest possible combined training score, so a district guessed at
+    the floor can't also be the district with the highest total. Needs a tribute
+    lookup to resolve which district a COMBINED_DISTRICT_SCORE market belongs to
+    (the market itself only stores the tribute pair, not the district number);
+    callers that can't cheaply supply one pass None and this check is skipped."""
+    if not tribute_by_id:
+        return None
+
+    def _district_of(m: Market) -> int | None:
+        if m.tribute_a_id is None:
+            return None
+        t = tribute_by_id.get(m.tribute_a_id)
+        return t.district if t else None
+
+    def _check(score_mkt: Market, highest_mkt: Market) -> str | None:
+        if (
+            score_mkt.type != _DISTRICT_SCORE_TYPE
+            or score_mkt.placement_num != _DISTRICT_SCORE_FLOOR
+        ):
+            return None
+        if highest_mkt.type != "DISTRICT_HIGHEST_SCORE":
+            return None
+        d = _district_of(score_mkt)
+        if d is None or highest_mkt.placement_num != d:
+            return None
+        return (
+            f"You can't parlay D{d}'s combined training score at the rock-bottom "
+            f"total ({_DISTRICT_SCORE_FLOOR}) together with D{d} having the highest "
+            f"combined score in the field — the lowest possible total can't also "
+            f"be the highest."
+        )
+
+    for m in existing_markets:
+        conflict = _check(new_mkt, m) or _check(m, new_mkt)
+        if conflict:
+            return conflict
+    return None
+
+
+async def tribute_lookup_for_markets(db, markets: list[Market]) -> dict[int, Tribute]:
+    """Fetch the Tribute rows referenced by a set of markets' tribute_a/b ids,
+    keyed by id. Callers should build this once (outside any per-candidate loop)
+    and pass the same dict into every _parlay_conflict() call so district-aware
+    rules like _district_score_vs_highest_conflict can resolve without N+1
+    queries. Takes a plain AsyncSession so it works from bot or web sessions."""
+    tids = {m.tribute_a_id for m in markets if m.tribute_a_id is not None}
+    tids |= {m.tribute_b_id for m in markets if m.tribute_b_id is not None}
+    if not tids:
+        return {}
+    rows = (await db.execute(select(Tribute).where(Tribute.id.in_(tids)))).scalars().all()
+    return {t.id: t for t in rows}
 
 
 _PARTNER_SCORE_TYPES = {"PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER"}
@@ -495,6 +632,53 @@ def _partner_comparison_conflict(existing_markets: list[Market], new_mkt: Market
     return None
 
 
+_FIELD_EXTREME_SCORE_TYPES = {"HIGHEST_TRAINING_SCORE", "LOWEST_TRAINING_SCORE"}
+
+
+def _extreme_score_partner_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Block a field-extreme training-score bet from contradicting a partner bet.
+
+    A tribute bet to receive the LOWEST training score in the whole field can't
+    also be bet to score higher than their district partner — the lowest score in
+    the field can't beat anyone, including a partner. Symmetrically, a tribute bet
+    to receive the HIGHEST score can't also be bet to score lower than their
+    partner."""
+
+    def _check(extreme: Market, partner: Market) -> str | None:
+        if extreme.type not in _FIELD_EXTREME_SCORE_TYPES or extreme.tribute_a_id is None:
+            return None
+        if partner.type not in _PARTNER_SCORE_TYPES:
+            return None
+        tid = extreme.tribute_a_id
+        asserts_higher = (
+            (partner.type == "PARTNER_SCORE_HIGHER" and partner.tribute_a_id == tid)
+            or (partner.type == "PARTNER_SCORE_LOWER" and partner.tribute_b_id == tid)
+        )
+        asserts_lower = (
+            (partner.type == "PARTNER_SCORE_LOWER" and partner.tribute_a_id == tid)
+            or (partner.type == "PARTNER_SCORE_HIGHER" and partner.tribute_b_id == tid)
+        )
+        if extreme.type == "LOWEST_TRAINING_SCORE" and asserts_higher:
+            return (
+                "You can't parlay a tribute to get the lowest training score in the "
+                "field and also bet them to score higher than their district partner "
+                "— the lowest score can't beat anyone."
+            )
+        if extreme.type == "HIGHEST_TRAINING_SCORE" and asserts_lower:
+            return (
+                "You can't parlay a tribute to get the highest training score in the "
+                "field and also bet them to score lower than their district partner "
+                "— the highest score can't lose to anyone."
+            )
+        return None
+
+    for m in existing_markets:
+        conflict = _check(new_mkt, m) or _check(m, new_mkt)
+        if conflict:
+            return conflict
+    return None
+
+
 def _victor_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
     """Allow at most one "who wins the Games" market per parlay.
 
@@ -515,9 +699,84 @@ def _victor_conflict(existing_markets: list[Market], new_mkt: Market) -> str | N
     return None
 
 
-def _parlay_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+def _arena_side(m: Market) -> str | None:
+    """Which arena-nature outcome `m` is a bet FOR ("ARTIFICIAL"/"NATURAL"),
+    or None if `m` isn't an arena-nature market at all."""
+    if m.type == "ARENA_IS_ARTIFICIAL":
+        return "ARTIFICIAL"
+    if m.type == "ARENA_IS_NATURAL":
+        return "NATURAL"
+    if m.type == "ARENA_TYPE":
+        return m.cause
+    return None
+
+
+def _arena_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Disallow parlaying an artificial-arena bet with a natural-arena bet.
+
+    ARENA_TYPE (cause=ARTIFICIAL/NATURAL), ARENA_IS_ARTIFICIAL, and
+    ARENA_IS_NATURAL all resolve off the same single global arena-type
+    setting, so an artificial-side leg and a natural-side leg can never both
+    win — one guarantees the other loses.
+    """
+    new_side = _arena_side(new_mkt)
+    if new_side is None:
+        return None
+    if any(_arena_side(m) not in (None, new_side) for m in existing_markets):
+        return (
+            "You can't parlay an artificial-arena bet with a natural-arena bet — "
+            "the Games only has one arena, so betting both sides is a guaranteed "
+            "loser. Pick one arena type per parlay."
+        )
+    return None
+
+
+async def _multi_outcome_type_keys(db) -> set[str]:
+    """Type keys (CUSTOM_{id}) for every multi_outcome MarketTemplate — roster
+    markets like "Fifth Career Alliance Member" where one Market row exists per
+    eligible tribute and only one/a few can win. Takes a plain AsyncSession so
+    it works from either the bot's get_session() or the web's get_db()."""
+    rows = (await db.execute(
+        select(MarketTemplate).where(MarketTemplate.multi_outcome == True)
+    )).scalars().all()
+    return {f"CUSTOM_{t.id}" for t in rows}
+
+
+def _multi_outcome_conflict(
+    existing_markets: list[Market],
+    new_mkt: Market,
+    multi_outcome_types: set[str] | None,
+) -> str | None:
+    """Block stacking two outcome-rows of the same multi_outcome roster market
+    (e.g. two different tributes both bet as "Fifth Career Alliance Member") —
+    only one (or a tied few) tribute can win it, so a second leg from the same
+    template is either redundant or a guaranteed loser. Only types confirmed
+    multi_outcome via `multi_outcome_types` trigger this — legacy single-outcome
+    CUSTOM_ props (independent per-tribute yes/no bets) are unaffected."""
+    if not multi_outcome_types or new_mkt.type not in multi_outcome_types:
+        return None
+    if any(m.type == new_mkt.type for m in existing_markets):
+        return (
+            "You can't parlay more than one outcome from the same roster market "
+            "— only one (or a tied few) tribute can win it, so stacking two legs "
+            "from it is either redundant or a guaranteed loser."
+        )
+    return None
+
+
+def _parlay_conflict(
+    existing_markets: list[Market],
+    new_mkt: Market,
+    tribute_by_id: dict[int, "Tribute"] | None = None,
+    multi_outcome_types: set[str] | None = None,
+) -> str | None:
     """Single gate for every parlay leg-compatibility rule. Returns an error
-    string if `new_mkt` can't legally share a parlay with `existing_markets`."""
+    string if `new_mkt` can't legally share a parlay with `existing_markets`.
+    `tribute_by_id` is optional context (tribute id -> Tribute) some rules need
+    to resolve which district a market belongs to; pass one via
+    tribute_lookup_for_markets() where practical, or omit to skip those rules.
+    `multi_outcome_types` is optional context (see _multi_outcome_type_keys())
+    for the roster-market rule; omit to skip it."""
     return (
         _milestone_conflict(existing_markets, new_mkt)
         or _placement_conflict(existing_markets, new_mkt)
@@ -526,17 +785,69 @@ def _parlay_conflict(existing_markets: list[Market], new_mkt: Market) -> str | N
         or _alliance_milestone_conflict(existing_markets, new_mkt)
         or _survival_conflict(existing_markets, new_mkt)
         or _training_score_conflict(existing_markets, new_mkt)
+        or _district_score_conflict(existing_markets, new_mkt)
+        or _district_score_vs_highest_conflict(existing_markets, new_mkt, tribute_by_id)
         or _partner_comparison_conflict(existing_markets, new_mkt)
+        or _extreme_score_partner_conflict(existing_markets, new_mkt)
         or _victor_conflict(existing_markets, new_mkt)
+        or _arena_conflict(existing_markets, new_mkt)
+        or _multi_outcome_conflict(existing_markets, new_mkt, multi_outcome_types)
     )
 
 
-async def _get_or_create_user(session, member: discord.Member) -> User:
-    u = await session.get(User, member.id)
+async def add_markets_to_pending_slip(
+    db, guild_id: int, discord_id: int, candidate_markets: list[Market]
+) -> tuple[int, int]:
+    """Copy as many ``candidate_markets`` as possible into a user's pending
+    parlay slip — used to seed a slip from a tail-board template/parlay so the
+    member can edit it before submitting, instead of only being able to tail it
+    as a fixed package. Skips markets already in the slip, past the leg cap, or
+    that conflict with a leg already there. Returns (added, skipped) counts.
+    Takes a plain AsyncSession so it works from either the bot's get_session()
+    or the web's get_db()."""
+    existing_legs = (await db.execute(
+        select(PendingParlayLeg).where(
+            PendingParlayLeg.guild_id == guild_id, PendingParlayLeg.user_id == discord_id,
+        )
+    )).scalars().all()
+    existing_market_ids = {l.market_id for l in existing_legs}
+    existing_markets = []
+    for l in existing_legs:
+        mkt = await db.get(Market, l.market_id)
+        if mkt:
+            existing_markets.append(mkt)
+
+    tribute_by_id = await tribute_lookup_for_markets(db, existing_markets + candidate_markets)
+    mo_types = await _multi_outcome_type_keys(db)
+
+    added = 0
+    skipped = 0
+    for mkt in candidate_markets:
+        if mkt.id in existing_market_ids:
+            skipped += 1
+            continue
+        if len(existing_market_ids) >= MAX_PARLAY_LEGS:
+            skipped += 1
+            continue
+        if _parlay_conflict(existing_markets, mkt, tribute_by_id, mo_types):
+            skipped += 1
+            continue
+        db.add(PendingParlayLeg(guild_id=guild_id, user_id=discord_id, market_id=mkt.id))
+        existing_markets.append(mkt)
+        existing_market_ids.add(mkt.id)
+        added += 1
+    return added, skipped
+
+
+async def _get_or_create_user(session, member: discord.Member, guild_id: int) -> User:
+    result = await session.execute(
+        select(User).where(User.guild_id == guild_id, User.discord_id == member.id)
+    )
+    u = result.scalar_one_or_none()
     if u is None:
         default_raw = await get_setting("default_chips")
         default = json.loads(default_raw) if default_raw else 1000
-        u = User(discord_id=member.id, username=member.display_name, chips=default)
+        u = User(guild_id=guild_id, discord_id=member.id, username=member.display_name, chips=default)
         session.add(u)
         await session.flush()
     else:
@@ -544,9 +855,151 @@ async def _get_or_create_user(session, member: discord.Member) -> User:
     return u
 
 
+# ── Cascading subject/market-type narrowing for /bet and /parlay add ──────────
+# subject_type + subject + market_type are optional filters that only affect the
+# autocomplete shown for market_id — they're read out of interaction.namespace by
+# the market_id (and market_type/subject) autocomplete callbacks below, exactly
+# like cashout_type narrows cashout_autocomplete. Everything stays skippable: a
+# user can ignore all three and just free-text search market_id like before.
+
+SUBJECT_TYPE_CHOICES = [
+    app_commands.Choice(name="Tribute", value="tribute"),
+    app_commands.Choice(name="District", value="district"),
+    app_commands.Choice(name="Alliance", value="alliance"),
+    app_commands.Choice(name="Game Prop", value="props"),
+    app_commands.Choice(name="Custom", value="custom"),
+]
+
+
+def _market_matches_subject(
+    m: "Market",
+    subject_type: str | None,
+    subject: str | None,
+) -> bool:
+    if not subject_type:
+        return True
+    if _type_section(m.type) != subject_type:
+        return False
+    if not subject:
+        return True
+    try:
+        sid = int(subject)
+    except (TypeError, ValueError):
+        return True
+    if subject_type == "tribute":
+        return m.tribute_a_id == sid or m.tribute_b_id == sid
+    if subject_type in ("district", "alliance"):
+        return m.placement_num == sid
+    return True
+
+
+def _ns_subject_params(interaction: discord.Interaction) -> tuple[str | None, str | None, str | None]:
+    ns = interaction.namespace
+    raw_subject_type = getattr(ns, "subject_type", None)
+    subject_type = raw_subject_type.value if isinstance(raw_subject_type, app_commands.Choice) else raw_subject_type
+    return (
+        subject_type or None,
+        getattr(ns, "subject", None) or None,
+        getattr(ns, "market_type", None) or None,
+    )
+
+
+async def market_subject_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Tributes / districts / alliances that currently have an OPEN market,
+    scoped to whichever subject_type the user already picked."""
+    subject_type, _, _ = _ns_subject_params(interaction)
+    if subject_type not in ("tribute", "district", "alliance"):
+        return []
+
+    async with get_session() as session:
+        result = await session.execute(select(Market).where(Market.status == "OPEN"))
+        markets = result.scalars().all()
+
+        if subject_type == "tribute":
+            tribute_ids = {
+                tid
+                for m in markets
+                if _type_section(m.type) == "tribute"
+                for tid in (m.tribute_a_id, m.tribute_b_id)
+                if tid is not None
+            }
+            if not tribute_ids:
+                return []
+            trib_result = await session.execute(
+                select(Tribute).where(Tribute.id.in_(tribute_ids))
+            )
+            tributes = trib_result.scalars().all()
+            choices = []
+            for t in sorted(tributes, key=lambda t: (t.district, t.display_gender, t.name)):
+                label = f"D{t.district}{t.display_gender} {t.name}"
+                if current.lower() in label.lower():
+                    choices.append(app_commands.Choice(name=label[:100], value=str(t.id)))
+            return choices[:25]
+
+        if subject_type == "district":
+            districts = {
+                m.placement_num
+                for m in markets
+                if _type_section(m.type) == "district" and m.placement_num is not None
+            }
+            choices = []
+            for d in sorted(districts):
+                label = f"District {d}"
+                if current.lower() in label.lower():
+                    choices.append(app_commands.Choice(name=label, value=str(d)))
+            return choices[:25]
+
+        # alliance
+        alliance_ids = {
+            m.placement_num
+            for m in markets
+            if _type_section(m.type) == "alliance" and m.placement_num is not None
+        }
+        if not alliance_ids:
+            return []
+        all_result = await session.execute(
+            select(Alliance).where(Alliance.id.in_(alliance_ids))
+        )
+        choices = []
+        for a in all_result.scalars().all():
+            if current.lower() in a.name.lower():
+                choices.append(app_commands.Choice(name=a.name[:100], value=str(a.id)))
+        return choices[:25]
+
+
+async def market_type_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Distinct market types among currently-OPEN markets, scoped to whichever
+    subject_type/subject the user already picked."""
+    subject_type, subject, _ = _ns_subject_params(interaction)
+    async with get_session() as session:
+        result = await session.execute(select(Market).where(Market.status == "OPEN"))
+        markets = result.scalars().all()
+        tmpl_result = await session.execute(select(MarketTemplate))
+        custom_labels = {f"CUSTOM_{t.id}": t.name for t in tmpl_result.scalars().all()}
+
+    type_labels = {**_TYPE_LABELS, **custom_labels}
+    seen: dict[str, None] = {}
+    for m in markets:
+        if not _market_matches_subject(m, subject_type, subject):
+            continue
+        seen.setdefault(m.type, None)
+
+    choices = []
+    for t in sorted(seen, key=lambda x: _TYPE_ORDER.get(x, 99)):
+        label = type_labels.get(t, t)
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=t))
+    return choices[:25]
+
+
 async def open_market_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
+    subject_type, subject, market_type = _ns_subject_params(interaction)
     async with get_session() as session:
         result = await session.execute(
             select(Market).where(Market.status == "OPEN").order_by(Market.id)
@@ -554,6 +1007,10 @@ async def open_market_autocomplete(
         markets = result.scalars().all()
     choices = []
     for m in markets:
+        if not _market_matches_subject(m, subject_type, subject):
+            continue
+        if market_type and m.type != market_type:
+            continue
         if current.lower() in m.label.lower():
             choices.append(app_commands.Choice(name=m.label[:100], value=str(m.id)))
     return choices[:25]
@@ -565,14 +1022,19 @@ async def parlay_market_autocomplete(
     """Open markets that can still be legally added to the caller's pending
     parlay slip. Markets already on the slip — or that would conflict with a leg
     already there (e.g. the opposing side of a bet already taken) — are hidden."""
+    subject_type, subject, market_type = _ns_subject_params(interaction)
     uid = interaction.user.id
+    gid = current_guild_id()
     async with get_session() as session:
         result = await session.execute(
             select(Market).where(Market.status == "OPEN").order_by(Market.id)
         )
         markets = list(result.scalars().all())
         legs_result = await session.execute(
-            select(PendingParlayLeg).where(PendingParlayLeg.user_id == uid)
+            select(PendingParlayLeg).where(
+                PendingParlayLeg.guild_id == gid,
+                PendingParlayLeg.user_id == uid,
+            )
         )
         leg_market_ids = {leg.market_id for leg in legs_result.scalars().all()}
         existing_mkts = []
@@ -582,13 +1044,20 @@ async def parlay_market_autocomplete(
             )
             existing_mkts = list(slip_result.scalars().all())
 
+        tribute_by_id = await tribute_lookup_for_markets(session, existing_mkts + markets)
+        mo_types = await _multi_outcome_type_keys(session)
+
     choices = []
     for m in markets:
         if m.id in leg_market_ids:
             continue
+        if not _market_matches_subject(m, subject_type, subject):
+            continue
+        if market_type and m.type != market_type:
+            continue
         if current.lower() not in m.label.lower():
             continue
-        if _parlay_conflict(existing_mkts, m):
+        if _parlay_conflict(existing_mkts, m, tribute_by_id, mo_types):
             continue
         choices.append(app_commands.Choice(name=m.label[:100], value=str(m.id)))
         if len(choices) >= 25:
@@ -600,9 +1069,13 @@ async def user_bet_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     uid = interaction.user.id
+    gid = current_guild_id()
     async with get_session() as session:
         result = await session.execute(
-            select(Bet).where(Bet.user_id == uid, Bet.status == "PENDING", Bet.parlay_id == None)
+            select(Bet).where(
+                Bet.guild_id == gid, Bet.user_id == uid,
+                Bet.status == "PENDING", Bet.parlay_id == None,
+            )
         )
         bets = result.scalars().all()
     choices = []
@@ -632,16 +1105,43 @@ async def user_parlay_autocomplete(
     return choices[:25]
 
 
+async def user_public_parlay_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    uid = interaction.user.id
+    gid = current_guild_id()
+    async with get_session() as session:
+        result = await session.execute(
+            select(Parlay).where(
+                Parlay.guild_id == gid,
+                Parlay.user_id == uid,
+                Parlay.status == "PENDING",
+                Parlay.is_public == True,  # noqa: E712
+            ).order_by(Parlay.placed_at.desc())
+        )
+        parlays = result.scalars().all()
+    choices = []
+    for p in parlays:
+        label = f"Parlay #{p.id} — {fmt_chips(p.total_wager)} wager"
+        if not current or current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=str(p.id)))
+    return choices[:25]
+
+
 async def cashout_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     uid = interaction.user.id
+    gid = current_guild_id()
     cashout_type = getattr(interaction.namespace, "cashout_type", "BET")
 
     if cashout_type == "PARLAY":
         async with get_session() as session:
             result = await session.execute(
-                select(Parlay).where(Parlay.user_id == uid, Parlay.status == "PENDING")
+                select(Parlay).where(
+                    Parlay.guild_id == gid, Parlay.user_id == uid,
+                    Parlay.status == "PENDING",
+                )
             )
             parlays = result.scalars().all()
         choices = []
@@ -655,7 +1155,10 @@ async def cashout_autocomplete(
         result = await session.execute(
             select(Bet, Market)
             .join(Market, Bet.market_id == Market.id)
-            .where(Bet.user_id == uid, Bet.status == "PENDING", Bet.parlay_id == None)
+            .where(
+                Bet.guild_id == gid, Bet.user_id == uid,
+                Bet.status == "PENDING", Bet.parlay_id == None,
+            )
         )
         rows = result.all()
     choices = []
@@ -665,10 +1168,13 @@ async def cashout_autocomplete(
     return choices[:25]
 
 
-async def _get_restriction_msg(session, user_id: int, mkt: Market) -> str | None:
+async def _get_restriction_msg(session, user_id: int, mkt: Market, guild_id: int = 0) -> str | None:
     """Return an error string if the user is restricted from betting on this market."""
     result = await session.execute(
-        select(BettingRestriction).where(BettingRestriction.discord_user_id == user_id)
+        select(BettingRestriction).where(
+            BettingRestriction.guild_id == guild_id,
+            BettingRestriction.discord_user_id == user_id,
+        )
     )
     restrictions = result.scalars().all()
     if not restrictions:
@@ -715,13 +1221,18 @@ async def _get_restriction_msg(session, user_id: int, mkt: Market) -> str | None
 # odds from when the template/parlay was first built.
 
 
-async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
+async def _gather_tailable(session, guild_id: int) -> tuple[list[dict], list[dict]]:
     """Return ``(featured, member)`` lists of tailable-parlay entries.
 
     Each entry is a dict with ``key``, ``name``, ``sub``, ``tag``,
-    ``market_ids``, ``labels`` and ``odds_list``. Only parlays whose every leg
-    market is still OPEN (and that still have at least 2 legs) are included, so
-    everything returned is actually tailable at live odds.
+    ``market_ids``, ``labels`` and ``odds_list``.
+
+    Featured (GM/auto) templates are listed regardless of leg status — matching
+    the Discord Activity's tail board — so a template with a closed leg is still
+    visible (with its real combined odds) rather than silently vanishing; actual
+    tailing is still blocked at bet time by ``_validate_tail_markets``. Member
+    parlays stay stricter: only shown if every leg is still OPEN, since tailing
+    someone else's pending slip should reflect what's genuinely live right now.
     """
     featured: list[dict] = []
     member: list[dict] = []
@@ -738,14 +1249,11 @@ async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
             .order_by(ParlayTemplateLeg.sort_order)
         )
         mkts: list[Market] = []
-        ok = True
         for leg in legs_result.scalars().all():
             m = await session.get(Market, leg.market_id)
-            if not m or m.status != "OPEN":
-                ok = False
-                break
-            mkts.append(m)
-        if not ok or len(mkts) < 2:
+            if m:
+                mkts.append(m)
+        if len(mkts) < 2:
             continue
         tag = tpl.difficulty or tpl.source
         if tag == "ADMIN":
@@ -759,11 +1267,17 @@ async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
             "market_ids": [m.id for m in mkts],
             "labels": [m.label for m in mkts],
             "odds_list": [m.odds for m in mkts],
+            "owner_id": None,
+            "source_parlay_id": None,
         })
 
     p_result = await session.execute(
         select(Parlay)
-        .where(Parlay.status == "PENDING", Parlay.is_public == True)  # noqa: E712
+        .where(
+            Parlay.guild_id == guild_id,
+            Parlay.status == "PENDING",
+            Parlay.is_public == True,  # noqa: E712
+        )
         .order_by(Parlay.placed_at.desc())
     )
     for parlay in p_result.scalars().all():
@@ -778,15 +1292,21 @@ async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
             mkts.append(m)
         if not ok or len(mkts) < 2:
             continue
-        owner = await session.get(User, parlay.user_id)
+        owner_result = await session.execute(
+            select(User).where(User.guild_id == guild_id, User.discord_id == parlay.user_id)
+        )
+        owner = owner_result.scalar_one_or_none()
+        default_name = f"{owner.username if owner else 'Member'}'s Parlay #{parlay.id}"
         member.append({
             "key": f"P{parlay.id}",
-            "name": f"{owner.username if owner else 'Member'}'s Parlay #{parlay.id}",
+            "name": parlay.name or default_name,
             "sub": f"Tailing {owner.username}'s {len(mkts)}-leg parlay" if owner else "",
             "tag": "MEMBER",
             "market_ids": [m.id for m in mkts],
             "labels": [m.label for m in mkts],
             "odds_list": [m.odds for m in mkts],
+            "owner_id": parlay.user_id,
+            "source_parlay_id": parlay.id,
         })
         if len(member) >= 15:
             break
@@ -794,7 +1314,7 @@ async def _gather_tailable(session) -> tuple[list[dict], list[dict]]:
     return featured, member
 
 
-async def _validate_tail_markets(session, user_id: int, market_ids: list[int]) -> tuple[str | None, list[Market]]:
+async def _validate_tail_markets(session, user_id: int, market_ids: list[int], guild_id: int = 0) -> tuple[str | None, list[Market]]:
     """Load and validate the legs of a parlay the user is about to tail."""
     markets: list[Market] = []
     for mid in market_ids:
@@ -804,11 +1324,13 @@ async def _validate_tail_markets(session, user_id: int, market_ids: list[int]) -
         markets.append(m)
     if len(markets) < 2:
         return "This parlay no longer has enough open legs to tail.", []
+    tribute_by_id = await tribute_lookup_for_markets(session, markets)
+    mo_types = await _multi_outcome_type_keys(session)
     for i, mkt in enumerate(markets):
-        conflict = _parlay_conflict(markets[:i], mkt)
+        conflict = _parlay_conflict(markets[:i], mkt, tribute_by_id, mo_types)
         if conflict:
             return conflict, []
-        restriction = await _get_restriction_msg(session, user_id, mkt)
+        restriction = await _get_restriction_msg(session, user_id, mkt, guild_id)
         if restriction:
             return restriction, []
     return None, markets
@@ -816,45 +1338,69 @@ async def _validate_tail_markets(session, user_id: int, market_ids: list[int]) -
 
 async def _tail_load_slip(session, user: User, market_ids: list[int]) -> tuple[str | None, int]:
     """Replace the user's pending slip with the tailed parlay's legs."""
-    err, markets = await _validate_tail_markets(session, user.discord_id, market_ids)
+    err, markets = await _validate_tail_markets(session, user.discord_id, market_ids, user.guild_id)
     if err:
         return err, 0
     existing = await session.execute(
-        select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+        select(PendingParlayLeg).where(
+            PendingParlayLeg.guild_id == user.guild_id,
+            PendingParlayLeg.user_id == user.discord_id,
+        )
     )
     for leg in existing.scalars().all():
         await session.delete(leg)
     for mkt in markets:
-        session.add(PendingParlayLeg(user_id=user.discord_id, market_id=mkt.id))
+        session.add(PendingParlayLeg(
+            guild_id=user.guild_id, user_id=user.discord_id, market_id=mkt.id,
+        ))
     return None, len(markets)
 
 
-async def _tail_submit(session, user: User, market_ids: list[int], wager: int) -> tuple[str | None, dict | None]:
-    """Build and commit a parlay from ``market_ids`` at current odds."""
+async def _tail_submit(
+    session,
+    user: User,
+    market_ids: list[int],
+    wager: int,
+    tailed_from_user_id: int | None = None,
+    tailed_from_parlay_id: int | None = None,
+) -> tuple[str | None, dict | None]:
+    """Build and commit a parlay from ``market_ids`` at current odds.
+
+    ``tailed_from_user_id``/``tailed_from_parlay_id`` record provenance when this
+    parlay was built off another member's board listing (never a template), so the
+    original poster can be notified when it resolves — see `_check_parlay`.
+    """
+    if await _betting_paused():
+        return BETTING_PAUSED_MSG, None
+    if await is_fully_restricted(session, user.guild_id, user.discord_id):
+        return BETTING_BLOCKED_MSG, None
     if user.chips < wager:
         return f"Insufficient chips. You have **{fmt_chips(user.chips)}**.", None
-    err, markets = await _validate_tail_markets(session, user.discord_id, market_ids)
+    err, markets = await _validate_tail_markets(session, user.discord_id, market_ids, user.guild_id)
     if err:
         return err, None
 
     all_odds = [m.odds for m in markets]
+    cap_err = await _parlay_cap_error(wager, all_odds)
+    if cap_err:
+        return cap_err, None
     total_payout = parlay_payout(wager, all_odds)
-    if total_payout > PARLAY_PAYOUT_CAP:
-        return (
-            f"Parlay payout cannot exceed **{fmt_chips(PARLAY_PAYOUT_CAP)}**. "
-            "Reduce your wager or remove legs.",
-            None,
-        )
 
     user.chips -= wager
     user.total_wagered += wager
 
     # Tailed copies are private by default so the board isn't flooded with clones.
+    if tailed_from_user_id == user.discord_id:
+        tailed_from_user_id = None
+        tailed_from_parlay_id = None
     parlay = Parlay(
+        guild_id=user.guild_id,
         user_id=user.discord_id,
         total_wager=wager,
         total_payout=total_payout,
         is_public=False,
+        tailed_from_user_id=tailed_from_user_id,
+        tailed_from_parlay_id=tailed_from_parlay_id,
     )
     session.add(parlay)
     await session.flush()
@@ -862,6 +1408,7 @@ async def _tail_submit(session, user: User, market_ids: list[int], wager: int) -
     leg_data: list[ParlayLegData] = []
     for i, mkt in enumerate(markets, 1):
         session.add(Bet(
+            guild_id=user.guild_id,
             user_id=user.discord_id,
             parlay_id=parlay.id,
             market_id=mkt.id,
@@ -909,8 +1456,12 @@ class TailWagerModal(discord.ui.Modal, title="Tail this parlay"):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
-            err, res = await _tail_submit(session, user, self.entry["market_ids"], wager)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            err, res = await _tail_submit(
+                session, user, self.entry["market_ids"], wager,
+                tailed_from_user_id=self.entry.get("owner_id"),
+                tailed_from_parlay_id=self.entry.get("source_parlay_id"),
+            )
             if err:
                 await interaction.followup.send(err, ephemeral=True)
                 return
@@ -927,6 +1478,13 @@ class TailWagerModal(discord.ui.Modal, title="Tail this parlay"):
             ephemeral=True,
         )
 
+        if isinstance(interaction.user, discord.Member):
+            await post_bet_log(
+                interaction.client, interaction.user, "PARLAY",
+                [leg.market_label for leg in res["leg_data"]], res["wager"], res["payout"],
+                is_tail=True,
+            )
+
 
 class TailView(discord.ui.View):
     """Board for browsing and tailing featured + member parlays at live odds."""
@@ -939,6 +1497,12 @@ class TailView(discord.ui.View):
         self.by_key = {e["key"]: e for e in self.entries}
         self.selected: str | None = None
         self.message: discord.Message | None = None
+
+        # The board image shows at most per_page parlays; the rest live on
+        # further pages reachable via the ◀ / ▶ buttons below.
+        self.per_page = TAIL_BOARD_PER_PAGE
+        self.page = 0
+        self.total_pages = max(1, -(-len(self.featured + self.member) // self.per_page))
 
         options = []
         for e in self.entries:
@@ -973,6 +1537,49 @@ class TailView(discord.ui.View):
         self.btn_tail.callback = self._on_tail
         self.add_item(self.btn_tail)
 
+        # Page navigation — only shown when the board spans more than one page.
+        self.btn_prev = discord.ui.Button(
+            label="Prev", emoji="◀",
+            style=discord.ButtonStyle.secondary, row=2, disabled=True,
+        )
+        self.btn_prev.callback = self._on_prev_page
+        self.btn_next = discord.ui.Button(
+            label="Next Page", emoji="▶",
+            style=discord.ButtonStyle.secondary, row=2,
+        )
+        self.btn_next.callback = self._on_next_page
+        if self.total_pages > 1:
+            self.add_item(self.btn_prev)
+            self.add_item(self.btn_next)
+
+    def _update_page_buttons(self) -> None:
+        self.btn_prev.disabled = self.page <= 0
+        self.btn_next.disabled = self.page >= self.total_pages - 1
+
+    async def _show_page(self, interaction: discord.Interaction, new_page: int) -> None:
+        """Re-render the board at ``new_page`` and swap it back into the message.
+
+        Paging returns to the board overview (from any detail view) but keeps the
+        current selection intact — the dropdown lists every parlay regardless of
+        which page the image is showing.
+        """
+        self.page = max(0, min(new_page, self.total_pages - 1))
+        self._update_page_buttons()
+        buf = await render_async(
+            render_tail_board, self.featured, self.member, self.page, self.per_page
+        )
+        f = buf_to_discord_file(buf, f"tail_board_{self.page + 1}.png")
+        try:
+            await interaction.response.edit_message(attachments=[f], view=self)
+        except discord.NotFound:
+            pass
+
+    async def _on_prev_page(self, interaction: discord.Interaction) -> None:
+        await self._show_page(interaction, self.page - 1)
+
+    async def _on_next_page(self, interaction: discord.Interaction) -> None:
+        await self._show_page(interaction, self.page + 1)
+
     async def _on_select(self, interaction: discord.Interaction) -> None:
         self.selected = self.select.values[0]
         self.btn_slip.disabled = False
@@ -999,14 +1606,15 @@ class TailView(discord.ui.View):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
             err, n = await _tail_load_slip(session, user, entry["market_ids"])
         if err:
             await interaction.followup.send(err, ephemeral=True)
             return
         await interaction.followup.send(
             f"Loaded **{n}** legs from **{entry['name']}** onto your slip (previous slip cleared).\n"
-            "Use `/parlay view` to preview or `/parlay submit` to lock in at live odds.",
+            "Use `/parlay view` to preview or `/parlay submit` to lock in at live odds.\n"
+            "💡 To keep your parlay private (off the tail board), use `/parlay submit public:False`.",
             ephemeral=True,
         )
 
@@ -1024,6 +1632,128 @@ class TailView(discord.ui.View):
                 await self.message.edit(view=self)
             except Exception:
                 pass
+
+
+async def _resolve_cashout_target(session, user: User, cashout_type: str, cid: int):
+    """Look up a bet/parlay cashout target and compute eligibility + amount.
+
+    Used for both the preview (read-only) and the confirm step (right before
+    mutating), so the precedence/eligibility check only lives in one place.
+    Returns ``(ok, error, amount, label, target)`` — ``target`` is the live Bet
+    or Parlay ORM object attached to ``session`` when ``ok``, else ``None``.
+    """
+    global_allowed_raw = await get_setting("cashout_allowed")
+    global_allowed = json.loads(global_allowed_raw) if global_allowed_raw else False
+    global_rate_raw = await get_setting("cashout_rate")
+    global_rate = json.loads(global_rate_raw) if global_rate_raw else 0.65
+
+    if cashout_type == "BET":
+        b = await session.get(Bet, cid)
+        if not b or b.user_id != user.discord_id or b.guild_id != user.guild_id:
+            return False, "Bet not found.", 0, None, None
+        if b.status != "PENDING" or b.parlay_id is not None:
+            return False, "You can only cash out pending straight bets.", 0, None, None
+
+        mkt = await session.get(Market, b.market_id)
+        by_type_raw = await get_setting("cashout_by_type")
+        cashout_by_type: dict = json.loads(by_type_raw) if by_type_raw else {}
+        type_override = cashout_by_type.get(mkt.type) if mkt else None
+        allowed, amount = resolve_cashout(
+            wager=b.wager, payout_if_win=b.payout_if_win,
+            global_allowed=global_allowed, global_rate=global_rate,
+            item_allowed=mkt.cashout_allowed if mkt else None,
+            item_rate=mkt.cashout_rate if mkt else None,
+            type_allowed=type_override["allowed"] if type_override else None,
+            type_rate=type_override.get("rate") if type_override else None,
+        )
+        label = mkt.label if mkt else "Unknown"
+        if not allowed:
+            return False, "Early cashout is not available for this bet.", 0, label, None
+        return True, None, amount, label, b
+
+    else:  # PARLAY
+        p = await session.get(Parlay, cid)
+        if not p or p.user_id != user.discord_id or p.guild_id != user.guild_id:
+            return False, "Parlay not found.", 0, None, None
+        if p.status != "PENDING":
+            return False, "That parlay is no longer pending.", 0, None, None
+
+        allowed, amount = resolve_cashout(
+            wager=p.total_wager, payout_if_win=p.total_payout,
+            global_allowed=global_allowed, global_rate=global_rate,
+            item_allowed=p.cashout_allowed, item_rate=p.cashout_rate,
+        )
+        label = f"Parlay #{cid}"
+        if not allowed:
+            return False, "Early cashout is not available.", 0, label, None
+        return True, None, amount, label, p
+
+
+class CashoutConfirmView(discord.ui.View):
+    """Shows the computed cashout amount and only mutates state on Confirm."""
+
+    def __init__(self, cashout_type: str, cid: int, user_discord_id: int) -> None:
+        super().__init__(timeout=60)
+        self.cashout_type = cashout_type
+        self.cid = cid
+        self.user_discord_id = user_discord_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_discord_id:
+            await interaction.response.send_message(
+                "This isn't your cashout to confirm.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm Cashout", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        async with get_session() as session:
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            ok, error, amount, label, target = await _resolve_cashout_target(
+                session, user, self.cashout_type, self.cid
+            )
+            if not ok:
+                await interaction.response.send_message(error, ephemeral=True)
+                return
+
+            target.status = "CASHED_OUT"
+            target.cashout_amount = amount
+            user.chips += amount
+            if self.cashout_type == "PARLAY":
+                legs_result = await session.execute(
+                    select(Bet).where(Bet.parlay_id == target.id, Bet.status == "PENDING")
+                )
+                for leg in legs_result.scalars().all():
+                    leg.status = "CASHED_OUT"
+                    leg.cashout_amount = amount
+            new_balance = user.chips
+
+        embed = discord.Embed(title="Cashed Out!", color=0x4CAF50)
+        embed.add_field(name="Market/Parlay", value=label, inline=False)
+        embed.add_field(name="Cashout Amount", value=fmt_chips(amount))
+        embed.add_field(name="New Balance", value=fmt_chips(new_balance))
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(embed=embed, view=self)
+        except discord.NotFound:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(content="Cashout cancelled.", embed=None, view=self)
+        except discord.NotFound:
+            pass
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
 
 
 class BettingCog(commands.Cog):
@@ -1051,15 +1781,45 @@ class BettingCog(commands.Cog):
     # ── /bet ──────────────────────────────────────────────────────────────────
 
     @app_commands.command(name="bet", description="Place a straight single bet on an open market")
-    @app_commands.describe(market_id="Market to bet on", amount="Amount of chips to wager")
-    @app_commands.autocomplete(market_id=open_market_autocomplete)
+    @app_commands.describe(
+        subject_type="Narrow down by subject (optional — skip straight to market_id to search everything)",
+        subject="Specific tribute/district/alliance to narrow further (optional)",
+        market_type="Market category to narrow further (optional)",
+        market_id="Market to bet on",
+        amount="Amount of chips to wager",
+    )
+    @app_commands.choices(subject_type=SUBJECT_TYPE_CHOICES)
+    @app_commands.autocomplete(
+        subject=market_subject_autocomplete,
+        market_type=market_type_autocomplete,
+        market_id=open_market_autocomplete,
+    )
     async def bet(
         self,
         interaction: discord.Interaction,
-        market_id: str,
-        amount: app_commands.Range[int, 1, 500000],
+        subject_type: app_commands.Choice[str] | None = None,
+        subject: str | None = None,
+        market_type: str | None = None,
+        market_id: str | None = None,
+        amount: app_commands.Range[int, 1, 500000] | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
+            return
+
+        if await _betting_paused():
+            await interaction.followup.send(BETTING_PAUSED_MSG, ephemeral=True)
+            return
+
+        if market_id is None:
+            await interaction.followup.send(
+                "Pick a market from the `market_id` autocomplete list — use `subject_type` / "
+                "`subject` / `market_type` first to narrow it down, or just start typing a "
+                "market name directly to search everything.",
+                ephemeral=True,
+            )
+            return
+        if amount is None:
+            await interaction.followup.send("Specify an `amount` of chips to wager.", ephemeral=True)
             return
 
         mid = _parse_id(market_id)
@@ -1076,12 +1836,14 @@ class BettingCog(commands.Cog):
                 await interaction.followup.send("That market is not open for betting.", ephemeral=True)
                 return
 
-            restriction = await _get_restriction_msg(session, interaction.user.id, mkt)
+            restriction = await _get_restriction_msg(session, interaction.user.id, mkt, current_guild_id())
             if restriction:
                 await interaction.followup.send(restriction, ephemeral=True)
                 return
 
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            # A full ("ALL") betting restriction is already checked above via
+            # _get_restriction_msg — no separate check needed here.
             if user.chips < amount:
                 await interaction.followup.send(
                     f"Insufficient chips. You have **{fmt_chips(user.chips)}** but need **{fmt_chips(amount)}**.",
@@ -1089,11 +1851,17 @@ class BettingCog(commands.Cog):
                 )
                 return
 
+            cap_err = await _single_cap_error(amount, mkt.odds)
+            if cap_err:
+                await interaction.followup.send(cap_err, ephemeral=True)
+                return
+
             payout = straight_payout(amount, mkt.odds)
             user.chips -= amount
             user.total_wagered += amount
 
             b = Bet(
+                guild_id=user.guild_id,
                 user_id=user.discord_id,
                 market_id=mkt.id,
                 wager=amount,
@@ -1116,16 +1884,46 @@ class BettingCog(commands.Cog):
         embed.set_footer(text=f"Remaining balance: {fmt_chips(new_balance)}")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+        if isinstance(interaction.user, discord.Member):
+            await post_bet_log(self.bot, interaction.user, "BET", [label], amount, payout)
+
     # ── /parlay ───────────────────────────────────────────────────────────────
 
     parlay_group = app_commands.Group(name="parlay", description="Build and submit a parlay bet")
 
     @parlay_group.command(name="add", description="Add a market to your pending parlay slip")
-    @app_commands.describe(market_id="Market to add to your parlay slip")
-    @app_commands.autocomplete(market_id=parlay_market_autocomplete)
-    async def parlay_add(self, interaction: discord.Interaction, market_id: str) -> None:
+    @app_commands.describe(
+        subject_type="Narrow down by subject (optional — skip straight to market_id to search everything)",
+        subject="Specific tribute/district/alliance to narrow further (optional)",
+        market_type="Market category to narrow further (optional)",
+        market_id="Market to add to your parlay slip",
+    )
+    @app_commands.choices(subject_type=SUBJECT_TYPE_CHOICES)
+    @app_commands.autocomplete(
+        subject=market_subject_autocomplete,
+        market_type=market_type_autocomplete,
+        market_id=parlay_market_autocomplete,
+    )
+    async def parlay_add(
+        self,
+        interaction: discord.Interaction,
+        subject_type: app_commands.Choice[str] | None = None,
+        subject: str | None = None,
+        market_type: str | None = None,
+        market_id: str | None = None,
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
+
+        if market_id is None:
+            await interaction.followup.send(
+                "Pick a market from the `market_id` autocomplete list — use `subject_type` / "
+                "`subject` / `market_type` first to narrow it down, or just start typing a "
+                "market name directly to search everything.",
+                ephemeral=True,
+            )
+            return
+
         mid = _parse_id(market_id)
         if mid is None:
             await interaction.followup.send(
@@ -1140,15 +1938,16 @@ class BettingCog(commands.Cog):
                 await interaction.followup.send("That market is not open.", ephemeral=True)
                 return
 
-            restriction = await _get_restriction_msg(session, interaction.user.id, mkt)
+            restriction = await _get_restriction_msg(session, interaction.user.id, mkt, current_guild_id())
             if restriction:
                 await interaction.followup.send(restriction, ephemeral=True)
                 return
 
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
 
             dup = await session.execute(
                 select(PendingParlayLeg).where(
+                    PendingParlayLeg.guild_id == user.guild_id,
                     PendingParlayLeg.user_id == user.discord_id,
                     PendingParlayLeg.market_id == mkt.id,
                 )
@@ -1158,7 +1957,10 @@ class BettingCog(commands.Cog):
                 return
 
             existing_legs_result = await session.execute(
-                select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+                select(PendingParlayLeg).where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
             )
             existing_legs = existing_legs_result.scalars().all()
             if len(existing_legs) >= MAX_PARLAY_LEGS:
@@ -1173,12 +1975,16 @@ class BettingCog(commands.Cog):
                 leg_mkt = await session.get(Market, leg.market_id)
                 if leg_mkt:
                     existing_mkts.append(leg_mkt)
-            conflict = _parlay_conflict(existing_mkts, mkt)
+            tribute_by_id = await tribute_lookup_for_markets(session, existing_mkts + [mkt])
+            mo_types = await _multi_outcome_type_keys(session)
+            conflict = _parlay_conflict(existing_mkts, mkt, tribute_by_id, mo_types)
             if conflict:
                 await interaction.followup.send(conflict, ephemeral=True)
                 return
 
-            session.add(PendingParlayLeg(user_id=user.discord_id, market_id=mkt.id))
+            session.add(PendingParlayLeg(
+                guild_id=user.guild_id, user_id=user.discord_id, market_id=mkt.id,
+            ))
             mkt_label = mkt.label
             mkt_odds = mkt.odds
 
@@ -1194,10 +2000,13 @@ class BettingCog(commands.Cog):
             return
 
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
             legs_result = await session.execute(
                 select(PendingParlayLeg)
-                .where(PendingParlayLeg.user_id == user.discord_id)
+                .where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
                 .order_by(PendingParlayLeg.added_at)
             )
             legs = legs_result.scalars().all()
@@ -1240,18 +2049,27 @@ class BettingCog(commands.Cog):
     @app_commands.describe(
         wager="Amount of chips to wager on this parlay",
         public="List this parlay on the tailing board for others to copy (default: yes)",
+        name="Custom title shown on the tail board (default: \"{you}'s Parlay #{id}\")",
     )
     async def parlay_submit(
         self,
         interaction: discord.Interaction,
         wager: app_commands.Range[int, 1, 500000],
         public: bool = True,
+        name: app_commands.Range[str, 1, 80] | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
 
+        if await _betting_paused():
+            await interaction.followup.send(BETTING_PAUSED_MSG, ephemeral=True)
+            return
+
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            if await is_fully_restricted(session, user.guild_id, user.discord_id):
+                await interaction.followup.send(BETTING_BLOCKED_MSG, ephemeral=True)
+                return
             if user.chips < wager:
                 await interaction.followup.send(
                     f"Insufficient chips. You have **{fmt_chips(user.chips)}**.", ephemeral=True
@@ -1260,7 +2078,10 @@ class BettingCog(commands.Cog):
 
             legs_result = await session.execute(
                 select(PendingParlayLeg)
-                .where(PendingParlayLeg.user_id == user.discord_id)
+                .where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
                 .order_by(PendingParlayLeg.added_at)
             )
             legs = legs_result.scalars().all()
@@ -1283,26 +2104,32 @@ class BettingCog(commands.Cog):
                 markets.append(mkt)
 
             # Final leg-compatibility validation pass before committing
+            tribute_by_id = await tribute_lookup_for_markets(session, markets)
+            mo_types = await _multi_outcome_type_keys(session)
             for i, mkt in enumerate(markets):
-                conflict = _parlay_conflict(markets[:i], mkt)
+                conflict = _parlay_conflict(markets[:i], mkt, tribute_by_id, mo_types)
                 if conflict:
                     await interaction.followup.send(conflict, ephemeral=True)
                     return
 
             all_odds = [m.odds for m in markets]
+            cap_err = await _parlay_cap_error(wager, all_odds)
+            if cap_err:
+                await interaction.followup.send(cap_err, ephemeral=True)
+                return
             total_payout = parlay_payout(wager, all_odds)
-            if total_payout > PARLAY_PAYOUT_CAP:
-                return (
-                    f"Parlay payout cannot exceed **{fmt_chips(PARLAY_PAYOUT_CAP)}**. "
-                    "Reduce your wager or remove legs.",
-                    None,
-                )
 
             user.chips -= wager
             user.total_wagered += wager
 
+            role_ids = {r.id for r in interaction.user.roles} if isinstance(interaction.user, discord.Member) else set()
+            downgraded = public and await is_public_bet_blocked(session, user.guild_id, user.discord_id, role_ids)
+            public = public and not downgraded
+
             parlay = Parlay(
+                guild_id=user.guild_id,
                 user_id=user.discord_id,
+                name=name,
                 total_wager=wager,
                 total_payout=total_payout,
                 is_public=public,
@@ -1313,6 +2140,7 @@ class BettingCog(commands.Cog):
             leg_data: list[ParlayLegData] = []
             for i, (leg, mkt) in enumerate(zip(legs, markets), 1):
                 b = Bet(
+                    guild_id=user.guild_id,
                     user_id=user.discord_id,
                     parlay_id=parlay.id,
                     market_id=mkt.id,
@@ -1329,16 +2157,24 @@ class BettingCog(commands.Cog):
 
         buf = await render_async(render_parlay_slip, leg_data, wager, total_payout, True)
         f = buf_to_discord_file(buf, f"parlay_{parlay_id}.png")
-        listed = (
-            "📣 Listed on the tailing board for others to copy."
-            if public else "🔒 Kept private — not listed for tailing."
-        )
+        if downgraded:
+            listed = "🔒 Kept private — public posting is restricted for you."
+        elif public:
+            listed = "📣 Listed on the tailing board for others to copy."
+        else:
+            listed = "🔒 Kept private — not listed for tailing."
         await interaction.followup.send(
             f"**Parlay #{parlay_id} submitted!** Wagered **{fmt_chips(wager)}** for a potential **{fmt_chips(total_payout)}**.\n"
             f"Remaining balance: {fmt_chips(new_balance)}\n{listed}",
             file=f,
             ephemeral=True,
         )
+
+        if isinstance(interaction.user, discord.Member):
+            await post_bet_log(
+                self.bot, interaction.user, "PARLAY",
+                [mkt.label for mkt in markets], wager, total_payout,
+            )
 
     @parlay_group.command(name="remove", description="Remove a leg from your pending parlay slip by position")
     @app_commands.describe(leg_number="Leg number to remove (see /parlay view)")
@@ -1350,10 +2186,13 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
             legs_result = await session.execute(
                 select(PendingParlayLeg)
-                .where(PendingParlayLeg.user_id == user.discord_id)
+                .where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
                 .order_by(PendingParlayLeg.added_at)
             )
             legs = legs_result.scalars().all()
@@ -1378,9 +2217,12 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
             legs_result = await session.execute(
-                select(PendingParlayLeg).where(PendingParlayLeg.user_id == user.discord_id)
+                select(PendingParlayLeg).where(
+                    PendingParlayLeg.guild_id == user.guild_id,
+                    PendingParlayLeg.user_id == user.discord_id,
+                )
             )
             for leg in legs_result.scalars().all():
                 await session.delete(leg)
@@ -1395,7 +2237,7 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            featured, member = await _gather_tailable(session)
+            featured, member = await _gather_tailable(session, current_guild_id())
 
         if not featured and not member:
             await interaction.followup.send(
@@ -1413,6 +2255,39 @@ class BettingCog(commands.Cog):
             file=f, view=view, ephemeral=True
         )
         view.message = msg
+
+    @parlay_group.command(
+        name="unlist",
+        description="Remove your parlay from the public tail board",
+    )
+    @app_commands.describe(parlay_id="Your listed parlay to remove from the tail board")
+    @app_commands.autocomplete(parlay_id=user_public_parlay_autocomplete)
+    async def parlay_unlist(self, interaction: discord.Interaction, parlay_id: str) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        pid = _parse_id(parlay_id)
+        if pid is None:
+            await interaction.followup.send(
+                "Invalid selection. Please pick a parlay from the autocomplete list.",
+                ephemeral=True,
+            )
+            return
+        async with get_session() as session:
+            parlay = await session.get(Parlay, pid)
+            if parlay is None or parlay.user_id != interaction.user.id or parlay.guild_id != current_guild_id():
+                await interaction.followup.send("Parlay not found.", ephemeral=True)
+                return
+            if not parlay.is_public:
+                await interaction.followup.send(
+                    f"Parlay #{pid} is already private — it's not listed on the tail board.",
+                    ephemeral=True,
+                )
+                return
+            parlay.is_public = False
+        await interaction.followup.send(
+            f"🔒 Parlay #{pid} removed from the tail board. Others can no longer copy it.",
+            ephemeral=True,
+        )
 
     # ── /cashout ──────────────────────────────────────────────────────────────
 
@@ -1443,71 +2318,21 @@ class BettingCog(commands.Cog):
             )
             return
 
-        global_allowed_raw = await get_setting("cashout_allowed")
-        global_allowed = json.loads(global_allowed_raw) if global_allowed_raw else False
-        global_rate_raw = await get_setting("cashout_rate")
-        global_rate = json.loads(global_rate_raw) if global_rate_raw else 0.65
-
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            ok, error, amount, label, _target = await _resolve_cashout_target(
+                session, user, cashout_type.value, cid
+            )
 
-            if cashout_type.value == "BET":
-                b = await session.get(Bet, cid)
-                if not b or b.user_id != user.discord_id:
-                    await interaction.followup.send("Bet not found.", ephemeral=True)
-                    return
-                if b.status != "PENDING" or b.parlay_id is not None:
-                    await interaction.followup.send(
-                        "You can only cash out pending straight bets.", ephemeral=True
-                    )
-                    return
+        if not ok:
+            await interaction.followup.send(error, ephemeral=True)
+            return
 
-                mkt = await session.get(Market, b.market_id)
-                allowed = mkt.cashout_allowed if mkt and mkt.cashout_allowed is not None else global_allowed
-                rate = mkt.cashout_rate if mkt and mkt.cashout_rate is not None else global_rate
-
-                if not allowed:
-                    await interaction.followup.send("Early cashout is not available for this bet.", ephemeral=True)
-                    return
-
-                amount = cashout_value(b.wager, b.payout_if_win, rate)
-                b.status = "CASHED_OUT"
-                b.cashout_amount = amount
-                user.chips += amount
-                label = mkt.label if mkt else "Unknown"
-
-            else:  # PARLAY
-                p = await session.get(Parlay, cid)
-                if not p or p.user_id != user.discord_id:
-                    await interaction.followup.send("Parlay not found.", ephemeral=True)
-                    return
-                if p.status != "PENDING":
-                    await interaction.followup.send("That parlay is no longer pending.", ephemeral=True)
-                    return
-
-                if not global_allowed:
-                    await interaction.followup.send("Early cashout is not available.", ephemeral=True)
-                    return
-
-                amount = cashout_value(p.total_wager, p.total_payout, global_rate)
-                p.status = "CASHED_OUT"
-                p.cashout_amount = amount
-                user.chips += amount
-
-                legs_result = await session.execute(
-                    select(Bet).where(Bet.parlay_id == p.id, Bet.status == "PENDING")
-                )
-                for leg in legs_result.scalars().all():
-                    leg.status = "CASHED_OUT"
-                    leg.cashout_amount = amount
-
-                label = f"Parlay #{cid}"
-
-        embed = discord.Embed(title="Cashed Out!", color=0x5B9BD5)
+        embed = discord.Embed(title="Confirm Cashout", color=0x5B9BD5)
         embed.add_field(name="Market/Parlay", value=label, inline=False)
         embed.add_field(name="Cashout Amount", value=fmt_chips(amount))
-        embed.add_field(name="New Balance", value=fmt_chips(user.chips))
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        view = CashoutConfirmView(cashout_type.value, cid, interaction.user.id)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     # ── /withdraw · /deposit ────────────────────────────────────────────────────
     # Chips are the in-bot currency; "panars" is the external economy run by
@@ -1521,19 +2346,36 @@ class BettingCog(commands.Cog):
     ) -> discord.abc.Messageable | None:
         """Resolve the withdraw/deposit admin channel, or None.
 
-        Checks per-guild setting first (set via `/admin settings withdraw_channel`),
+        Checks per-guild setting first (set via `/settings withdraw_channel`),
         then falls back to the WITHDRAW_CHANNEL_ID env var.
         """
         if interaction.guild is None:
             return None
         from bot.database.engine import get_guild_setting
-        raw = await get_guild_setting(interaction.guild_id, "withdraw_channel_id")
+        raw = await get_guild_setting(current_guild_id(), "withdraw_channel_id")
         if not raw:
             raw = await get_setting("withdraw_channel_id")
         channel_id = json.loads(raw) if raw else config.WITHDRAW_CHANNEL_ID
         if not channel_id:
             return None
         return interaction.guild.get_channel(channel_id)
+
+    async def _withdraw_ping(self, interaction: discord.Interaction) -> str:
+        """Resolve the optional /settings withdraw_ping target into a mention
+        string ("" if unset)."""
+        if interaction.guild is None:
+            return ""
+        from bot.database.engine import get_guild_setting
+        gid = current_guild_id()
+        role_raw = await get_guild_setting(gid, "withdraw_ping_role_id")
+        role_id = json.loads(role_raw) if role_raw else None
+        if role_id:
+            return f"<@&{role_id}> "
+        user_raw = await get_guild_setting(gid, "withdraw_ping_user_id")
+        user_id = json.loads(user_raw) if user_raw else None
+        if user_id:
+            return f"<@{user_id}> "
+        return ""
 
     @app_commands.command(
         name="withdraw",
@@ -1559,7 +2401,7 @@ class BettingCog(commands.Cog):
 
         member = interaction.user
         async with get_session() as session:
-            user = await _get_or_create_user(session, member)
+            user = await _get_or_create_user(session, member, current_guild_id())
             if user.chips < amount:
                 await interaction.followup.send(
                     f"Insufficient chips. You have **{fmt_chips(user.chips)}** but "
@@ -1568,24 +2410,33 @@ class BettingCog(commands.Cog):
                 )
                 return
 
+            rate = await effective_rate(session, user.guild_id, member, "WITHDRAW")
+            panar_amount = round(amount * rate)
+
             user.chips -= amount
             new_balance = user.chips
+            blocked = await is_fully_restricted(session, user.guild_id, user.discord_id)
+
+            req = ChipRequest(
+                guild_id=user.guild_id, user_id=user.discord_id,
+                kind="WITHDRAW", amount=amount, converted_amount=panar_amount, status="PENDING",
+            )
+            session.add(req)
+            await session.flush()
+
+            ping = await self._withdraw_ping(interaction)
+            content = ping + render_request_content("WITHDRAW", user.discord_id, amount, panar_amount)
+            view = build_request_view(req, user.guild_id, user.discord_id, blocked)
 
             # Post the payout request inside the transaction: if the send fails,
             # the chip debit rolls back so we never take chips without notifying
             # admins to pay out the panars.
-            await channel.send(
-                f"💸 **Withdrawal request** — {member.mention} is converting "
-                f"**{fmt_chips(amount)}** into Panars. Their chip balance has "
-                f"already been debited. Run this to pay them out:\n"
-                f"`/admin1 award-deprive citizen:{member.mention} operation:Award "
-                f"resource:Panars amount:{amount}`"
-            )
+            await channel.send(content=content, view=view)
 
         await interaction.followup.send(
             f"Withdrawal request for **{fmt_chips(amount)}** submitted. The amount "
             f"has been debited from your balance (now **{fmt_chips(new_balance)}**) "
-            "and an admin will pay out your Panars shortly.",
+            f"and an admin will pay out **{panar_amount:,} Panars** shortly.",
             ephemeral=True,
         )
 
@@ -1614,18 +2465,29 @@ class BettingCog(commands.Cog):
         # Chips are NOT credited here — an admin takes the panars and credits the
         # chips so nobody can mint chips they didn't pay for.
         member = interaction.user
-        await channel.send(
-            f"🏦 **Deposit request** — {member.mention} wants to convert "
-            f"**{amount:,} Panars** into chips. Take their Panars, then credit "
-            "the chips:\n"
-            f"`/admin1 award-deprive citizen:{member.mention} operation:Deprive "
-            f"resource:Panars amount:{amount}`\n"
-            f"`/admin settings chips_give user:{member.mention} amount:{amount}`"
-        )
+        async with get_session() as session:
+            user = await _get_or_create_user(session, member, current_guild_id())
+            guild_id = user.guild_id
+            blocked = await is_fully_restricted(session, guild_id, user.discord_id)
+
+            rate = await effective_rate(session, guild_id, member, "DEPOSIT")
+            chip_amount = round(amount * rate)
+
+            req = ChipRequest(
+                guild_id=guild_id, user_id=user.discord_id,
+                kind="DEPOSIT", amount=amount, converted_amount=chip_amount, status="PENDING",
+            )
+            session.add(req)
+            await session.flush()
+
+        ping = await self._withdraw_ping(interaction)
+        content = ping + render_request_content("DEPOSIT", member.id, amount, chip_amount)
+        view = build_request_view(req, guild_id, member.id, blocked)
+        await channel.send(content=content, view=view)
 
         await interaction.followup.send(
             f"Deposit request for **{amount:,} Panars** submitted. An admin will "
-            f"take your Panars and credit **{fmt_chips(amount)}** to your balance "
+            f"take your Panars and credit **{fmt_chips(chip_amount)}** to your balance "
             "shortly.",
             ephemeral=True,
         )
@@ -1649,10 +2511,14 @@ class BettingCog(commands.Cog):
         filter_val = filter_by.value if filter_by else "ALL"
 
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
 
-            straight_q = select(Bet).where(Bet.user_id == user.discord_id, Bet.parlay_id == None)
-            parlay_q = select(Parlay).where(Parlay.user_id == user.discord_id)
+            straight_q = select(Bet).where(
+                Bet.guild_id == user.guild_id, Bet.user_id == user.discord_id, Bet.parlay_id == None,
+            )
+            parlay_q = select(Parlay).where(
+                Parlay.guild_id == user.guild_id, Parlay.user_id == user.discord_id,
+            )
             if filter_val != "ALL":
                 straight_q = straight_q.where(Bet.status == filter_val)
                 parlay_q = parlay_q.where(Parlay.status == filter_val)
@@ -1718,7 +2584,7 @@ class BettingCog(commands.Cog):
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            featured_list, member_list = await _gather_tailable(session)
+            featured_list, member_list = await _gather_tailable(session, current_guild_id())
 
         if not featured_list:
             await interaction.followup.send(

@@ -1,8 +1,13 @@
+import asyncio
+import contextvars
+import fcntl
 import json
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
+from typing import AsyncGenerator, Iterator
 
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -10,24 +15,75 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy import select, func, text
 
 from bot import config
-from bot.database.models import Base, BettingPhase, DistrictRecord, GameSetting, MarketTemplate
+from bot.database.models import Base, BettingPhase, DistrictRecord, GameSetting, MarketTemplate, TributeLock
 
-engine = create_async_engine(
-    f"sqlite+aiosqlite:///{config.DB_PATH}",
-    echo=False,
-)
+_guild_id_ctx: contextvars.ContextVar[int] = contextvars.ContextVar("guild_id", default=0)
 
-AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autoflush=False,
-)
+_engines: dict[int, AsyncEngine] = {}
+_factories: dict[int, async_sessionmaker[AsyncSession]] = {}
+
+# Guilds whose per-guild DB has had its schema created/migrated/seeded this
+# process. Plus an in-process async lock per guild so concurrent first-touches
+# serialise (the cross-process flock alone can't make a second coroutine wait
+# for the first one's CREATE TABLE within the same process).
+_initialized: set[int] = set()
+_init_locks: dict[int, asyncio.Lock] = {}
+
+
+def _db_path_for_guild(guild_id: int) -> Path:
+    return Path(config.DB_PATH).parent / f"sportsbook_{guild_id}.db"
+
+
+def _ensure_engine(guild_id: int) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
+    if guild_id not in _engines:
+        db_path = _db_path_for_guild(guild_id)
+        eng = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
+        factory = async_sessionmaker(
+            eng,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autoflush=False,
+        )
+        _engines[guild_id] = eng
+        _factories[guild_id] = factory
+    return _engines[guild_id], _factories[guild_id]
+
+
+def set_guild_context(guild_id: int) -> None:
+    """Bind the current async task to a Discord guild's database. Called once
+    per interaction from the live interaction.guild_id, so every command, button,
+    modal, and audit log automatically resolves to that server's own DB."""
+    _guild_id_ctx.set(guild_id)
+
+
+def current_guild_id() -> int:
+    """The guild id bound to the current context — the single source of truth for
+    which DB to open and for guild_id row stamps, query filters, and settings
+    keys. Set per-interaction by set_guild_context."""
+    return _guild_id_ctx.get()
+
+
+async def _ensure_initialized(guild_id: int) -> None:
+    """Lazily create/migrate/seed a guild's DB on first access this process, so a
+    server's database is always ready before a query runs — including new servers
+    the bot was just added to and interactions that arrive during startup before
+    on_ready's init loop finishes (which previously raised 'no such table')."""
+    if guild_id in _initialized:
+        return
+    lock = _init_locks.setdefault(guild_id, asyncio.Lock())
+    async with lock:
+        if guild_id not in _initialized:
+            await _do_init(guild_id)
 
 
 @asynccontextmanager
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
+    gid = current_guild_id()
+    if not gid:
+        raise RuntimeError("No guild context set — database access requires a guild")
+    await _ensure_initialized(gid)
+    _, factory = _ensure_engine(gid)
+    async with factory() as session:
         async with session.begin():
             yield session
 
@@ -35,19 +91,62 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 @asynccontextmanager
 async def get_read_session() -> AsyncGenerator[AsyncSession, None]:
     """Lightweight session for read-only queries — no explicit transaction begin/commit."""
-    async with AsyncSessionLocal() as session:
+    gid = current_guild_id()
+    if not gid:
+        raise RuntimeError("No guild context set — database access requires a guild")
+    await _ensure_initialized(gid)
+    _, factory = _ensure_engine(gid)
+    async with factory() as session:
         yield session
 
 
-async def init_db() -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    await _migrate_schema()
-    await _seed_defaults()
+@contextmanager
+def _init_lock(guild_id: int) -> Iterator[None]:
+    """Cross-process exclusive lock so the bot and web services never run
+    create_all/migrate/seed against the same per-guild DB concurrently (which
+    races on CREATE TABLE / duplicate-key INSERTs). The loser blocks until the
+    winner finishes, then finds the schema already present and skips it."""
+    db_path = _db_path_for_guild(guild_id)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = db_path.parent / f".init-{guild_id}.lock"
+    with open(lock_path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+async def init_db(guild_id: int) -> None:
+    """Idempotent public entry point used at startup / on_guild_join. Safe to
+    call repeatedly; the actual work runs once per guild per process."""
+    if guild_id:
+        await _ensure_initialized(guild_id)
+
+
+async def _do_init(guild_id: int) -> None:
+    token = _guild_id_ctx.set(guild_id)
+    try:
+        with _init_lock(guild_id):
+            eng, _ = _ensure_engine(guild_id)
+            async with eng.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            await _migrate_schema()
+            # Mark ready before seeding: _seed_defaults opens get_session for this
+            # same guild, which must short-circuit _ensure_initialized rather than
+            # recurse / deadlock on the per-guild lock held above.
+            _initialized.add(guild_id)
+            await _seed_defaults()
+    except Exception:
+        _initialized.discard(guild_id)
+        raise
+    finally:
+        _guild_id_ctx.reset(token)
 
 
 async def _migrate_schema() -> None:
-    async with engine.begin() as conn:
+    eng, _ = _ensure_engine(current_guild_id())
+    async with eng.begin() as conn:
         rows = await conn.execute(text("PRAGMA table_info(market_templates)"))
         existing = {row[1] for row in rows.fetchall()}
         if "type_key" not in existing:
@@ -59,6 +158,18 @@ async def _migrate_schema() -> None:
         if "is_builtin" not in existing:
             await conn.execute(text(
                 "ALTER TABLE market_templates ADD COLUMN is_builtin BOOLEAN NOT NULL DEFAULT 0"
+            ))
+        if "multi_outcome" not in existing:
+            await conn.execute(text(
+                "ALTER TABLE market_templates ADD COLUMN multi_outcome BOOLEAN NOT NULL DEFAULT 0"
+            ))
+        if "eligibility_mode" not in existing:
+            await conn.execute(text(
+                "ALTER TABLE market_templates ADD COLUMN eligibility_mode VARCHAR(10)"
+            ))
+        if "weight_overrides" not in existing:
+            await conn.execute(text(
+                "ALTER TABLE market_templates ADD COLUMN weight_overrides JSON"
             ))
 
         rows = await conn.execute(text("PRAGMA table_info(tributes)"))
@@ -132,7 +243,7 @@ async def _migrate_schema() -> None:
         if kb_marker.fetchone() is None:
             await conn.execute(text("UPDATE tributes SET kill_boost = 0.0"))
             await conn.execute(text(
-                "INSERT INTO game_settings (key, value) "
+                "INSERT OR IGNORE INTO game_settings (key, value) "
                 "VALUES ('kill_boost_format', '\"v2\"')"
             ))
         if "debilitation_level" not in trib_cols:
@@ -151,6 +262,10 @@ async def _migrate_schema() -> None:
         if "highest_placement" not in trib_cols:
             await conn.execute(text(
                 "ALTER TABLE tributes ADD COLUMN highest_placement INTEGER"
+            ))
+        if "bloodbath_kills" not in trib_cols:
+            await conn.execute(text(
+                "ALTER TABLE tributes ADD COLUMN bloodbath_kills INTEGER NOT NULL DEFAULT 0"
             ))
 
         # Migrate district_records from per-tribute rows to per-district aggregate rows
@@ -238,6 +353,20 @@ async def _migrate_schema() -> None:
             "SELECT COUNT(*) FROM betting_phases"
         ))).scalar()
         if phase_rows:
+            # Add the Pre-Reaping phase (District Victor only, before any
+            # tribute is reaped) to legacy DBs that predate it. Sorts before
+            # every other phase so /game start's "lowest sort_order" pick
+            # lands here first without disturbing the existing phase order.
+            prereaping_count = (await conn.execute(text(
+                "SELECT COUNT(*) FROM betting_phases WHERE name = 'Pre-Reaping'"
+            ))).scalar()
+            if prereaping_count == 0:
+                await conn.execute(text(
+                    "INSERT OR IGNORE INTO betting_phases (name, description, sort_order) "
+                    "VALUES ('Pre-Reaping', 'Only District Futures markets are open — betting "
+                    "before any tribute is reaped', -1)"
+                ))
+
             # Add Final 8 / Final 5 phases to legacy DBs that predate them.
             final8_count = (await conn.execute(text(
                 "SELECT COUNT(*) FROM betting_phases WHERE name = 'Final 8'"
@@ -305,6 +434,25 @@ async def _migrate_schema() -> None:
             f"DELETE FROM market_templates WHERE type_key IN ({_removed_types})"
         ))
 
+        # Rename the DISTRICT_VICTOR market type's display label from "District
+        # Victor" to "District Futures" on databases seeded before the rename.
+        await conn.execute(text(
+            "UPDATE market_templates SET name = 'District Futures' "
+            "WHERE type_key = 'DISTRICT_VICTOR' AND name = 'District Victor'"
+        ))
+        await conn.execute(text(
+            "UPDATE betting_phases SET description = "
+            "'Only District Futures markets are open — betting before any tribute is reaped' "
+            "WHERE name = 'Pre-Reaping' AND description = "
+            "'Only District Victor markets are open — betting before any tribute is reaped'"
+        ))
+        await conn.execute(text(
+            "UPDATE betting_phases SET description = "
+            "'Only District Futures and tribute score markets are open' "
+            "WHERE name = 'Pre-Games' AND description = "
+            "'Only District Victor and tribute score markets are open'"
+        ))
+
         # Add alliance_id to modifier_assignments for alliance-scoped modifiers
         rows = await conn.execute(text("PRAGMA table_info(modifier_assignments)"))
         ma_cols = {row[1] for row in rows.fetchall()}
@@ -320,6 +468,172 @@ async def _migrate_schema() -> None:
         if parlay_cols and "is_public" not in parlay_cols:
             await conn.execute(text(
                 "ALTER TABLE parlays ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT 1"
+            ))
+        if parlay_cols and "name" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN name VARCHAR(80)"
+            ))
+        if parlay_cols and "tailed_from_user_id" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN tailed_from_user_id BIGINT"
+            ))
+        if parlay_cols and "tailed_from_parlay_id" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN tailed_from_parlay_id INTEGER "
+                "REFERENCES parlays(id)"
+            ))
+        if parlay_cols and "cashout_allowed" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN cashout_allowed BOOLEAN"
+            ))
+        if parlay_cols and "cashout_rate" not in parlay_cols:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN cashout_rate REAL"
+            ))
+
+        # Move "Sponsors Open" to after Arena (was Pre-Games(0), Bloodbath(1),
+        # Sponsors Open(2), Arena(3), ... — sponsors used to open mid-Bloodbath
+        # instead of once the arena action actually starts). Guarded on the old
+        # ordering so this only runs once per DB.
+        arena_order = (await conn.execute(text(
+            "SELECT sort_order FROM betting_phases WHERE name = 'Arena'"
+        ))).scalar()
+        sponsors_open_order = (await conn.execute(text(
+            "SELECT sort_order FROM betting_phases WHERE name = 'Sponsors Open'"
+        ))).scalar()
+        if arena_order is not None and sponsors_open_order is not None and arena_order > sponsors_open_order:
+            await conn.execute(text(
+                "UPDATE betting_phases SET sort_order = :o WHERE name = 'Arena'"
+            ), {"o": sponsors_open_order})
+            await conn.execute(text(
+                "UPDATE betting_phases SET sort_order = :o WHERE name = 'Sponsors Open'"
+            ), {"o": arena_order})
+
+        # ── Multi-server isolation: add guild_id to all user-scoped tables ────────
+        # When migrating a guild-specific DB (created by copying sportsbook.db),
+        # stamp all existing rows with the real guild_id so they remain visible
+        # to guild-scoped queries.  The legacy/fallback DB (guild_id=0) keeps 0.
+        _gid = current_guild_id()
+
+        # users: recreate with composite PK (guild_id, discord_id).
+        rows = await conn.execute(text("PRAGMA table_info(users)"))
+        user_cols = {row[1] for row in rows.fetchall()}
+        if "guild_id" not in user_cols:
+            await conn.execute(text("PRAGMA foreign_keys = OFF"))
+            await conn.execute(text("DROP TABLE IF EXISTS users_new"))
+            await conn.execute(text("""
+                CREATE TABLE users_new (
+                    guild_id BIGINT NOT NULL DEFAULT 0,
+                    discord_id BIGINT NOT NULL,
+                    username VARCHAR(100) NOT NULL,
+                    chips INTEGER NOT NULL DEFAULT 1000,
+                    total_wagered INTEGER NOT NULL DEFAULT 0,
+                    total_won INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, discord_id)
+                )
+            """))
+            await conn.execute(
+                text("""
+                    INSERT INTO users_new
+                    SELECT :gid, discord_id, username, chips,
+                           IFNULL(total_wagered, 0), IFNULL(total_won, 0),
+                           IFNULL(created_at, CURRENT_TIMESTAMP)
+                    FROM users
+                """),
+                {"gid": _gid},
+            )
+            await conn.execute(text("DROP TABLE users"))
+            await conn.execute(text("ALTER TABLE users_new RENAME TO users"))
+            await conn.execute(text("PRAGMA foreign_keys = ON"))
+
+        # bets / parlays / pending_parlay_legs / betting_restrictions: add guild_id
+        rows = await conn.execute(text("PRAGMA table_info(bets)"))
+        if "guild_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE bets ADD COLUMN guild_id BIGINT NOT NULL DEFAULT 0"
+            ))
+            if _gid:
+                await conn.execute(
+                    text("UPDATE bets SET guild_id = :gid WHERE guild_id = 0"),
+                    {"gid": _gid},
+                )
+
+        rows = await conn.execute(text("PRAGMA table_info(parlays)"))
+        if "guild_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN guild_id BIGINT NOT NULL DEFAULT 0"
+            ))
+            if _gid:
+                await conn.execute(
+                    text("UPDATE parlays SET guild_id = :gid WHERE guild_id = 0"),
+                    {"gid": _gid},
+                )
+
+        rows = await conn.execute(text("PRAGMA table_info(pending_parlay_legs)"))
+        if "guild_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE pending_parlay_legs ADD COLUMN guild_id BIGINT NOT NULL DEFAULT 0"
+            ))
+            if _gid:
+                await conn.execute(
+                    text("UPDATE pending_parlay_legs SET guild_id = :gid WHERE guild_id = 0"),
+                    {"gid": _gid},
+                )
+
+        rows = await conn.execute(text("PRAGMA table_info(betting_restrictions)"))
+        if "guild_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE betting_restrictions ADD COLUMN guild_id BIGINT NOT NULL DEFAULT 0"
+            ))
+            if _gid:
+                await conn.execute(
+                    text("UPDATE betting_restrictions SET guild_id = :gid WHERE guild_id = 0"),
+                    {"gid": _gid},
+                )
+
+        # Rename game_settings key: active_phase_id → current_phase_id (key renamed in lemonade)
+        old_phase_row = (await conn.execute(
+            text("SELECT value FROM game_settings WHERE key='active_phase_id'")
+        )).fetchone()
+        if old_phase_row:
+            await conn.execute(text(
+                "INSERT OR REPLACE INTO game_settings (key, value) VALUES ('current_phase_id', :v)"
+            ), {"v": old_phase_row[0]})
+            await conn.execute(text("DELETE FROM game_settings WHERE key='active_phase_id'"))
+
+        # Backfill any guild_id=0 rows left by an earlier migration run (e.g. if
+        # the bot was updated after the guild DB was first created with old code).
+        if _gid:
+            # users has a composite PK (guild_id, discord_id) so promote only rows
+            # that have no existing guild-specific counterpart, then drop duplicates.
+            await conn.execute(
+                text("""
+                    UPDATE users SET guild_id = :gid
+                    WHERE guild_id = 0
+                    AND discord_id NOT IN (
+                        SELECT discord_id FROM users WHERE guild_id = :gid
+                    )
+                """),
+                {"gid": _gid},
+            )
+            await conn.execute(
+                text("DELETE FROM users WHERE guild_id = 0"),
+            )
+            # Simple tables: just reassign the 0 rows.
+            for _table in ("bets", "parlays", "pending_parlay_legs", "betting_restrictions"):
+                await conn.execute(
+                    text(f"UPDATE {_table} SET guild_id = :gid WHERE guild_id = 0"),  # noqa: S608
+                    {"gid": _gid},
+                )
+
+        rows = await conn.execute(text("PRAGMA table_info(chip_requests)"))
+        if "converted_amount" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text("ALTER TABLE chip_requests ADD COLUMN converted_amount INTEGER"))
+            # Backfill existing rows as 1:1 — the rate every past request was
+            # actually created under, before per-role/user rates existed.
+            await conn.execute(text(
+                "UPDATE chip_requests SET converted_amount = amount WHERE converted_amount IS NULL"
             ))
 
 
@@ -343,7 +657,7 @@ _BUILTIN_MARKET_TYPES = [
     ("COMBINED_DISTRICT_SCORE", "Combined District Training Score",     "VERY_HARD", "Guess the combined training scores of both district tributes. Resolves when Pre-Games ends."),
     ("TRAINING_SCORE_OU",       "Training Score Over/Under",            "EASY",      "Bet over or under on a tribute's training score. Resolves when Pre-Games ends."),
     # ── District-level markets ─────────────────────────────────────────────────
-    ("DISTRICT_VICTOR",         "District Victor",                      "HARD",      "Bet on which district the victor will come from. Resolves at game end."),
+    ("DISTRICT_VICTOR",         "District Futures",                     "HARD",      "Bet on which district the victor will come from. Resolves at game end."),
     ("DISTRICT_KILLS_OU",       "District Total Kills Over/Under",      "MODERATE",  "Bet over or under on a district's combined kill total. Resolves at game end."),
     ("DISTRICT_BOTH_BLOODBATH", "District Both Survive Bloodbath",      "MODERATE",  "Both district tributes survive the opening bloodbath. Resolves when Bloodbath ends."),
     ("DISTRICT_BOTH_FINAL_8",   "District Both Make Final 8",           "HARD",      "Both district tributes are alive when the Final 8 phase begins."),
@@ -353,7 +667,6 @@ _BUILTIN_MARKET_TYPES = [
     # ── Alliance-level markets ─────────────────────────────────────────────────
     ("ALLIANCE_VICTOR",         "Alliance Victor",                      "HARD",      "A member of the alliance wins the Games. Resolves at game end."),
     ("ALLIANCE_KILLS_OU",       "Alliance Total Kills Over/Under",      "MODERATE",  "Bet over or under on the alliance's combined kill total. Resolves at game end."),
-    ("ALLIANCE_ALL_BLOODBATH",  "Alliance All Survive Bloodbath",       "MODERATE",  "All alliance members survive the opening bloodbath. Resolves when Bloodbath ends."),
     ("ALLIANCE_ALL_FINAL_8",    "Alliance All Make Final 8",            "HARD",      "All alliance members are alive when the Final 8 phase begins."),
     ("ALLIANCE_ONE_FINAL_8",    "Alliance At Least One Makes Final 8",  "MODERATE",  "At least one alliance member is alive when the Final 8 phase begins."),
     ("ALLIANCE_ALL_FINAL_5",    "Alliance All Make Final 5",            "VERY_HARD", "All alliance members are alive when the Final 5 phase begins."),
@@ -374,7 +687,6 @@ _BUILTIN_MARKET_TYPES = [
     ("DISTRICT_WIPED_BLOODBATH","District Wiped in Bloodbath",          "HARD",      "Both district tributes are killed during the opening bloodbath. Auto-resolves when Arena phase begins."),
     # ── New alliance-level markets ─────────────────────────────────────────────
     ("ALLIANCE_RUNNER_UP",      "Alliance Produces Runner-Up",          "HARD",      "A member of this alliance finishes 2nd overall. Auto-resolves at game end."),
-    ("ALLIANCE_WIPED_BLOODBATH","Alliance Wiped in Bloodbath",          "VERY_HARD", "All alliance members are killed during the opening bloodbath. Auto-resolves when Arena phase begins."),
     # ── Game-level prop markets ────────────────────────────────────────────────
     ("BLOODBATH_KILLS_OU",      "Bloodbath Kills Over/Under",           "MODERATE",  "Over or under on total tribute-on-tribute kills scored during the bloodbath. Auto-resolves when Arena phase begins."),
     ("BLOODBATH_DEATHS_OU",     "Bloodbath Deaths Over/Under",          "MODERATE",  "Over or under on total tribute deaths in the bloodbath. Auto-resolves when Bloodbath phase ends."),
@@ -391,6 +703,11 @@ _BUILTIN_MARKET_TYPES = [
     ("GAMES_FEAST",             "Games Features a Feast",               "MODERATE",  "The Games will feature a Cornucopia feast event. Resolves manually."),
     ("GAMES_BETRAYAL",          "Games Features a Betrayal",            "MODERATE",  "The Games will feature a notable alliance betrayal. Resolves manually."),
     ("DISTRICT_PARTNER_KILL",   "Games Features a District Partner Kill","HARD",     "Any tribute kills their own district partner during the Games. Auto-resolves at game end."),
+    # ── District-partner comparison markets ────────────────────────────────────
+    ("PARTNER_SCORE_HIGHER",    "Scores Higher Than District Partner",  "MODERATE",  "This tribute scores higher than their district partner in training. Auto-resolves when Pre-Games ends."),
+    ("PARTNER_SCORE_LOWER",     "Scores Lower Than District Partner",   "MODERATE",  "This tribute scores lower than their district partner in training. Auto-resolves when Pre-Games ends."),
+    ("PARTNER_PLACE_HIGHER",    "Places Higher Than District Partner",  "MODERATE",  "This tribute finishes in a higher placement than their district partner. Auto-resolves at game end."),
+    ("PARTNER_PLACE_LOWER",     "Places Lower Than District Partner",   "MODERATE",  "This tribute finishes in a lower placement than their district partner. Auto-resolves at game end."),
 ]
 
 
@@ -398,7 +715,10 @@ async def _seed_defaults() -> None:
     defaults = {
         "cashout_allowed": json.dumps(config.CASHOUT_ALLOWED),
         "cashout_rate": json.dumps(config.CASHOUT_RATE),
+        "single_payout_cap": json.dumps(config.SINGLE_PAYOUT_CAP),
+        "parlay_payout_cap": json.dumps(config.PARLAY_PAYOUT_CAP),
         "game_active": json.dumps(False),
+        "betting_paused": json.dumps(False),
         "default_chips": json.dumps(config.DEFAULT_CHIPS),
         "current_phase_id": json.dumps(None),
         "sponsor_state": json.dumps(None),
@@ -422,10 +742,11 @@ async def _seed_defaults() -> None:
         )
         if phase_count == 0:
             default_phases = [
-                ("Pre-Games",        "Only District Victor and tribute score markets are open", 0),
+                ("Pre-Reaping",      "Only District Futures markets are open — betting before any tribute is reaped", -1),
+                ("Pre-Games",        "Only District Futures and tribute score markets are open", 0),
                 ("Bloodbath",        "The initial cornucopia bloodbath — bloodbath markets open", 1),
-                ("Sponsors Open",    "Sponsorship window opens — funded districts surge",         2),
-                ("Arena",            "The arena opens — all remaining markets go live",           3),
+                ("Arena",            "The arena opens — all remaining markets go live",           2),
+                ("Sponsors Open",    "Sponsorship window opens — funded districts surge",         3),
                 ("Sponsors Closing", "Sponsorship window closes — funding edge fades",            4),
                 ("Final 8",          "The top 8 tributes remain",                                 5),
                 ("Final 5",          "The top 5 tributes remain",                                 6),
@@ -469,3 +790,25 @@ async def get_guild_setting(guild_id: int, key: str) -> str | None:
 
 async def set_guild_setting(guild_id: int, key: str, value) -> None:
     await set_setting(f"{guild_id}:{key}", value)
+
+
+# Shared verbatim by the bot's global command-tree check, the web dashboard's
+# login gate, and the Activity's token exchange, so a Tribute-locked user is
+# blocked identically everywhere with the exact same message.
+TRIBUTE_LOCK_MESSAGE = "Your status as a tribute prevents you from interacting with the sportsbook."
+
+
+async def get_tribute_lock(session, guild_id: int, discord_user_id: int) -> TributeLock | None:
+    """Return the TributeLock row for this user in this guild, or None.
+
+    Takes a plain AsyncSession so it works whether called with a bot-side
+    session (get_session/get_read_session) or a web-side one (web/database.py's
+    get_db) — the query itself doesn't care which engine produced the session.
+    """
+    result = await session.execute(
+        select(TributeLock).where(
+            TributeLock.guild_id == guild_id,
+            TributeLock.discord_user_id == discord_user_id,
+        )
+    )
+    return result.scalar_one_or_none()

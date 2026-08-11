@@ -1,4 +1,4 @@
-# Capitol Sportsbook — Discord Activity Setup
+# Panem Sportsbook — Discord Activity Setup
 
 The bot ships an **embedded Discord Activity**: an in-Discord UI for browsing
 markets/odds/leaderboard, placing bets and parlays, tailing public slips, and (for
@@ -91,7 +91,7 @@ Then set the Dev Portal **URL Mapping target** to that tunnel host
 ## 5. Launching & testing
 
 - **In Discord:** join a voice channel → **Activities** (rocket) button →
-  **Capitol Sportsbook**. Or run `/play` for instructions + a browser link.
+  **Panem Sportsbook**. Or run `/play` for instructions + a browser link.
 - **Standalone (no Discord):** open `https://<your-host>/activity`. The SDK handshake
   only runs inside Discord; for quick UI/API testing in a plain tab you can append a
   pre-minted token, e.g. `…/activity?token=<bearer>` (mint one in a Python shell with

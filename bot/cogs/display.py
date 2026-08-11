@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from sqlalchemy import select, func, or_
 
-from bot.database.engine import get_session, get_read_session, get_setting
-from bot.database.models import Alliance, Bet, BettingPhase, Market, MarketTemplate, Tribute, User
+from bot.database.engine import (
+    get_session, get_read_session, get_setting, current_guild_id,
+    get_guild_setting, set_guild_setting, set_guild_context,
+)
+from bot.database.models import Alliance, Bet, BettingPhase, Market, MarketTemplate, Parlay, Tribute, User
 from bot.imaging.hot_odds import (
     BoardCardData, FeaturedMarket, TributeDetailData,
     render_hot_odds, render_tribute_detail,
@@ -107,12 +111,15 @@ async def _tribute_autocomplete(
     return choices[:25]
 
 
-async def _get_or_create_user(session, member: discord.Member) -> User:
-    u = await session.get(User, member.id)
+async def _get_or_create_user(session, member: discord.Member, guild_id: int) -> User:
+    result = await session.execute(
+        select(User).where(User.guild_id == guild_id, User.discord_id == member.id)
+    )
+    u = result.scalar_one_or_none()
     if u is None:
         default_raw = await get_setting("default_chips")
         default = json.loads(default_raw) if default_raw else 1000
-        u = User(discord_id=member.id, username=member.display_name, chips=default)
+        u = User(guild_id=guild_id, discord_id=member.id, username=member.display_name, chips=default)
         session.add(u)
         await session.flush()
     else:
@@ -139,6 +146,26 @@ _MODE_BUTTON_LABELS = {
     "alliance": "Alliance Odds",
     "tribute":  "Tribute Odds",
 }
+
+# Default check cadence for the live odds-updates watcher (see
+# `/settings odds_updates`) when a guild hasn't customized it.
+DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES = 5
+
+# Default announcement text and odds-movers bar when a guild hasn't
+# customized them (see `/settings odds_updates_message` / `odds_updates_threshold`).
+DEFAULT_ODDS_UPDATE_MESSAGE = "📈 **The odds have moved!** Check them out and place your bets!"
+DEFAULT_ODDS_UPDATE_THRESHOLD = 100
+
+
+def _decode_setting(raw: str | None, default=None):
+    """Decode a JSON-encoded guild-setting value, treating both "never set"
+    (``raw is None``) and "explicitly cleared" (stored as JSON ``null``) as
+    ``default`` — a bare ``if raw else default`` gets this wrong since the
+    string ``"null"`` is truthy."""
+    if raw is None:
+        return default
+    value = json.loads(raw)
+    return default if value is None else value
 # The headline moneyline shown as the board cards is excluded from each mode's
 # featured strip so the two halves never duplicate.
 _HEADLINE_TYPE = {
@@ -226,13 +253,17 @@ def _build_board(
 
     elif mode == "district":
         victor = {m.placement_num: m.odds for m in markets if m.type == "DISTRICT_VICTOR"}
-        for d in sorted({t.district for t in tributes}):
+        # District moneylines can be open (Pre-Reaping) before any tribute has
+        # been reaped into a district, so the card list comes from the markets
+        # themselves rather than `tributes` — otherwise an empty roster means
+        # zero cards even though all 12 district odds are live.
+        for d in sorted(set(victor) | {t.district for t in tributes}):
             members = [t for t in tributes if t.district == d]
             cards.append(BoardCardData(
                 badge=f"D{d}",
                 name=f"District {d}",
                 odds=victor.get(d),
-                status=_group_status([t.status for t in members]),
+                status=_group_status([t.status for t in members]) if members else "PENDING",
                 sort_key=(d,),
             ))
 
@@ -327,9 +358,209 @@ class OddsBoardView(discord.ui.View):
                 pass
 
 
+# Shared across the /leaderboard Discord command, the web dashboard's
+# /leaderboard page, and the Activity's /leaderboard tab, so all three surfaces
+# stay in sync on which categories exist and how each one is computed.
+LEADERBOARD_CATEGORIES = [
+    ("CHIPS", "Most Chips"),
+    ("CHIPS_BET", "Most Chips Bet"),
+    ("BETS_WON", "Most Bets Won"),
+    ("PARLAYS_WON", "Most Parlays Won"),
+    ("PARLAYS_TAILED", "Most Tailed Parlays"),
+]
+
+
+async def _leaderboard_rows(
+    session, guild_id: int, category: str, limit: int
+) -> tuple[str, str, list[tuple[int, int]]]:
+    """Return ``(title, value_kind, rows)`` for a leaderboard category.
+
+    ``value_kind`` is ``"chips"`` or ``"count"`` so callers know how to format
+    the value; ``rows`` is ``[(discord_id, value), ...]`` best-first.
+    """
+    if category == "CHIPS_BET":
+        title, kind = "Most Chips Bet", "chips"
+        result = await session.execute(
+            select(User.discord_id, User.total_wagered)
+            .where(User.guild_id == guild_id, User.total_wagered > 0)
+            .order_by(User.total_wagered.desc())
+            .limit(limit)
+        )
+    elif category == "BETS_WON":
+        title, kind = "Most Bets Won", "count"
+        result = await session.execute(
+            select(Bet.user_id, func.count(Bet.id))
+            .where(Bet.guild_id == guild_id, Bet.status == "WON")
+            .group_by(Bet.user_id)
+            .order_by(func.count(Bet.id).desc())
+            .limit(limit)
+        )
+    elif category == "PARLAYS_WON":
+        title, kind = "Most Parlays Won", "count"
+        result = await session.execute(
+            select(Parlay.user_id, func.count(Parlay.id))
+            .where(Parlay.guild_id == guild_id, Parlay.status == "WON")
+            .group_by(Parlay.user_id)
+            .order_by(func.count(Parlay.id).desc())
+            .limit(limit)
+        )
+    elif category == "PARLAYS_TAILED":
+        title, kind = "Most Tailed Parlays", "count"
+        result = await session.execute(
+            select(Parlay.tailed_from_user_id, func.count(Parlay.id))
+            .where(Parlay.guild_id == guild_id, Parlay.tailed_from_user_id.isnot(None))
+            .group_by(Parlay.tailed_from_user_id)
+            .order_by(func.count(Parlay.id).desc())
+            .limit(limit)
+        )
+    else:  # CHIPS
+        title, kind = "Most Chips", "chips"
+        result = await session.execute(
+            select(User.discord_id, User.chips)
+            .where(User.guild_id == guild_id)
+            .order_by(User.chips.desc())
+            .limit(limit)
+        )
+    return title, kind, list(result.all())
+
+
 class DisplayCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        self._odds_watch_loop.start()
+
+    async def cog_unload(self) -> None:
+        self._odds_watch_loop.cancel()
+
+    # ── Live odds-updates watcher (see /settings odds_updates) ─────────────────
+    # Runs on a fixed 1-minute tick across every joined guild; each guild's own
+    # `odds_updates_interval_minutes` setting decides how often it's actually
+    # due, so different servers can run this at their own customized cadence
+    # off of one shared loop rather than needing a dynamic per-guild task.
+
+    @tasks.loop(minutes=1)
+    async def _odds_watch_loop(self) -> None:
+        for guild in list(self.bot.guilds):
+            try:
+                await self._check_odds_updates(guild)
+            except Exception:
+                log.exception(f"Odds-updates check failed for guild {guild.id}")
+
+    @_odds_watch_loop.before_loop
+    async def _before_odds_watch_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _check_odds_updates(self, guild: discord.Guild) -> None:
+        set_guild_context(guild.id)
+
+        channel_id = _decode_setting(await get_guild_setting(guild.id, "odds_updates_channel_id"))
+        if channel_id is None:
+            return
+        channel = self.bot.get_channel(channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return
+
+        interval_minutes = _decode_setting(
+            await get_guild_setting(guild.id, "odds_updates_interval_minutes"),
+            DEFAULT_ODDS_UPDATE_INTERVAL_MINUTES,
+        )
+
+        last_checked = _decode_setting(await get_guild_setting(guild.id, "odds_updates_last_checked_at"), 0)
+        now = time.time()
+        if now - last_checked < interval_minutes * 60:
+            return
+        await set_guild_setting(guild.id, "odds_updates_last_checked_at", now)
+
+        async with get_session() as session:
+            tributes = list((await session.execute(
+                select(Tribute).order_by(Tribute.district)
+            )).scalars().all())
+            if not tributes:
+                return
+            alliances = list((await session.execute(
+                select(Alliance).order_by(Alliance.name)
+            )).scalars().all())
+            markets = list((await session.execute(
+                select(Market).where(Market.status == "OPEN").order_by(Market.id)
+            )).scalars().all())
+            bet_count_rows = await session.execute(
+                select(Bet.market_id, func.count(Bet.id).label("cnt"))
+                .where(Bet.parlay_id.is_(None))
+                .join(Market, Bet.market_id == Market.id)
+                .where(Market.status == "OPEN")
+                .where(Market.type != "TRIBUTE_WINS")
+                .group_by(Bet.market_id)
+            )
+            bet_counts = {row.market_id: row.cnt for row in bet_count_rows.all()}
+
+        cards, featured = _build_board("tribute", tributes, alliances, markets, bet_counts)
+
+        # Per-tribute odds snapshot drives both change-detection and the
+        # odds-movers embed below, which needs each tribute's before/after
+        # odds rather than just a "something changed" fingerprint.
+        win_odds = {m.tribute_a_id: m.odds for m in markets if m.type == "TRIBUTE_WINS"}
+        new_snapshot = {
+            str(t.id): {
+                "name": t.name, "district": t.district, "gender": t.display_gender,
+                "odds": win_odds.get(t.id), "status": t.status,
+            }
+            for t in tributes
+        }
+
+        previous_snapshot = _decode_setting(await get_guild_setting(guild.id, "odds_updates_last_snapshot"))
+        await set_guild_setting(guild.id, "odds_updates_last_snapshot", new_snapshot)
+
+        # First check ever for this guild (no baseline yet) — record it
+        # silently rather than posting, since nothing has actually "changed".
+        if previous_snapshot is None or previous_snapshot == new_snapshot:
+            return
+
+        from bot.imaging.hot_odds import DEFAULT_ANNOUNCEMENT
+        ann_raw = await get_setting("capitol_announcement")
+        announcement = json.loads(ann_raw) if ann_raw else None
+        buf = await render_async(
+            render_hot_odds, cards, featured, 0,
+            _BOARD_TITLES["tribute"], _FEATURED_TITLES["tribute"],
+            announcement or DEFAULT_ANNOUNCEMENT,
+        )
+        f = buf_to_discord_file(buf, "hot_odds.png")
+
+        # Odds-movers embed: only tributes present in both snapshots with
+        # known odds on both sides, and only if the swing clears the bar —
+        # skipped entirely (no embed) when nothing clears it.
+        threshold = _decode_setting(
+            await get_guild_setting(guild.id, "odds_updates_threshold"), DEFAULT_ODDS_UPDATE_THRESHOLD
+        )
+        movers = []
+        for tid, new in new_snapshot.items():
+            old = previous_snapshot.get(tid)
+            if old is None or old["odds"] is None or new["odds"] is None:
+                continue
+            diff = new["odds"] - old["odds"]
+            if abs(diff) >= threshold:
+                movers.append((abs(diff), diff, old, new))
+        movers.sort(key=lambda m: -m[0])
+
+        embeds = []
+        if movers:
+            embed = discord.Embed(title="📊 Odds Movers", color=0xC9A227)
+            lines = [
+                f"**{new['name']}** (D{new['district']}{new['gender']}) — "
+                f"{fmt_odds(old['odds'])} → {fmt_odds(new['odds'])}  ({diff:+d})"
+                for _, diff, old, new in movers
+            ]
+            _add_field_chunks(embed, f"Moved ±{threshold} or more since the last update", lines)
+            embeds.append(embed)
+
+        message = _decode_setting(
+            await get_guild_setting(guild.id, "odds_updates_message"), DEFAULT_ODDS_UPDATE_MESSAGE
+        )
+        try:
+            await channel.send(content=message, file=f, embeds=embeds)
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning(f"Failed to post odds update to channel {channel.id} in guild {guild.id}")
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -369,7 +600,7 @@ class DisplayCog(commands.Cog):
                 )
                 return
             async with get_session() as session:
-                user = await _get_or_create_user(session, interaction.user)
+                user = await _get_or_create_user(session, interaction.user, current_guild_id())
                 user_chips = user.chips
 
                 t = await session.get(Tribute, tribute_id)
@@ -426,7 +657,7 @@ class DisplayCog(commands.Cog):
 
         # ── Full board view (District / Alliance / Tribute toggle) ────────────
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
             user_chips = user.chips
 
             trib_result = await session.execute(
@@ -469,10 +700,17 @@ class DisplayCog(commands.Cog):
         if not available:
             available = ["tribute"]
 
+        # Pre-Reaping only has DISTRICT_VICTOR markets open — some tributes may
+        # already be reaped (and thus have per-tribute markets seeded) before the
+        # phase advances to Pre-Games, so hide those modes rather than relying on
+        # `tributes`/`alliances` being empty.
+        if phase_name == "Pre-Reaping" and "district" in available:
+            available = ["district"]
+
         # Pregames default to the district board (the headline early-stage view);
         # individual tribute victor odds are open too and reachable via the toggle.
         # Every other phase defaults to the tribute board.
-        if phase_name == "Pre-Games" and "district" in available:
+        if phase_name in ("Pre-Reaping", "Pre-Games") and "district" in available:
             mode = "district"
         else:
             mode = "tribute" if "tribute" in available else available[0]
@@ -584,7 +822,7 @@ class DisplayCog(commands.Cog):
     async def balance(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user)
+            user = await _get_or_create_user(session, interaction.user, current_guild_id())
             chips = user.chips
             wagered = user.total_wagered
             won = user.total_won
@@ -604,33 +842,54 @@ class DisplayCog(commands.Cog):
 
     # ── /leaderboard ──────────────────────────────────────────────────────────
 
-    @app_commands.command(name="leaderboard", description="View the top chip holders")
-    async def leaderboard(self, interaction: discord.Interaction) -> None:
+    _LEADERBOARD_TOP_N = 10
+
+    @app_commands.command(name="leaderboard", description="View the sportsbook leaderboard")
+    @app_commands.describe(category="Which leaderboard to show")
+    @app_commands.choices(category=[
+        app_commands.Choice(name=label, value=value) for value, label in LEADERBOARD_CATEGORIES
+    ])
+    async def leaderboard(
+        self,
+        interaction: discord.Interaction,
+        category: app_commands.Choice[str] | None = None,
+    ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
-        async with get_session() as session:
-            result = await session.execute(
-                select(User).order_by(User.chips.desc()).limit(10)
-            )
-            users = result.scalars().all()
+        cat = category.value if category else "CHIPS"
+        gid = current_guild_id()
+        n = self._LEADERBOARD_TOP_N
 
-        if not users:
+        async with get_session() as session:
+            title, kind, rows = await _leaderboard_rows(session, gid, cat, n)
+            fmt = fmt_chips if kind == "chips" else str
+
+            usernames: dict[int, str] = {}
+            ids = {uid for uid, _ in rows}
+            if ids:
+                user_result = await session.execute(
+                    select(User.discord_id, User.username)
+                    .where(User.guild_id == gid, User.discord_id.in_(ids))
+                )
+                usernames = {uid: name for uid, name in user_result.all()}
+
+        if not rows:
             await interaction.followup.send("No players yet.", ephemeral=True)
             return
 
-        embed = discord.Embed(
-            title="🏆 CAPITOL LEADERBOARD — TOP BETTORS",
-            color=0xFFD700,
-        )
-
         medals = ["🥇", "🥈", "🥉"]
         lines = []
-        for i, u in enumerate(users):
+        for i, (user_id, value) in enumerate(rows):
             medal = medals[i] if i < 3 else f"**{i + 1}.**"
-            lines.append(f"{medal} **{u.username}** — {fmt_chips(u.chips)}")
+            name = usernames.get(user_id, "Member")
+            lines.append(f"{medal} **{name}** — {fmt(value)}")
 
-        embed.description = "\n".join(lines)
-        embed.set_footer(text="Balances update in real time.")
+        embed = discord.Embed(
+            title=f"🏆 Sportsbook Leaderboard — {title}",
+            description="\n".join(lines),
+            color=0xFFD700,
+        )
+        embed.set_footer(text="Updates in real time.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 

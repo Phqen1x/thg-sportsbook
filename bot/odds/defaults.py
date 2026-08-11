@@ -435,14 +435,18 @@ def kill_quality_multiplier(victim_win_prob: float, field_avg_prob: float) -> fl
     return max(KILL_QUALITY_MIN, min(KILL_QUALITY_MAX, mult))
 
 
-# ── District-pair kill suppression ───────────────────────────────────────────
+# ── District-pair / alliance kill suppression ────────────────────────────────
 # Tributes from the same district are paired together and rarely fight each
 # other. DISTRICT_PAIR_KILL_SUPPRESSION is the base multiplier on the raw
 # KILL_EVENT probability when both tributes share a district.
-# If they also belong to *opposing* alliances (each has an alliance_id and
-# those ids differ), competing loyalties make conflict more plausible, so a
-# less severe multiplier is used instead.
+# Allies are voluntarily bonded rather than forced together like district
+# partners, so cross-district allies get a lighter (but still significant)
+# ALLIANCE_PAIR_KILL_SUPPRESSION instead of the district figure.
+# If two same-district tributes belong to *opposing* alliances (each has an
+# alliance_id and those ids differ), competing loyalties make conflict more
+# plausible, so a less severe multiplier is used instead.
 DISTRICT_PAIR_KILL_SUPPRESSION = 0.10
+ALLIANCE_PAIR_KILL_SUPPRESSION = 0.20
 OPPOSING_ALLIANCE_KILL_SUPPRESSION = 0.35
 
 
@@ -462,23 +466,33 @@ def kill_boost_dr_factor(kills_before: int, national_kill_record: int | None) ->
 
 
 def district_pair_kill_factor(tribute_a: "Tribute", tribute_b: "Tribute") -> float:
-    """Probability suppression for a KILL_EVENT between same-district tributes.
+    """Probability suppression for a KILL_EVENT between bonded tributes.
 
-    Returns 1.0 (no change) when the two tributes are from different districts.
-    Returns DISTRICT_PAIR_KILL_SUPPRESSION for district partners with aligned
-    or no alliance affiliation, and OPPOSING_ALLIANCE_KILL_SUPPRESSION when
-    both belong to different alliances — less suppression because their
-    competing alliance loyalties override the usual district bond.
+    Returns 1.0 (no change) when the two tributes share neither a district nor
+    an alliance. Returns DISTRICT_PAIR_KILL_SUPPRESSION for district partners
+    with aligned or no alliance affiliation, ALLIANCE_PAIR_KILL_SUPPRESSION for
+    allies from different districts, and OPPOSING_ALLIANCE_KILL_SUPPRESSION
+    when same-district tributes belong to different alliances — less
+    suppression because their competing alliance loyalties override the usual
+    district bond.
     """
-    if tribute_a.district != tribute_b.district:
-        return 1.0
-    if (
+    same_district = tribute_a.district == tribute_b.district
+    same_alliance = (
+        tribute_a.alliance_id is not None
+        and tribute_a.alliance_id == tribute_b.alliance_id
+    )
+    opposing_alliance = (
         tribute_a.alliance_id is not None
         and tribute_b.alliance_id is not None
         and tribute_a.alliance_id != tribute_b.alliance_id
-    ):
+    )
+    if same_district and opposing_alliance:
         return OPPOSING_ALLIANCE_KILL_SUPPRESSION
-    return DISTRICT_PAIR_KILL_SUPPRESSION
+    if same_district:
+        return DISTRICT_PAIR_KILL_SUPPRESSION
+    if same_alliance:
+        return ALLIANCE_PAIR_KILL_SUPPRESSION
+    return 1.0
 
 
 def _p_top_k(strength: float, k: int) -> float:
@@ -527,6 +541,10 @@ def strength_hurts(market_type: str, ou_side: str | None) -> bool:
     if market_type in ("FIRST_IN_ALLIANCE_DEATH", "FIRST_TRIBUTE_TO_DIE",
                         "LOWEST_TRAINING_SCORE"):
         return True   # stronger tribute is LESS likely for these markets
+    if market_type in ("TRIBUTE_KILLED_BLOODBATH", "PARTNER_SCORE_LOWER",
+                        "PARTNER_PLACE_LOWER"):
+        return True   # complementary to BLOODBATH_SURVIVOR / *_HIGHER — a
+                       # strength boost must push these DOWN, not up
     return False
 
 
@@ -809,6 +827,26 @@ def default_odds(
         prob = p_over if ou_side == "OVER" else 1.0 - p_over
         return prob_to_american(prob)
 
+    if market_type in (
+        "PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER",
+        "PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER",
+    ):
+        # Head-to-head probability: tribute_a's share of the two-tribute strength pool.
+        # Same formula for score and placement comparisons — training score is the
+        # best pre-Games proxy for relative finishing order as well.
+        # Both sides must be compressed the same way (score_a already is, above) —
+        # otherwise "A higher than B" and "B lower than A" price different
+        # probabilities for the same real-world outcome, since whichever tribute
+        # lands in the tribute_a slot gets its score dampened and the other doesn't.
+        score_b = (
+            _compress(tribute_b.training_score or 6, field_mean)
+            if tribute_b is not None and tribute_b.status == "ALIVE"
+            else 1.0
+        )
+        p_a_wins = score_a / max(score_a + score_b, 1)
+        prob = p_a_wins if market_type in ("PARTNER_SCORE_HIGHER", "PARTNER_PLACE_HIGHER") else 1.0 - p_a_wins
+        return prob_to_american(max(0.01, min(0.99, prob)))
+
     return DEFAULT_FALLBACK_ODDS
 
 
@@ -915,7 +953,7 @@ def district_default_odds(
         m = int(math.floor(line)) + 1
         p_over = _poisson_at_least(m, lam)
         prob = p_over if ou_side == "OVER" else 1.0 - p_over
-        return prob_to_american(prob)
+        return prob_to_american(max(0.01, min(0.99, prob)))
 
     if market_type == "DISTRICT_BOTH_BLOODBATH":
         sum_inv = sum(1.0 / max(s, 1) for s in alive_all_scores) or 1.0
@@ -988,6 +1026,33 @@ def district_default_odds(
     return DEFAULT_FALLBACK_ODDS
 
 
+def pre_reaping_district_odds(
+    district_records: "dict[int, DistrictRecord]",
+) -> dict[int, int]:
+    """Opening DISTRICT_VICTOR odds for all 12 districts before any tribute has
+    been reaped — there's no roster or training score to price from yet, so
+    this is the only district-market pricing path driven purely by each
+    district's historical reputation rather than the current field.
+
+    Each district starts from a flat 1/12 field share, nudged by
+    ``reputation_factor`` (bounded to ±10% per district at the reputation
+    extremes), then the 12 shares are renormalized back to a probability
+    distribution so the field still sums to ~100% before conversion.
+    """
+    baseline = 1.0 / 12
+    raw = {
+        d: baseline * reputation_factor(
+            district_records[d].reputation if d in district_records else None
+        )
+        for d in range(1, 13)
+    }
+    total = sum(raw.values()) or 1.0
+    return {
+        d: prob_to_american(max(0.01, min(0.99, p / total)))
+        for d, p in raw.items()
+    }
+
+
 def alliance_default_odds(
     market_type: str,
     alliance_members: list["Tribute"],
@@ -1035,28 +1100,6 @@ def alliance_default_odds(
         p_over = _poisson_at_least(m, lam)
         prob = p_over if ou_side == "OVER" else 1.0 - p_over
         return prob_to_american(prob)
-
-    if market_type == "ALLIANCE_ALL_BLOODBATH":
-        sum_inv = sum(1.0 / max(s, 1) for s in alive_all_scores) or 1.0
-        p_all = 1.0
-        for t in alive:
-            inv = 1.0 / max(t.training_score or 6, 1)
-            p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
-            p_death = max(0.03, min(0.92, p_death))
-            p_survive = (1.0 - p_death) * _wf(t)
-            p_all *= max(0.03, min(0.97, p_survive))
-        return prob_to_american(max(0.01, min(0.99, p_all)))
-
-    if market_type == "ALLIANCE_WIPED_BLOODBATH":
-        sum_inv = sum(1.0 / max(s, 1) for s in alive_all_scores) or 1.0
-        p_all_dead = 1.0
-        for t in alive:
-            inv = 1.0 / max(t.training_score or 6, 1)
-            p_death = BLOODBATH_DEATH_FRACTION * n * (inv / sum_inv)
-            p_death = max(0.03, min(0.92, p_death))
-            p_die = p_death * _wf(t)
-            p_all_dead *= max(0.03, min(0.97, p_die))
-        return prob_to_american(max(0.01, min(0.99, p_all_dead)))
 
     if market_type in _ALLIANCE_K_ALL:
         k = _ALLIANCE_K_ALL[market_type]
@@ -1238,16 +1281,176 @@ def game_default_odds(
 
     # GAMES_FEAST, GAMES_BETRAYAL, ANY_BB_DOUBLE_KILL — no modellable prior
 
-    if market_type in (
-        "PARTNER_SCORE_HIGHER", "PARTNER_SCORE_LOWER",
-        "PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER",
-    ):
-        # Head-to-head probability: tribute_a's share of the two-tribute strength pool.
-        # Same formula for score and placement comparisons — training score is the
-        # best pre-Games proxy for relative finishing order as well.
-        sb = (tribute_b.training_score or 6) if tribute_b is not None else 6
-        p_a_wins = score_a / max(score_a + sb, 1)
-        prob = p_a_wins if market_type in ("PARTNER_SCORE_HIGHER", "PARTNER_PLACE_HIGHER") else 1.0 - p_a_wins
-        return prob_to_american(max(0.01, min(0.99, prob)))
-
     return DEFAULT_FALLBACK_ODDS
+
+
+# ── Multi-outcome roster markets (e.g. "Fifth Career Alliance Member") ──────
+# A multi_outcome MarketTemplate prices one Market row per eligible tribute from
+# a weighted blend of curated historical factors instead of the win/kill/
+# placement formulas above, and entirely independent of them — the probability
+# distribution is normalised over just the template's eligible tributes, never
+# the whole field, so this can't be pulled toward (or pull on) any other
+# market's odds. Every factor is a multiplicative signal centered at 1.0
+# (neutral); ratio-based ones are clamped the same way _district_historical_
+# factor's _component() helper clamps district ratios in bot/cogs/admin.py.
+
+MULTI_OUTCOME_RATIO_MIN = 0.2
+MULTI_OUTCOME_RATIO_MAX = 5.0
+
+
+def _ratio_factor(value: float | None, group_values: list[float], invert: bool = False) -> float:
+    """Clamped ratio of `value` to the mean of `group_values`."""
+    if value is None or not group_values:
+        return 1.0
+    avg = sum(group_values) / len(group_values)
+    if avg <= 0:
+        return 1.0
+    if invert:
+        # A zero stat is the best possible outcome for an inverted (penalty)
+        # metric (e.g. avg_placement); treat it as the max ratio instead of
+        # dividing by zero.
+        ratio = MULTI_OUTCOME_RATIO_MAX if value <= 0 else (avg / value)
+    else:
+        ratio = value / avg
+    return max(MULTI_OUTCOME_RATIO_MIN, min(MULTI_OUTCOME_RATIO_MAX, ratio))
+
+
+def _f_tribute_kills(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    return _ratio_factor(float(tribute.kills), [float(t.kills) for t in eligible])
+
+
+def _f_tribute_bloodbath_kills(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    return _ratio_factor(float(tribute.bloodbath_kills), [float(t.bloodbath_kills) for t in eligible])
+
+
+def _f_tribute_kill_boost(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    def _kb(t: "Tribute") -> float:
+        return max(0.5, 1.0 + t.kill_boost * KILL_BOOST_SCALE)
+    return _ratio_factor(_kb(tribute), [_kb(t) for t in eligible])
+
+
+def _f_training_score(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    raw = [(t.training_score or 6) for t in eligible if t.status == "ALIVE"] or [6.0]
+    mean = sum(raw) / len(raw)
+    scores = [_compress(s, mean) for s in raw]
+    score = _compress(tribute.training_score or 6, mean) if tribute.status == "ALIVE" else mean
+    return _ratio_factor(score, scores)
+
+
+def _f_prior_experience(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    return prior_experience_factor(tribute.times_played, tribute.highest_placement)
+
+
+def _f_age(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    return age_factor(tribute.age)
+
+
+def _f_district_kill_record(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    dr = dr_map.get(tribute.district)
+    if dr is None or dr.kill_record is None:
+        return 1.0
+    vals = [float(r.kill_record) for r in all_dr if r.kill_record is not None]
+    return _ratio_factor(float(dr.kill_record), vals)
+
+
+def _f_district_bloodbath_kills(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    dr = dr_map.get(tribute.district)
+    if dr is None or dr.bloodbath_kills is None:
+        return 1.0
+    vals = [float(r.bloodbath_kills) for r in all_dr if r.bloodbath_kills is not None]
+    return _ratio_factor(float(dr.bloodbath_kills), vals)
+
+
+def _f_district_avg_placement(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    dr = dr_map.get(tribute.district)
+    if dr is None or dr.avg_placement is None:
+        return 1.0
+    vals = [float(r.avg_placement) for r in all_dr if r.avg_placement is not None]
+    # Lower average placement number is a better historical record, so invert.
+    return _ratio_factor(float(dr.avg_placement), vals, invert=True)
+
+
+def _district_wins(record: "DistrictRecord") -> float | None:
+    if record.wins is not None:
+        return float(record.wins)
+    if record.victor_male_count is not None or record.victor_female_count is not None:
+        return float((record.victor_male_count or 0) + (record.victor_female_count or 0))
+    return None
+
+
+def _f_district_victor_count(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    dr = dr_map.get(tribute.district)
+    if dr is None:
+        return 1.0
+    d_wins = _district_wins(dr)
+    vals = [w for w in (_district_wins(r) for r in all_dr) if w is not None]
+    if d_wins is None or not vals:
+        return 1.0
+    return _ratio_factor(d_wins, vals)
+
+
+def _f_district_funding_level(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    dr = dr_map.get(tribute.district)
+    return funding_factor(dr.funding_level if dr else None)
+
+
+def _f_district_reputation(tribute: "Tribute", eligible: list["Tribute"], dr_map: dict, all_dr: list) -> float:
+    dr = dr_map.get(tribute.district)
+    return reputation_factor(dr.reputation if dr else None)
+
+
+# key -> (display label, compute(tribute, eligible, dr_map, all_dr) -> multiplier).
+# This exact set of keys drives the `/admin market_type weight` command's
+# factor choices — the curated list the admin can prioritize/deprioritize per
+# roster market template.
+MULTI_OUTCOME_FACTORS: dict[str, tuple[str, "callable"]] = {
+    "tribute_kills":            ("Tribute Kills",             _f_tribute_kills),
+    "tribute_bloodbath_kills":  ("Tribute Bloodbath Kills",   _f_tribute_bloodbath_kills),
+    "tribute_kill_boost":       ("Tribute Kill Quality",      _f_tribute_kill_boost),
+    "training_score":           ("Training Score",            _f_training_score),
+    "prior_experience":         ("Prior Games Experience",    _f_prior_experience),
+    "age_factor":               ("Age",                       _f_age),
+    "district_kill_record":     ("District Kill Record",      _f_district_kill_record),
+    "district_bloodbath_kills": ("District Bloodbath Kills",  _f_district_bloodbath_kills),
+    "district_avg_placement":   ("District Avg Placement",    _f_district_avg_placement),
+    "district_victor_count":    ("District Victor Count",     _f_district_victor_count),
+    "district_funding_level":   ("District Funding Level",    _f_district_funding_level),
+    "district_reputation":      ("District Reputation",       _f_district_reputation),
+}
+
+
+def multi_outcome_odds(
+    eligible: list["Tribute"],
+    dr_map: dict[int, "DistrictRecord"],
+    all_dr: list["DistrictRecord"],
+    weight_overrides: dict[str, float] | None,
+) -> dict[int, int]:
+    """American odds for every eligible tribute in a multi_outcome roster
+    market. Each factor's clamped multiplier is combined via a weighted
+    geometric mean (not a raw product) so the combined signal stays bounded
+    near the individual factors' range regardless of how many are active —
+    the same "tempered" idea as MODIFIER_TEMPER in bot/cogs/admin.py, made
+    admin-tunable per factor. A weight of 0 drops a factor out entirely; the
+    resulting probabilities are normalised over `eligible` only, then
+    converted with prob_to_american (which applies the project's usual
+    soft-rail/score-compression safeguards).
+    """
+    weights = weight_overrides or {}
+    combined: dict[int, float] = {}
+    for t in eligible:
+        log_sum = 0.0
+        weight_sum = 0.0
+        for key, (_label, fn) in MULTI_OUTCOME_FACTORS.items():
+            w = weights.get(key, 1.0)
+            if w == 0:
+                continue
+            factor = max(0.01, fn(t, eligible, dr_map, all_dr))
+            log_sum += w * math.log(factor)
+            weight_sum += w
+        combined[t.id] = math.exp(log_sum / weight_sum) if weight_sum > 0 else 1.0
+
+    total = sum(combined.values()) or 1.0
+    return {
+        tid: prob_to_american(max(0.001, min(0.999, val / total)))
+        for tid, val in combined.items()
+    }

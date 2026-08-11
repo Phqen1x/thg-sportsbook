@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(os.environ.get("DOTENV_PATH"))
+load_dotenv(os.environ.get("DOTENV_PATH"), override=True)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -16,6 +16,9 @@ BOT_TOKEN: str = _bot.BOT_TOKEN
 ADMIN_ROLE_ID: int | None = _bot.ADMIN_ROLE_ID
 DB_PATH: str = _bot.DB_PATH
 DEFAULT_CHIPS: int = _bot.DEFAULT_CHIPS
+UPLOADS_DIR = _bot.UPLOADS_DIR
+SINGLE_PAYOUT_CAP: int = _bot.SINGLE_PAYOUT_CAP
+PARLAY_PAYOUT_CAP: int = _bot.PARLAY_PAYOUT_CAP
 
 # Web-specific
 DISCORD_CLIENT_ID: str = os.environ.get("DISCORD_CLIENT_ID", "")

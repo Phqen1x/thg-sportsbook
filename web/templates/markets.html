@@ -38,6 +38,29 @@
   <a href="/markets?status=all"      class="btn btn-sm {% if status == 'all'      %}btn-primary{% else %}btn-outline{% endif %}">All</a>
   <a href="/markets?status=resolved" class="btn btn-sm {% if status == 'resolved' %}btn-primary{% else %}btn-outline{% endif %}">Resolved</a>
   <a href="/markets?status=closed"   class="btn btn-sm {% if status == 'closed'   %}btn-primary{% else %}btn-outline{% endif %}">Closed</a>
+
+  <div class="tribute-filter" id="tribute-filter">
+    <button type="button" class="btn btn-outline btn-sm tribute-filter-btn" id="tribute-filter-btn">
+      Tributes <span class="tribute-filter-count" id="tribute-filter-count"></span> ▾
+    </button>
+    <div class="tribute-filter-menu hidden" id="tribute-filter-menu">
+      <div class="tribute-filter-menu-actions">
+        <button type="button" class="link-btn" id="tribute-filter-clear">Clear</button>
+      </div>
+      <div class="tribute-filter-list" id="tribute-filter-list"></div>
+    </div>
+  </div>
+
+  <div class="sort-row">
+    <label class="sort-label" for="mkt-sort">Sort</label>
+    <select class="form-control form-control-sm sort-select" id="mkt-sort">
+      <option value="default">Default</option>
+      <option value="name">Name (A–Z)</option>
+      <option value="odds-fav">Odds: Favorites First</option>
+      <option value="odds-long">Odds: Longshots First</option>
+      <option value="popular">Most Bets</option>
+    </select>
+  </div>
 </div>
 
 {% if featured_parlays %}
@@ -105,12 +128,16 @@
       <tr data-type="{{ market.type }}"
           data-label="{{ market.label | lower }}"
           data-ta="{{ (ta.name if ta else '') | lower }}"
-          data-tb="{{ (tb.name if tb else '') | lower }}">
+          data-tb="{{ (tb.name if tb else '') | lower }}"
+          data-ta-id="{{ market.tribute_a_id or '' }}"
+          data-tb-id="{{ market.tribute_b_id or '' }}"
+          data-odds="{{ market.odds if market.odds is not none else '' }}"
+          data-bets="{{ bet_counts.get(market.id, 0) }}">
         <td>
           <div class="market-label">{{ market.label }}</div>
           {% if ta or tb %}
           <div class="text-dim" style="font-size:0.8rem">
-            {% if ta %}{{ ta.name }}{% endif %}{% if tb %} vs {{ tb.name }}{% endif %}
+            {% if ta %}{{ ta.name }}{% endif %}{% if tb %} {{ pair_word(market.type) }} {{ tb.name }}{% endif %}
           </div>
           {% endif %}
         </td>
@@ -149,16 +176,24 @@
     </tbody>
   </table>
   <div id="no-rows" class="empty-state hidden">No markets match.</div>
+  <div class="pagination" id="mkt-pagination"></div>
 </div>
+
+<script>window.ALL_TRIBUTES = {{ all_tributes_json | safe }};</script>
+
 {% endblock %}
 
 {% block scripts %}
 <script>
 (function () {
+  const PAGE_SIZE = 24;
   const VICTOR_TYPES = new Set(["TRIBUTE_WINS","DISTRICT_VICTOR","ALLIANCE_VICTOR"]);
   const rows = Array.from(document.querySelectorAll("#markets-body tr[data-type]"));
   const noRows = document.getElementById("no-rows");
-  let activeCat = "", searchQ = "";
+  const paginationEl = document.getElementById("mkt-pagination");
+  const tbody = document.getElementById("markets-body");
+  let activeCat = "", searchQ = "", sortBy = "default", page = 1;
+  const selectedTributeIds = new Set();
 
   function matchesCat(row, cat) {
     if (!cat) return true;
@@ -171,28 +206,123 @@
     return true;
   }
 
-  function refilter() {
-    const q = searchQ.toLowerCase();
-    let shown = 0;
-    rows.forEach(r => {
-      const ok = matchesCat(r, activeCat) &&
-        (!q || r.dataset.label.includes(q) || r.dataset.ta.includes(q) || r.dataset.tb.includes(q));
-      r.style.display = ok ? "" : "none";
-      if (ok) shown++;
-    });
-    if (noRows) noRows.classList.toggle("hidden", shown > 0);
+  function matchesTributes(row) {
+    if (!selectedTributeIds.size) return true;
+    return selectedTributeIds.has(row.dataset.taId) || selectedTributeIds.has(row.dataset.tbId);
   }
+
+  function sortRows(list) {
+    const arr = [...list];
+    const odds = (r) => r.dataset.odds === "" ? null : Number(r.dataset.odds);
+    if (sortBy === "name" || sortBy === "default") arr.sort((a, b) => a.dataset.label.localeCompare(b.dataset.label, undefined, { numeric: true }));
+    else if (sortBy === "odds-fav") arr.sort((a, b) => (odds(a) ?? Infinity) - (odds(b) ?? Infinity));
+    else if (sortBy === "odds-long") arr.sort((a, b) => (odds(b) ?? -Infinity) - (odds(a) ?? -Infinity));
+    else if (sortBy === "popular") arr.sort((a, b) => Number(b.dataset.bets) - Number(a.dataset.bets));
+    return arr;
+  }
+
+  // Filtering/search/category/tribute always run over the full row set
+  // first, then sort, then pagination slices whatever matched — so search
+  // results and filtered/sorted lists page exactly like the unfiltered list.
+  function computeFiltered() {
+    const q = searchQ.toLowerCase();
+    return sortRows(rows.filter(r =>
+      matchesCat(r, activeCat) &&
+      matchesTributes(r) &&
+      (!q || r.dataset.label.includes(q) || r.dataset.ta.includes(q) || r.dataset.tb.includes(q))));
+  }
+
+  function renderPage() {
+    const filtered = computeFiltered();
+    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    page = Math.min(Math.max(page, 1), totalPages);
+    const start = (page - 1) * PAGE_SIZE;
+    const pageItems = filtered.slice(start, start + PAGE_SIZE);
+    const shown = new Set(pageItems);
+    rows.forEach(r => { r.style.display = shown.has(r) ? "" : "none"; });
+    if (tbody) pageItems.forEach(r => tbody.appendChild(r)); // reflect sort order visually
+    if (noRows) noRows.classList.toggle("hidden", filtered.length > 0);
+    renderPagination(totalPages);
+  }
+
+  function renderPagination(totalPages) {
+    if (!paginationEl) return;
+    if (totalPages <= 1) { paginationEl.innerHTML = ""; return; }
+    paginationEl.innerHTML = `
+      <button type="button" class="btn btn-outline btn-sm" id="mkt-prev"${page <= 1 ? " disabled" : ""}>Prev</button>
+      <span class="pagination-info">Page
+        <input type="number" class="pagination-page-input" id="mkt-page-input" min="1" max="${totalPages}" value="${page}">
+        of ${totalPages}
+      </span>
+      <button type="button" class="btn btn-outline btn-sm" id="mkt-next"${page >= totalPages ? " disabled" : ""}>Next</button>`;
+    document.getElementById("mkt-prev").addEventListener("click", () => { page--; renderPage(); });
+    document.getElementById("mkt-next").addEventListener("click", () => { page++; renderPage(); });
+    document.getElementById("mkt-page-input").addEventListener("change", (e) => {
+      const v = parseInt(e.target.value, 10);
+      page = Number.isFinite(v) ? v : 1;
+      renderPage();
+    });
+  }
+
+  // Any change to filter/search/tribute selection invalidates the current
+  // page, so jump back to page 1; Prev/Next/page-input leave it alone.
+  function applyFilters() { page = 1; renderPage(); }
 
   document.querySelectorAll(".home-cat-pill").forEach(pill =>
     pill.addEventListener("click", () => {
       document.querySelectorAll(".home-cat-pill").forEach(p => p.classList.remove("active"));
       pill.classList.add("active");
       activeCat = pill.dataset.cat;
-      refilter();
+      applyFilters();
     }));
 
   const searchEl = document.getElementById("mkt-search");
-  if (searchEl) searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); refilter(); });
+  if (searchEl) searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); applyFilters(); });
+
+  const sortEl = document.getElementById("mkt-sort");
+  if (sortEl) sortEl.addEventListener("change", () => { sortBy = sortEl.value; applyFilters(); });
+
+  // Tribute picker: multi-select dropdown, "select all that apply".
+  const tributeWrap  = document.getElementById("tribute-filter");
+  const tributeBtn   = document.getElementById("tribute-filter-btn");
+  const tributeMenu  = document.getElementById("tribute-filter-menu");
+  const tributeList  = document.getElementById("tribute-filter-list");
+  const tributeCount = document.getElementById("tribute-filter-count");
+  const tributeClear = document.getElementById("tribute-filter-clear");
+
+  if (tributeList && Array.isArray(window.ALL_TRIBUTES)) {
+    const sorted = [...window.ALL_TRIBUTES].sort((a, b) => a.district - b.district || a.name.localeCompare(b.name));
+    tributeList.innerHTML = sorted.map(t => `
+      <label class="tribute-filter-item">
+        <input type="checkbox" value="${t.id}">
+        <span>D${t.district} &middot; ${t.name}</span>
+      </label>`).join("");
+    tributeList.querySelectorAll('input[type="checkbox"]').forEach(cb =>
+      cb.addEventListener("change", () => {
+        if (cb.checked) selectedTributeIds.add(cb.value); else selectedTributeIds.delete(cb.value);
+        if (tributeCount) tributeCount.textContent = selectedTributeIds.size ? `(${selectedTributeIds.size})` : "";
+        applyFilters();
+      }));
+  }
+  if (tributeBtn && tributeMenu) {
+    tributeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      tributeMenu.classList.toggle("hidden");
+    });
+    document.addEventListener("click", (e) => {
+      if (tributeWrap && !tributeWrap.contains(e.target)) tributeMenu.classList.add("hidden");
+    });
+  }
+  if (tributeClear) {
+    tributeClear.addEventListener("click", () => {
+      selectedTributeIds.clear();
+      if (tributeList) tributeList.querySelectorAll('input[type="checkbox"]').forEach(cb => { cb.checked = false; });
+      if (tributeCount) tributeCount.textContent = "";
+      applyFilters();
+    });
+  }
+
+  renderPage();
 })();
 </script>
 {% endblock %}

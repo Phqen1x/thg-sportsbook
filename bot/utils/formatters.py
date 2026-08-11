@@ -74,7 +74,7 @@ def market_type_label(t: str) -> str:
         "TRIBUTE_KILLED_BLOODBATH":  "Bloodbath Kill",
         "KILLS_OU":                "Kills Over/Under",
         "PLACEMENT_OU":            "Placement Over/Under",
-        "DISTRICT_VICTOR":         "District Victor",
+        "DISTRICT_VICTOR":         "District Futures",
         "DISTRICT_KILLS_OU":       "District Kills O/U",
         "DISTRICT_BOTH_BLOODBATH":   "District Both Bloodbath",
         "DISTRICT_WIPED_BLOODBATH":  "District BB Wipe",
@@ -84,13 +84,15 @@ def market_type_label(t: str) -> str:
         "DISTRICT_ONE_FINAL_5":    "District One Final 5",
         "ALLIANCE_VICTOR":         "Alliance Victor",
         "ALLIANCE_KILLS_OU":       "Alliance Kills O/U",
-        "ALLIANCE_ALL_BLOODBATH":    "Alliance All Bloodbath",
-        "ALLIANCE_WIPED_BLOODBATH":  "Alliance BB Wipe",
         "BLOODBATH_KILLS_OU":        "Bloodbath Kills O/U",
         "ALLIANCE_ALL_FINAL_8":    "Alliance All Final 8",
         "ALLIANCE_ONE_FINAL_8":    "Alliance One Final 8",
         "ALLIANCE_ALL_FINAL_5":    "Alliance All Final 5",
         "ALLIANCE_ONE_FINAL_5":    "Alliance One Final 5",
+        "PARTNER_SCORE_HIGHER":    "Partner Score Higher",
+        "PARTNER_SCORE_LOWER":     "Partner Score Lower",
+        "PARTNER_PLACE_HIGHER":    "Partner Place Higher",
+        "PARTNER_PLACE_LOWER":     "Partner Place Lower",
     }.get(t, t)
 
 

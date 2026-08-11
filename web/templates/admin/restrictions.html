@@ -1,0 +1,110 @@
+{% extends "admin/layout.html" %}
+{% block title %}Restrictions — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Rate Overrides &amp; Public-Bet Restrictions</h1>
+</div>
+
+<div class="card">
+  <div class="card-label">SET EXCHANGE RATE OVERRIDE</div>
+  <form method="post" action="/admin/restrictions/rates/set">
+    <div class="form-group">
+      <label class="form-label">Scope</label>
+      <select name="scope" class="form-control">
+        <option value="USER">User</option>
+        <option value="ROLE">Role</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Discord User ID or Role ID</label>
+      <input type="text" name="target_id" class="form-control" placeholder="123456789012345678" required>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Direction</label>
+      <select name="direction" class="form-control">
+        <option value="DEPOSIT">Deposit (Panars → chips)</option>
+        <option value="WITHDRAW">Withdraw (chips → Panars)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Rate (multiplier)</label>
+      <input type="number" name="rate" class="form-control" step="0.01" min="0.01" value="1.0" required>
+    </div>
+    <button type="submit" class="btn btn-primary">Save Override</button>
+  </form>
+</div>
+
+<div class="section-header mt-3">
+  <h2>Active Overrides</h2>
+</div>
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>Scope</th><th>Target ID</th><th>Direction</th><th>Rate</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for o in overrides %}
+      <tr>
+        <td>{{ o.scope }}</td>
+        <td class="text-dim" style="font-size:0.8rem">{{ o.target_id }}</td>
+        <td>{{ o.direction }}</td>
+        <td class="text-gold font-bold">{{ o.rate }}</td>
+        <td>
+          <form method="post" action="/admin/restrictions/rates/{{ o.id }}/delete" onsubmit="return confirm('Remove this override?')">
+            <button class="btn btn-sm btn-danger">Remove</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="text-dim text-center">No rate overrides set — everyone uses the global rates from Settings.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card mt-3">
+  <div class="card-label">BLOCK PUBLIC PARLAYS</div>
+  <form method="post" action="/admin/restrictions/public-block/set">
+    <div class="form-group">
+      <label class="form-label">Scope</label>
+      <select name="scope" class="form-control">
+        <option value="USER">User</option>
+        <option value="ROLE">Role</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Discord User ID or Role ID</label>
+      <input type="text" name="target_id" class="form-control" placeholder="123456789012345678" required>
+    </div>
+    <div class="form-help">Blocked members can still bet — their public/tail-board submissions are just kept private instead.</div>
+    <button type="submit" class="btn btn-primary">Block</button>
+  </form>
+</div>
+
+<div class="section-header mt-3">
+  <h2>Blocked Roles &amp; Users</h2>
+</div>
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>Scope</th><th>Target ID</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for b in blocks %}
+      <tr>
+        <td>{{ b.scope }}</td>
+        <td class="text-dim" style="font-size:0.8rem">{{ b.target_id }}</td>
+        <td>
+          <form method="post" action="/admin/restrictions/public-block/{{ b.id }}/delete" onsubmit="return confirm('Unblock this target?')">
+            <button class="btn btn-sm btn-danger">Unblock</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="text-dim text-center">No public-parlay blocks set.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

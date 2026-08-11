@@ -8,5 +8,8 @@ if [ ! -f "$SNAP_COMMON/.env" ]; then
     exit 1
 fi
 
+# Anchor the (writable) data directory; per-guild files are sportsbook_<id>.db.
+export DB_PATH="${DB_PATH:-$SNAP_COMMON/data/sportsbook.db}"
+
 cd "$SNAP_COMMON"
 exec "$SNAP/bin/thg-sportsbook-web"

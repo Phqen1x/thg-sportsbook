@@ -70,7 +70,7 @@
       <div class="home-market-label">{{ m.label }}</div>
       {% if ta or tb %}
       <div class="home-market-sub">
-        {% if ta %}{{ ta.name }}{% endif %}{% if tb %} vs {{ tb.name }}{% endif %}
+        {% if ta %}{{ ta.name }}{% endif %}{% if tb %} {{ pair_word(m.type) }} {{ tb.name }}{% endif %}
       </div>
       {% endif %}
       <div class="home-market-meta">

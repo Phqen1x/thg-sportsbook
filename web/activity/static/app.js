@@ -1,4 +1,4 @@
-// Capitol Sportsbook — Discord Activity SPA (no-build, vanilla ES module).
+// Panem Sportsbook — Discord Activity SPA (no-build, vanilla ES module).
 // Handles the Embedded App SDK auth handshake, then drives a small hash router
 // over the JSON API in web/routes/activity.py. Identity + admin rights are
 // established server-side; this client only carries the signed bearer token.
@@ -18,6 +18,14 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const fmtChips = (n) => Number(n ?? 0).toLocaleString("en-US");
 const fmtOdds = (n) => (n == null ? "—" : n >= 0 ? `+${n}` : `${n}`);
 const oddsClass = (n) => (n == null ? "" : n >= 0 ? "odds-pos" : "odds-neg");
+const decFromOdds = (odds) => (odds >= 0 ? odds / 100 + 1 : 100 / Math.abs(odds) + 1);
+const payoutForWager = (wager, odds) => Math.max(wager, Math.round(wager * decFromOdds(odds)));
+// Live payout caps come from ME (see /me in web/routes/activity.py) so previews
+// track admin changes without a page reload; fall back to a generous default
+// (never used to actually reject a bet — the server is the source of truth)
+// if ME hasn't loaded yet.
+const singlePayoutCap = () => ME?.single_payout_cap ?? 10_000_000;
+const parlayPayoutCap = () => ME?.parlay_payout_cap ?? 10_000_000;
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -51,6 +59,36 @@ function toast(message, type = "success") {
   _toastTimer = setTimeout(() => t.classList.remove("show"), 3500);
 }
 
+// Small popup anchored next to whichever button triggered it — used whenever a
+// leg or whole parlay is added to the slip, so the member gets feedback right
+// where they're looking instead of being redirected to the Parlay tab. Built
+// fresh each time and appended to <body> so it's never clipped by a scrolling/
+// overflow-hidden ancestor (the nav bar, a card list, etc.).
+function notifyNearButton(anchorEl, message, isError = false) {
+  if (!anchorEl || !anchorEl.getBoundingClientRect) return toast(message, isError ? "error" : "success");
+  const bubble = document.createElement("div");
+  bubble.className = "inline-popup" + (isError ? " error" : "");
+  bubble.textContent = message;
+  document.body.appendChild(bubble);
+
+  const anchorRect = anchorEl.getBoundingClientRect();
+  const bubbleRect = bubble.getBoundingClientRect();
+  let left = anchorRect.left + anchorRect.width / 2 - bubbleRect.width / 2;
+  left = Math.max(6, Math.min(left, window.innerWidth - bubbleRect.width - 6));
+  let top = anchorRect.bottom + 6;
+  if (top + bubbleRect.height > window.innerHeight - 6) {
+    top = anchorRect.top - bubbleRect.height - 6;
+  }
+  bubble.style.left = `${left}px`;
+  bubble.style.top = `${top}px`;
+
+  requestAnimationFrame(() => bubble.classList.add("show"));
+  setTimeout(() => {
+    bubble.classList.remove("show");
+    setTimeout(() => bubble.remove(), 200);
+  }, 2600);
+}
+
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 async function authenticate() {
@@ -71,6 +109,9 @@ async function authenticate() {
 
   SDK = new DiscordSDK(CFG.clientId);
   await SDK.ready();
+  // Keep as string — Discord snowflakes exceed Number.MAX_SAFE_INTEGER and
+  // would silently lose precision if converted to a JS number.
+  const guildId = SDK.guildId || null;
   const { code } = await SDK.commands.authorize({
     client_id: CFG.clientId,
     response_type: "code",
@@ -78,7 +119,7 @@ async function authenticate() {
     prompt: "none",
     scope: ["identify"],
   });
-  const result = await api("/token", { method: "POST", body: { code } });
+  const result = await api("/token", { method: "POST", body: { code, guild_id: guildId } });
   TOKEN = result.token;
   await SDK.commands.authenticate({ access_token: result.access_token });
   ME = { ...result.user, chips: 0 };
@@ -105,21 +146,29 @@ const TABS = [
   ["tail", "Tail"],
 ];
 
+function tabLink([id, label], extraClass = "") {
+  return `<a href="${location.pathname}${location.search}#${id}" data-tab="${id}" class="${extraClass}">${label}</a>`;
+}
+
 function renderShell() {
+  const isAdmin = !!ME?.is_admin;
   const tabs = [...TABS];
-  if (ME?.is_admin) tabs.push(["admin", "Admin"]);
+  if (isAdmin) tabs.push(["admin", "Admin"]);
   document.getElementById("app").innerHTML = `
     <header class="topbar">
       <div class="brand"><img src="static/panem.png" alt="" class="brand-logo"> PANEM</div>
       <nav class="tabs" id="tabs">
-        ${tabs.map(([id, label]) =>
-          `<a href="${location.pathname}${location.search}#${id}" data-tab="${id}">${label}</a>`).join("")}
+        ${tabs.map((t) => tabLink(t)).join("")}
       </nav>
       <a href="${location.pathname}${location.search}#balance" class="me">
         <span id="balance" class="chips">${fmtChips(ME?.chips)} chips</span>
         <img class="avatar" src="${esc(ME?.avatar_url || "")}" alt="">
       </a>
     </header>
+    <nav class="tabs-grid" id="tabs-grid">
+      ${TABS.map((t) => tabLink(t)).join("")}
+      ${isAdmin ? tabLink(["admin", "Admin"], "tabs-grid-admin") : ""}
+    </nav>
     <main id="view" class="view"></main>`;
   window.addEventListener("hashchange", route);
 }
@@ -138,7 +187,7 @@ const VIEWS = {
 async function route() {
   let tab = (location.hash || "#markets").slice(1).split("/")[0];
   if (!VIEWS[tab] || (tab === "admin" && !ME?.is_admin)) tab = "markets";
-  document.querySelectorAll("#tabs a").forEach((a) =>
+  document.querySelectorAll("[data-tab]").forEach((a) =>
     a.classList.toggle("active", a.dataset.tab === tab));
   const view = $("#view");
   view.innerHTML = `<div class="loading-inline">Loading…</div>`;
@@ -151,11 +200,15 @@ async function route() {
 
 // ── Market rendering helpers ───────────────────────────────────────────────────
 
+// Market types where tribute_a/tribute_b are combined into one joint outcome
+// (e.g. their scores summed) rather than pitted head-to-head — keep in sync
+// with COMBINED_PAIR_MARKET_TYPES in web/app.py.
+const COMBINED_PAIR_MARKET_TYPES = new Set(["COMBINED_DISTRICT_SCORE"]);
+
 function marketSubtitle(m) {
-  const bits = [];
-  if (m.tribute_a) bits.push(esc(m.tribute_a));
-  if (m.tribute_b) bits.push(esc(m.tribute_b));
-  return bits.join(" vs ");
+  if (!m.tribute_a || !m.tribute_b) return esc(m.tribute_a || m.tribute_b || "");
+  const joiner = COMBINED_PAIR_MARKET_TYPES.has(m.type) ? "and" : "vs";
+  return `${esc(m.tribute_a)} ${joiner} ${esc(m.tribute_b)}`;
 }
 
 function marketCard(m, { actions = "member" } = {}) {
@@ -213,18 +266,60 @@ const CATS = [
   { key: "props",    icon: "🎯",  label: "Props" },
 ];
 
+const MARKETS_PAGE_SIZE = 24;
+
 async function viewMarkets(view) {
-  const [marketsData, tailData, bannersData] = await Promise.all([
+  const [marketsData, tailData, bannersData, tributesData] = await Promise.all([
     api("/markets?status=open"),
     api("/tail").catch(() => ({ templates: [] })),
     api("/banners").catch(() => ({ banners: [] })),
+    api("/tributes").catch(() => ({ tributes: [] })),
   ]);
 
   const allMarkets = marketsData.markets;
   const templates  = tailData.templates || [];
   const banners    = bannersData.banners || [];
+  const tributes   = [...(tributesData.tributes || [])]
+    .sort((a, b) => a.district - b.district || a.name.localeCompare(b.name));
 
   view.innerHTML = `
+    <div class="filter-sort-bar">
+      <div class="cat-pills" id="cat-pills">
+        ${CATS.map((c) => `
+          <button class="cat-pill${c.key === "" ? " active" : ""}" data-cat="${esc(c.key)}">
+            <span class="cat-icon">${c.icon}</span>
+            <span class="cat-label">${c.label}</span>
+          </button>`).join("")}
+      </div>
+      <div class="tribute-filter" id="tribute-filter">
+        <button type="button" class="btn btn-outline btn-sm tribute-filter-btn" id="tribute-filter-btn">
+          Tributes <span class="tribute-filter-count" id="tribute-filter-count"></span> ▾
+        </button>
+        <div class="tribute-filter-menu" id="tribute-filter-menu" hidden>
+          <div class="tribute-filter-menu-actions">
+            <button type="button" class="link-btn" id="tribute-filter-clear">Clear</button>
+          </div>
+          <div class="tribute-filter-list" id="tribute-filter-list">
+            ${tributes.map((t) => `
+              <label class="tribute-filter-item">
+                <input type="checkbox" value="${t.id}">
+                <span>D${t.district} · ${esc(t.name)}</span>
+              </label>`).join("")}
+          </div>
+        </div>
+      </div>
+      <div class="sort-row">
+        <label class="sort-label" for="mkt-sort">Sort</label>
+        <select class="input sort-select" id="mkt-sort">
+          <option value="default">Default</option>
+          <option value="name">Name (A–Z)</option>
+          <option value="odds-fav">Odds: Favorites First</option>
+          <option value="odds-long">Odds: Longshots First</option>
+          <option value="popular">Most Bets</option>
+        </select>
+      </div>
+    </div>
+
     ${marketsData.phase_name
       ? `<div class="phase-banner">Phase: ${esc(marketsData.phase_name)}</div>`
       : ""}
@@ -232,14 +327,6 @@ async function viewMarkets(view) {
     <div class="home-search">
       <input class="home-search-input" id="mkt-search"
         placeholder="Search tributes, districts, alliances…" autocomplete="off" type="search">
-    </div>
-
-    <div class="cat-pills" id="cat-pills">
-      ${CATS.map((c) => `
-        <button class="cat-pill${c.key === "" ? " active" : ""}" data-cat="${esc(c.key)}">
-          <span class="cat-icon">${c.icon}</span>
-          <span class="cat-label">${c.label}</span>
-        </button>`).join("")}
     </div>
 
     ${banners.length ? `
@@ -258,9 +345,12 @@ async function viewMarkets(view) {
     <h2 class="section-title" id="mkts-heading">Open Markets</h2>
     <div class="list" id="market-list">
       ${allMarkets.length
-        ? allMarkets.map((m) => marketCard(m)).join("")
-        : `<div class="empty">No open markets right now.</div>`}
+        ? ""
+        : marketsData.phase_name
+          ? `<div class="empty">No open markets right now.</div>`
+          : `<div class="empty">The Games haven't started yet — check back once an admin kicks things off.</div>`}
     </div>
+    <div class="pagination" id="market-pagination"></div>
 
     ${templates.length ? `
     <h2 class="section-title">Featured Parlays</h2>
@@ -271,39 +361,140 @@ async function viewMarkets(view) {
   bindMemberMarketActions(view);
   bindFeaturedParlayActions(view);
 
-  let activeCat = "";
-  let searchQ   = "";
+  let activeCat  = "";
+  let searchQ    = "";
+  let sortBy     = "default";
+  let page       = 1;
+  const selectedTributeIds = new Set();
 
-  function refilter() {
+  function sortMarkets(list) {
+    const arr = [...list];
+    if (sortBy === "name" || sortBy === "default") arr.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+    else if (sortBy === "odds-fav") arr.sort((a, b) => (a.odds ?? Infinity) - (b.odds ?? Infinity));
+    else if (sortBy === "odds-long") arr.sort((a, b) => (b.odds ?? -Infinity) - (a.odds ?? -Infinity));
+    else if (sortBy === "popular") arr.sort((a, b) => (b.bet_count ?? 0) - (a.bet_count ?? 0));
+    return arr;
+  }
+
+  function matchesTributes(m) {
+    if (!selectedTributeIds.size) return true;
+    return selectedTributeIds.has(String(m.tribute_a_id)) || selectedTributeIds.has(String(m.tribute_b_id));
+  }
+
+  function computeFiltered() {
     const q = searchQ.toLowerCase();
-    const filtered = allMarkets.filter((m) => {
+    return sortMarkets(allMarkets.filter((m) => {
       if (!matchesCat(m, activeCat)) return false;
+      if (!matchesTributes(m)) return false;
       if (!q) return true;
       return (
         m.label.toLowerCase().includes(q) ||
         (m.tribute_a && m.tribute_a.toLowerCase().includes(q)) ||
         (m.tribute_b && m.tribute_b.toLowerCase().includes(q))
       );
-    });
+    }));
+  }
+
+  // Re-renders the current page from the current filter/sort/search state.
+  // Filtering/sorting always runs over the full market set first, so search
+  // results and filtered/sorted lists page exactly like the unfiltered list.
+  function renderMarketsPage() {
+    if (!allMarkets.length) return; // static empty-state markup already in place
+    const filtered = computeFiltered();
+    const totalPages = Math.max(1, Math.ceil(filtered.length / MARKETS_PAGE_SIZE));
+    page = Math.min(Math.max(page, 1), totalPages);
+    const start = (page - 1) * MARKETS_PAGE_SIZE;
+    const pageItems = filtered.slice(start, start + MARKETS_PAGE_SIZE);
+
     const listEl = $("#market-list", view);
     const heading = $("#mkts-heading", view);
     if (heading) heading.textContent = `Open Markets${filtered.length !== allMarkets.length ? ` (${filtered.length})` : ""}`;
-    listEl.innerHTML = filtered.length
-      ? filtered.map((m) => marketCard(m)).join("")
+    listEl.innerHTML = pageItems.length
+      ? pageItems.map((m) => marketCard(m)).join("")
       : `<div class="empty">No markets match.</div>`;
     bindMemberMarketActions(view);
+    renderPagination(totalPages);
   }
 
+  function renderPagination(totalPages) {
+    const el = $("#market-pagination", view);
+    if (!el) return;
+    if (totalPages <= 1) { el.innerHTML = ""; return; }
+    el.innerHTML = `
+      <button type="button" class="btn btn-outline btn-sm" id="mkt-prev"${page <= 1 ? " disabled" : ""}>Prev</button>
+      <span class="pagination-info">Page
+        <input type="number" class="pagination-page-input" id="mkt-page-input" min="1" max="${totalPages}" value="${page}">
+        of ${totalPages}
+      </span>
+      <button type="button" class="btn btn-outline btn-sm" id="mkt-next"${page >= totalPages ? " disabled" : ""}>Next</button>`;
+    $("#mkt-prev", el).addEventListener("click", () => { page--; renderMarketsPage(); });
+    $("#mkt-next", el).addEventListener("click", () => { page++; renderMarketsPage(); });
+    $("#mkt-page-input", el).addEventListener("change", (e) => {
+      const v = parseInt(e.target.value, 10);
+      page = Number.isFinite(v) ? v : 1;
+      renderMarketsPage();
+    });
+  }
+
+  // Any change to filter/search/sort/tribute selection invalidates the
+  // current page, so jump back to page 1; Prev/Next/page-input leave it alone.
+  function applyFilters() { page = 1; renderMarketsPage(); }
+
+  renderMarketsPage();
+
   const searchEl = $("#mkt-search", view);
-  searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); refilter(); });
+  searchEl.addEventListener("input", () => { searchQ = searchEl.value.trim(); applyFilters(); });
+
+  const sortEl = $("#mkt-sort", view);
+  sortEl.addEventListener("change", () => { sortBy = sortEl.value; applyFilters(); });
 
   view.querySelectorAll(".cat-pill").forEach((pill) =>
     pill.addEventListener("click", () => {
       view.querySelectorAll(".cat-pill").forEach((p) => p.classList.remove("active"));
       pill.classList.add("active");
       activeCat = pill.dataset.cat;
-      refilter();
+      applyFilters();
     }));
+
+  // Tribute picker: multi-select dropdown, "select all that apply".
+  const tributeBtn   = $("#tribute-filter-btn", view);
+  const tributeMenu  = $("#tribute-filter-menu", view);
+  const tributeCount = $("#tribute-filter-count", view);
+  const tributeClear = $("#tribute-filter-clear", view);
+
+  if (tributeBtn) {
+    tributeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      tributeMenu.hidden = !tributeMenu.hidden;
+    });
+  }
+  view.querySelectorAll('.tribute-filter-item input[type="checkbox"]').forEach((cb) =>
+    cb.addEventListener("change", () => {
+      if (cb.checked) selectedTributeIds.add(cb.value); else selectedTributeIds.delete(cb.value);
+      tributeCount.textContent = selectedTributeIds.size ? `(${selectedTributeIds.size})` : "";
+      applyFilters();
+    }));
+  if (tributeClear) {
+    tributeClear.addEventListener("click", () => {
+      selectedTributeIds.clear();
+      view.querySelectorAll('.tribute-filter-item input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
+      tributeCount.textContent = "";
+      applyFilters();
+    });
+  }
+}
+
+// Closes the tribute picker dropdown when clicking outside it. Bound once at
+// module scope (not per viewMarkets() render) since the elements only exist
+// while the Markets tab is mounted — the lookups simply no-op on other tabs.
+document.addEventListener("click", (e) => {
+  const menu = document.getElementById("tribute-filter-menu");
+  const wrap = document.getElementById("tribute-filter");
+  if (menu && !menu.hidden && wrap && !wrap.contains(e.target)) menu.hidden = true;
+});
+
+function tailPath(t) {
+  return t.kind === "member" ? `/tail/parlay/${t.id}` : `/tail/${t.id}`;
 }
 
 function featuredParlayCard(t) {
@@ -319,7 +510,8 @@ function featuredParlayCard(t) {
       </ul>
       <div class="feat-parlay-footer">
         <span class="${oddsClass(t.combined_odds)} feat-parlay-odds">${t.combined_odds == null ? "—" : fmtOdds(t.combined_odds)}</span>
-        <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}">Tail this</button>
+        <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}" data-kind="${esc(t.kind || "template")}" data-odds="${t.combined_odds ?? ""}">Tail this</button>
+        <button class="btn btn-outline btn-sm" data-act="add-slip" data-id="${t.id}" data-kind="${esc(t.kind || "template")}">Add to Slip</button>
       </div>
     </div>`;
 }
@@ -328,9 +520,17 @@ function bindFeaturedParlayActions(view) {
   view.querySelectorAll('[data-act="tail"]').forEach((b) =>
     b.addEventListener("click", () => openWagerModal({
       title: "Tail Parlay",
-      onSubmit: (wager) => api(`/tail/${b.dataset.id}`, { method: "POST", body: { wager } }),
+      odds: b.dataset.odds !== "" ? Number(b.dataset.odds) : null,
+      onSubmit: (wager) => api(tailPath(b.dataset), { method: "POST", body: { wager } }),
       after: () => { location.hash = "#mybets"; },
     })));
+  view.querySelectorAll('[data-act="add-slip"]').forEach((b) =>
+    b.addEventListener("click", async () => {
+      try {
+        const r = await api(`${tailPath(b.dataset)}/add-to-slip`, { method: "POST" });
+        notifyNearButton(b, r.message);
+      } catch (e) { notifyNearButton(b, e.message, true); }
+    }));
 }
 
 function bindMemberMarketActions(view) {
@@ -340,34 +540,57 @@ function bindMemberMarketActions(view) {
     b.addEventListener("click", async () => {
       try {
         const r = await api(`/parlay/add/${b.dataset.id}`, { method: "POST" });
-        toast(r.message);
-      } catch (e) { toast(e.message, "error"); }
+        notifyNearButton(b, r.message);
+      } catch (e) { notifyNearButton(b, e.message, true); }
     }));
 }
 
 // ── Views: Tributes ────────────────────────────────────────────────────────────
 
+function tributeStatCells(t) {
+  const stats = [
+    ["Training", t.training_score != null ? String(t.training_score) : "—"],
+    ["Kills", String(t.kills ?? 0)],
+    ["Alliance", t.alliance ? esc(t.alliance) : "—"],
+  ];
+  if (t.placement != null) stats.push(["Placement", `#${t.placement}`]);
+  return stats.map(([label, value]) => `
+    <div class="tribute-stat">
+      <span class="tribute-stat-label">${label}</span>
+      <span class="tribute-stat-value">${value}</span>
+    </div>`).join("");
+}
+
+// Shown at its natural aspect ratio (width:100%, height:auto — no cropping)
+// so the card just grows to fit whatever image is provided, rather than
+// squeezing a portrait photo into a small fixed-size thumbnail. Omitted
+// entirely when no face claim is set, so undecorated tributes stay compact.
+function tributePortrait(t) {
+  if (!t.face_claim) return "";
+  return `<img class="tribute-portrait" src="${esc(t.face_claim)}" alt="" loading="lazy" onerror="this.remove()">`;
+}
+
 async function viewTributes(view) {
   const { tributes } = await api("/tributes");
   view.innerHTML = `
-    <div class="grid">
+    <div class="grid tribute-grid">
       ${tributes.map((t) => `
         <div class="card tribute-card status-edge-${esc(t.status.toLowerCase())}">
           <div class="tribute-head">
             <span class="district">D${t.district}</span>
             <span class="status status-${esc(t.status.toLowerCase())}">${esc(t.status)}</span>
           </div>
-          <div class="tribute-name">${esc(t.name)} <span class="dim">${esc(t.gender)}</span></div>
-          <div class="tribute-stats dim">
-            ${t.training_score != null ? `Training ${t.training_score}` : ""}
-            ${t.kills ? `· ${t.kills} kills` : ""}
-            ${t.alliance ? `· ${esc(t.alliance)}` : ""}
+          ${tributePortrait(t)}
+          <div class="tribute-content">
+            <div class="tribute-name">${esc(t.name)}</div>
+            <div class="dim tribute-sub">${esc(t.gender)}${t.age != null ? ` · Age ${t.age}` : ""}</div>
+            <div class="tribute-stat-grid">${tributeStatCells(t)}</div>
+            ${t.win_market_id && t.status === "ALIVE" ? `
+              <div class="tribute-bet">
+                <span class="${oddsClass(t.win_odds)}">${fmtOdds(t.win_odds)} to win</span>
+                <button class="btn btn-primary btn-sm" data-act="bet" data-id="${t.win_market_id}">Bet</button>
+              </div>` : ""}
           </div>
-          ${t.win_market_id && t.status === "ALIVE" ? `
-            <div class="tribute-bet">
-              <span class="${oddsClass(t.win_odds)}">${fmtOdds(t.win_odds)} to win</span>
-              <button class="btn btn-primary btn-sm" data-act="bet" data-id="${t.win_market_id}">Bet</button>
-            </div>` : ""}
         </div>`).join("")}
     </div>`;
   bindMemberMarketActions(view);
@@ -376,15 +599,22 @@ async function viewTributes(view) {
 // ── Views: Leaderboard ─────────────────────────────────────────────────────────
 
 async function viewLeaderboard(view) {
-  const { users } = await api("/leaderboard");
+  const cat = location.hash.split("/")[1] || "CHIPS";
+  const base = location.pathname + location.search;
+  const { users, title, value_kind, categories } = await api(`/leaderboard?category=${encodeURIComponent(cat)}`);
   view.innerHTML = `
+    <div class="subtabs" style="flex-wrap:wrap">
+      ${categories.map((c) => `
+        <a href="${base}#leaderboard/${c.value}" class="${cat === c.value ? "active" : ""}">${esc(c.label)}</a>`).join("")}
+    </div>
+    <h2 class="section-title">${esc(title)}</h2>
     <div class="list leaderboard">
-      ${users.map((u) => `
+      ${users.length ? users.map((u) => `
         <div class="card lb-row ${u.is_me ? "lb-me" : ""}">
           <span class="lb-rank">#${u.rank}</span>
           <span class="lb-name">${esc(u.username)}</span>
-          <span class="lb-chips chips">${fmtChips(u.chips)}</span>
-        </div>`).join("")}
+          <span class="lb-chips chips">${value_kind === "chips" ? fmtChips(u.value) : u.value}</span>
+        </div>`).join("") : `<div class="empty">No players yet.</div>`}
     </div>`;
 }
 
@@ -402,7 +632,7 @@ async function viewMyBets(view) {
         <div class="dim">Wager ${fmtChips(b.wager)} @ ${fmtOdds(b.odds_at_placement)} · win ${fmtChips(b.payout_if_win)}</div>
       </div>
       <span class="status status-${esc(b.status.toLowerCase())}">${esc(b.status)}</span>
-      ${b.status === "PENDING" ? `<button class="btn btn-outline btn-sm" data-act="cashout-bet" data-id="${b.id}">Cash out</button>` : ""}
+      ${b.status === "PENDING" && b.cashout_preview != null ? `<button class="btn btn-outline btn-sm" data-act="cashout-bet" data-id="${b.id}" data-amount="${b.cashout_preview}">Cash out (${fmtChips(b.cashout_preview)})</button>` : ""}
     </div>`).join("");
 
   const parlays = data.parlays.map((p) => `
@@ -415,7 +645,7 @@ async function viewMyBets(view) {
       <ul class="parlay-legs">
         ${p.legs.map((l) => `<li><span class="leg-status status-${esc(l.status.toLowerCase())}">${esc(l.status)}</span> ${esc(mlabel(l.market_id))}</li>`).join("")}
       </ul>
-      ${p.status === "PENDING" ? `<button class="btn btn-outline btn-sm" data-act="cashout-parlay" data-id="${p.id}">Cash out</button>` : ""}
+      ${p.status === "PENDING" && p.cashout_preview != null ? `<button class="btn btn-outline btn-sm" data-act="cashout-parlay" data-id="${p.id}" data-amount="${p.cashout_preview}">Cash out (${fmtChips(p.cashout_preview)})</button>` : ""}
     </div>`).join("");
 
   view.innerHTML = `
@@ -425,9 +655,15 @@ async function viewMyBets(view) {
     <div class="list">${parlays || `<div class="empty">No parlays yet.</div>`}</div>`;
 
   view.querySelectorAll('[data-act="cashout-bet"]').forEach((b) =>
-    b.addEventListener("click", () => doAction(`/cashout/bet/${b.dataset.id}`, "POST")));
+    b.addEventListener("click", () => {
+      if (!confirm(`Cash out this bet for ${fmtChips(b.dataset.amount)} chips?`)) return;
+      doAction(`/cashout/bet/${b.dataset.id}`, "POST");
+    }));
   view.querySelectorAll('[data-act="cashout-parlay"]').forEach((b) =>
-    b.addEventListener("click", () => doAction(`/cashout/parlay/${b.dataset.id}`, "POST")));
+    b.addEventListener("click", () => {
+      if (!confirm(`Cash out this parlay for ${fmtChips(b.dataset.amount)} chips?`)) return;
+      doAction(`/cashout/parlay/${b.dataset.id}`, "POST");
+    }));
 }
 
 // ── Views: Parlay slip ─────────────────────────────────────────────────────────
@@ -454,9 +690,11 @@ async function viewParlay(view) {
       ${legs.length >= 2 ? `
         <div class="card parlay-submit">
           <input id="parlay-wager" type="number" min="1" placeholder="Wager (chips)" class="input">
-          <label class="checkbox"><input type="checkbox" id="parlay-public"> List on tail board</label>
+          <div class="modal-payout dim" id="parlay-payout"></div>
+          <label class="checkbox"><input type="checkbox" id="parlay-public" checked> List on tail board</label>
           <div class="row-buttons">
             <button class="btn btn-primary" id="parlay-go">Submit Parlay</button>
+            ${ME?.is_admin ? `<button class="btn btn-outline" id="parlay-feature">Feature Parlay</button>` : ""}
             <button class="btn btn-outline" id="parlay-clear">Clear</button>
           </div>
         </div>` : (legs.length ? `<button class="btn btn-outline" id="parlay-clear">Clear slip</button>` : "")}
@@ -466,6 +704,16 @@ async function viewParlay(view) {
     b.addEventListener("click", () => doAction(`/parlay/remove/${b.dataset.id}`, "POST")));
   const clear = $("#parlay-clear", view);
   if (clear) clear.addEventListener("click", () => doAction("/parlay/clear", "POST"));
+  const feature = $("#parlay-feature", view);
+  if (feature) feature.addEventListener("click", () => openFeatureParlayModal());
+  const wagerEl = $("#parlay-wager", view);
+  if (wagerEl && data.combined_odds != null) {
+    wagerEl.addEventListener("input", () => {
+      const w = Number(wagerEl.value) || 0;
+      const payout = Math.min(payoutForWager(w, data.combined_odds), parlayPayoutCap());
+      $("#parlay-payout", view).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
+    });
+  }
   const go = $("#parlay-go", view);
   if (go) go.addEventListener("click", async () => {
     const wager = Number($("#parlay-wager", view).value);
@@ -497,16 +745,27 @@ async function viewTail(view) {
           <ul class="parlay-legs">
             ${t.legs.map((m) => `<li>${esc(m.label)} <span class="${oddsClass(m.odds)}">${fmtOdds(m.odds)}</span></li>`).join("")}
           </ul>
-          <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}">Tail this</button>
+          <div class="row-buttons">
+            <button class="btn btn-primary btn-sm" data-act="tail" data-id="${t.id}" data-kind="${esc(t.kind || "template")}" data-odds="${t.combined_odds ?? ""}">Tail this</button>
+            <button class="btn btn-outline btn-sm" data-act="add-slip" data-id="${t.id}" data-kind="${esc(t.kind || "template")}">Add to Slip</button>
+          </div>
         </div>`).join("") : `<div class="empty">No public parlays to tail right now.</div>`}
     </div>`;
 
   view.querySelectorAll('[data-act="tail"]').forEach((b) =>
     b.addEventListener("click", () => openWagerModal({
       title: "Tail Parlay",
-      onSubmit: (wager) => api(`/tail/${b.dataset.id}`, { method: "POST", body: { wager } }),
+      odds: b.dataset.odds !== "" ? Number(b.dataset.odds) : null,
+      onSubmit: (wager) => api(tailPath(b.dataset), { method: "POST", body: { wager } }),
       after: () => { location.hash = "#mybets"; },
     })));
+  view.querySelectorAll('[data-act="add-slip"]').forEach((b) =>
+    b.addEventListener("click", async () => {
+      try {
+        const r = await api(`${tailPath(b.dataset)}/add-to-slip`, { method: "POST" });
+        notifyNearButton(b, r.message);
+      } catch (e) { notifyNearButton(b, e.message, true); }
+    }));
 }
 
 // ── Views: Balance / profile ───────────────────────────────────────────────────
@@ -563,18 +822,38 @@ async function viewBalance(view) {
 async function viewAdmin(view) {
   const sub = (location.hash.split("/")[1]) || "markets";
   const base = location.pathname + location.search;
+  const status = await api("/admin/game/status").catch(() => ({ game_active: true, phase_name: null }));
   view.innerHTML = `
+    ${status.game_active ? "" : `
+    <div class="card admin-start-game">
+      <div>
+        <div class="card-label">The Games haven't started</div>
+        <div class="dim">Starting opens Pre-Games markets and seeds the tailing board.</div>
+      </div>
+      <button class="btn btn-primary" id="admin-start-game">⚡ Start the Games</button>
+    </div>`}
     <div class="subtabs">
       <a href="${base}#admin/markets"  class="${sub === "markets"  ? "active" : ""}">Markets</a>
       <a href="${base}#admin/chips"    class="${sub === "chips"    ? "active" : ""}">Chips</a>
       <a href="${base}#admin/tributes" class="${sub === "tributes" ? "active" : ""}">Tributes</a>
       <a href="${base}#admin/banners"  class="${sub === "banners"  ? "active" : ""}">Banners</a>
+      <a href="${base}#admin/parlays"  class="${sub === "parlays"  ? "active" : ""}">Parlays</a>
+      <a href="${base}#admin/rates"    class="${sub === "rates"    ? "active" : ""}">Rates</a>
     </div>
     <div id="admin-body"><div class="loading-inline">Loading…</div></div>`;
+  const startBtn = $("#admin-start-game", view);
+  if (startBtn) {
+    startBtn.addEventListener("click", () => {
+      if (!confirm("Start the Games? This opens Pre-Games markets and seeds the tailing board.")) return;
+      doAction("/admin/game/start", "POST");
+    });
+  }
   const body = $("#admin-body", view);
   if (sub === "chips")    return adminChips(body);
   if (sub === "tributes") return adminTributes(body);
   if (sub === "banners")  return adminBanners(body);
+  if (sub === "parlays")  return adminParlays(body);
+  if (sub === "rates")    return adminRates(body);
   return adminMarkets(body);
 }
 
@@ -619,8 +898,53 @@ async function adminMarkets(body) {
 }
 
 async function adminChips(body) {
-  const { users } = await api("/admin/users");
+  const [{ users }, economy, payoutCaps] = await Promise.all([
+    api("/admin/users"),
+    api("/admin/economy").catch(() => null),
+    api("/admin/payout-caps").catch(() => null),
+  ]);
   body.innerHTML = `
+    ${economy ? `
+    <div class="card">
+      <div class="card-label">ECONOMY</div>
+      <div class="econ-grid">
+        <div class="econ-item">
+          <span class="econ-num">${fmtChips(economy.chips_spent)}</span>
+          <span class="econ-label">Chips Spent</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num">${fmtChips(economy.chips_circulating)}</span>
+          <span class="econ-label">In Circulation</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num odds-pos">${fmtChips(economy.panars_converted)}</span>
+          <span class="econ-label">Panars Converted</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num odds-neg">${fmtChips(economy.chips_withdrawn)}</span>
+          <span class="econ-label">Chips Withdrawn</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num ${economy.net_panars >= 0 ? "odds-pos" : "odds-neg"}">${economy.net_panars >= 0 ? "+" : ""}${fmtChips(economy.net_panars)}</span>
+          <span class="econ-label">Net Panars</span>
+        </div>
+      </div>
+    </div>` : ""}
+    ${payoutCaps ? `
+    <div class="card">
+      <div class="card-label">PAYOUT CAPS</div>
+      <div class="econ-grid">
+        <div class="econ-item">
+          <span class="econ-num">${fmtChips(payoutCaps.single_payout_cap)}</span>
+          <span class="econ-label">Single Bet Cap</span>
+        </div>
+        <div class="econ-item">
+          <span class="econ-num">${fmtChips(payoutCaps.parlay_payout_cap)}</span>
+          <span class="econ-label">Parlay Cap</span>
+        </div>
+      </div>
+      <div class="dim" style="margin-top:8px">Adjust these on the <a href="${location.pathname}${location.search}#admin/rates">Rates</a> tab.</div>
+    </div>` : ""}
     <div class="card admin-form">
       <div class="card-label">GIVE / TAKE</div>
       <input id="chip-id" class="input" placeholder="Discord user ID (click row below)">
@@ -676,23 +1000,27 @@ async function adminChips(body) {
 
 async function adminTributes(body) {
   const { tributes } = await api("/tributes");
-  body.innerHTML = `<div class="grid">
+  body.innerHTML = `<div class="grid tribute-grid">
     ${tributes.map((t) => `
       <div class="card tribute-card status-edge-${esc(t.status.toLowerCase())}">
         <div class="tribute-head">
           <span class="district">D${t.district}</span>
           <span class="status status-${esc(t.status.toLowerCase())}">${esc(t.status)}</span>
         </div>
-        <div class="tribute-name">${esc(t.name)} <span class="dim">${esc(t.gender)}</span></div>
-        ${t.status === "ALIVE" ? `
-          <div class="row-buttons">
-            <button class="btn btn-outline btn-sm" data-act="kill"   data-id="${t.id}" data-name="${esc(t.name)}">Eliminate</button>
-            <button class="btn btn-primary btn-sm" data-act="victor" data-id="${t.id}" data-name="${esc(t.name)}">Victor</button>
-          </div>` : ""}
-        ${t.status === "DEAD" ? `
-          <div class="row-buttons">
-            <button class="btn btn-outline btn-sm" data-act="unkill" data-id="${t.id}" data-name="${esc(t.name)}">Unkill</button>
-          </div>` : ""}
+        ${tributePortrait(t)}
+        <div class="tribute-content">
+          <div class="tribute-name">${esc(t.name)}</div>
+          <div class="dim tribute-sub">${esc(t.gender)}${t.age != null ? ` · Age ${t.age}` : ""}</div>
+          ${t.status === "ALIVE" ? `
+            <div class="row-buttons">
+              <button class="btn btn-outline btn-sm" data-act="kill"   data-id="${t.id}" data-name="${esc(t.name)}">Eliminate</button>
+              <button class="btn btn-primary btn-sm" data-act="victor" data-id="${t.id}" data-name="${esc(t.name)}">Victor</button>
+            </div>` : ""}
+          ${t.status === "DEAD" ? `
+            <div class="row-buttons">
+              <button class="btn btn-outline btn-sm" data-act="unkill" data-id="${t.id}" data-name="${esc(t.name)}">Unkill</button>
+            </div>` : ""}
+        </div>
       </div>`).join("")}
   </div>`;
   body.querySelectorAll('[data-act="kill"]').forEach((b) =>
@@ -760,6 +1088,244 @@ async function adminBanners(body) {
     }));
 }
 
+async function adminParlays(body) {
+  const [{ templates }, openData] = await Promise.all([
+    api("/admin/parlays"),
+    api("/markets?status=open"),
+  ]);
+  const openMarkets = openData.markets;
+
+  body.innerHTML = `
+    <div class="card admin-form" id="parlay-form">
+      <div class="card-label">CREATE FEATURED PARLAY</div>
+      <input id="p-name" class="input" placeholder="Name (required)" maxlength="100">
+      <input id="p-desc" class="input" placeholder="Description (optional)" maxlength="500">
+      <button class="btn btn-primary" id="p-add">Create Template</button>
+    </div>
+    <div class="list" id="parlay-list">
+      ${templates.length ? templates.map((t) => `
+        <div class="card tail-card">
+          <div class="tail-head">
+            <span class="tail-name">${esc(t.name)}</span>
+            ${t.difficulty ? `<span class="badge">${esc(t.difficulty)}</span>` : ""}
+            <span class="status ${t.active ? "status-open" : "status-closed"}">${t.active ? "ACTIVE" : "INACTIVE"}</span>
+          </div>
+          ${t.description ? `<div class="dim">${esc(t.description)}</div>` : ""}
+          <ul class="parlay-legs">
+            ${t.legs.length ? t.legs.map((l) => `
+              <li>
+                <span>${esc(l.label)}</span>
+                <span class="${oddsClass(l.odds)}">${fmtOdds(l.odds)}</span>
+                <button class="btn btn-outline btn-sm" data-act="p-remove-leg" data-tpl="${t.id}" data-leg="${l.leg_id}" style="margin-left:auto">Remove</button>
+              </li>`).join("") : `<li class="dim">No legs yet — add one below.</li>`}
+          </ul>
+          <div class="row-buttons">
+            <select class="input p-leg-picker" data-tpl="${t.id}" style="flex:1;min-width:140px">
+              <option value="">Add a market as a leg…</option>
+              ${openMarkets.filter((m) => !t.legs.some((l) => l.market_id === m.id)).map((m) => `
+                <option value="${m.id}">${esc(m.label)} (${fmtOdds(m.odds)})</option>`).join("")}
+            </select>
+            <button class="btn btn-outline btn-sm" data-act="p-add-leg" data-tpl="${t.id}">Add Leg</button>
+          </div>
+          <div class="row-buttons">
+            <span class="${oddsClass(t.combined_odds)}" style="flex:1;align-self:center;font-weight:700">${t.combined_odds == null ? "—" : fmtOdds(t.combined_odds)}</span>
+            <button class="btn btn-outline btn-sm" data-act="p-toggle" data-tpl="${t.id}">${t.active ? "Deactivate" : "Activate"}</button>
+            <button class="btn btn-outline btn-sm" data-act="p-delete" data-tpl="${t.id}">Delete</button>
+          </div>
+        </div>`).join("") : `<div class="empty">No featured parlays yet — create one above.</div>`}
+    </div>`;
+
+  $("#p-add", body).addEventListener("click", async () => {
+    const name = $("#p-name", body).value.trim();
+    const description = $("#p-desc", body).value.trim();
+    if (!name) return toast("Name is required.", "error");
+    try {
+      const r = await api("/admin/parlays/create", { method: "POST", body: { name, description } });
+      toast(r.message);
+      adminParlays(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  body.querySelectorAll('[data-act="p-add-leg"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const tplId = btn.dataset.tpl;
+      const picker = body.querySelector(`.p-leg-picker[data-tpl="${tplId}"]`);
+      const marketId = picker ? Number(picker.value) : 0;
+      if (!marketId) return toast("Pick a market first.", "error");
+      try {
+        const r = await api(`/admin/parlays/${tplId}/add-leg`, { method: "POST", body: { market_id: marketId } });
+        toast(r.message);
+        adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
+  body.querySelectorAll('[data-act="p-remove-leg"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/parlays/${btn.dataset.tpl}/remove-leg`, { method: "POST", body: { leg_id: Number(btn.dataset.leg) } });
+        toast(r.message);
+        adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
+  body.querySelectorAll('[data-act="p-toggle"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/parlays/${btn.dataset.tpl}/toggle`, { method: "POST" });
+        toast(r.message);
+        adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
+  body.querySelectorAll('[data-act="p-delete"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      if (!confirm("Delete this featured parlay template? This can't be undone.")) return;
+      try {
+        const r = await api(`/admin/parlays/${btn.dataset.tpl}`, { method: "DELETE" });
+        toast(r.message);
+        adminParlays(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+}
+
+async function adminRates(body) {
+  const [rates, { blocks }, payoutCaps] = await Promise.all([
+    api("/admin/exchange-rates"),
+    api("/admin/public-blocks"),
+    api("/admin/payout-caps"),
+  ]);
+
+  body.innerHTML = `
+    <div class="card admin-form">
+      <div class="card-label">GLOBAL PAYOUT CAPS</div>
+      <input id="pc-single" class="input" type="number" min="1" value="${payoutCaps.single_payout_cap}" placeholder="Single bet cap (chips)">
+      <input id="pc-parlay" class="input" type="number" min="1" value="${payoutCaps.parlay_payout_cap}" placeholder="Parlay cap (chips)">
+      <button class="btn btn-primary" id="pc-save">Save Payout Caps</button>
+      <div class="dim" style="width:100%">A wager that would pay out more than the applicable cap is rejected with the max wager the member could place instead.</div>
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">GLOBAL RATES</div>
+      <input id="r-deposit" class="input" type="number" step="0.01" min="0.01" value="${rates.global_deposit_rate}" placeholder="Deposit rate (chips per Panar)">
+      <input id="r-withdraw" class="input" type="number" step="0.01" min="0.01" value="${rates.global_withdraw_rate}" placeholder="Withdraw rate (Panars per chip)">
+      <button class="btn btn-primary" id="r-save-global">Save Global Rates</button>
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">ADD RATE OVERRIDE</div>
+      <select id="r-scope" class="input">
+        <option value="USER">User</option>
+        <option value="ROLE">Role</option>
+      </select>
+      <input id="r-target" class="input" placeholder="Discord user ID or Role ID">
+      <select id="r-direction" class="input">
+        <option value="DEPOSIT">Deposit (Panars → chips)</option>
+        <option value="WITHDRAW">Withdraw (chips → Panars)</option>
+      </select>
+      <input id="r-rate" class="input" type="number" step="0.01" min="0.01" value="1.0" placeholder="Rate">
+      <button class="btn btn-primary" id="r-add-override">Add Override</button>
+    </div>
+
+    <div class="list">
+      ${rates.overrides.length ? rates.overrides.map((o) => `
+        <div class="card tail-card">
+          <div class="tail-head">
+            <span class="tail-name">${o.scope} ${esc(o.target_id)}</span>
+            <span class="badge">${o.direction}</span>
+          </div>
+          <div class="row-buttons">
+            <span style="flex:1;align-self:center;font-weight:700">${o.rate}</span>
+            <button class="btn btn-outline btn-sm" data-act="r-remove" data-id="${o.id}">Remove</button>
+          </div>
+        </div>`).join("") : `<div class="empty">No rate overrides set — everyone uses the global rates above.</div>`}
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">BLOCK PUBLIC PARLAYS</div>
+      <select id="b-scope" class="input">
+        <option value="USER">User</option>
+        <option value="ROLE">Role</option>
+      </select>
+      <input id="b-target" class="input" placeholder="Discord user ID or Role ID">
+      <button class="btn btn-primary" id="b-add">Block</button>
+      <div class="dim" style="width:100%">Blocked members can still bet — their public/tail-board submissions are just kept private instead.</div>
+    </div>
+
+    <div class="list">
+      ${blocks.length ? blocks.map((b) => `
+        <div class="card tail-card">
+          <div class="row-buttons">
+            <span style="flex:1;align-self:center;font-weight:700">${b.scope} ${esc(b.target_id)}</span>
+            <button class="btn btn-outline btn-sm" data-act="b-remove" data-id="${b.id}">Unblock</button>
+          </div>
+        </div>`).join("") : `<div class="empty">No public-parlay blocks set.</div>`}
+    </div>`;
+
+  $("#pc-save", body).addEventListener("click", async () => {
+    const single_payout_cap = Number($("#pc-single", body).value);
+    const parlay_payout_cap = Number($("#pc-parlay", body).value);
+    if (!single_payout_cap || !parlay_payout_cap) return toast("Enter both payout caps.", "error");
+    try {
+      const r = await api("/admin/payout-caps", { method: "POST", body: { single_payout_cap, parlay_payout_cap } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  $("#r-save-global", body).addEventListener("click", async () => {
+    const deposit_rate = Number($("#r-deposit", body).value);
+    const withdraw_rate = Number($("#r-withdraw", body).value);
+    if (!deposit_rate || !withdraw_rate) return toast("Enter both rates.", "error");
+    try {
+      const r = await api("/admin/exchange-rates/global", { method: "POST", body: { deposit_rate, withdraw_rate } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  $("#r-add-override", body).addEventListener("click", async () => {
+    const scope = $("#r-scope", body).value;
+    const target_id = $("#r-target", body).value.trim();
+    const direction = $("#r-direction", body).value;
+    const rate = Number($("#r-rate", body).value);
+    if (!target_id || !rate) return toast("Enter a target ID and rate.", "error");
+    try {
+      const r = await api("/admin/exchange-rates", { method: "POST", body: { scope, target_id, direction, rate } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  body.querySelectorAll('[data-act="r-remove"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/exchange-rates/${btn.dataset.id}`, { method: "DELETE" });
+        toast(r.message);
+        adminRates(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
+  $("#b-add", body).addEventListener("click", async () => {
+    const scope = $("#b-scope", body).value;
+    const target_id = $("#b-target", body).value.trim();
+    if (!target_id) return toast("Enter a target ID.", "error");
+    try {
+      const r = await api("/admin/public-blocks", { method: "POST", body: { scope, target_id } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  body.querySelectorAll('[data-act="b-remove"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api(`/admin/public-blocks/${btn.dataset.id}`, { method: "DELETE" });
+        toast(r.message);
+        adminRates(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+}
+
 // ── Generic helpers / modals ───────────────────────────────────────────────────
 
 async function doAction(path, method = "POST", body) {
@@ -794,10 +1360,10 @@ async function openBetModal(marketId) {
       <button class="btn btn-outline" id="bet-cancel">Cancel</button>
     </div>`);
   const wagerEl = $("#bet-wager", overlay);
-  const dec = m.odds >= 0 ? m.odds / 100 + 1 : 100 / Math.abs(m.odds) + 1;
   wagerEl.addEventListener("input", () => {
     const w = Number(wagerEl.value) || 0;
-    $("#bet-payout", overlay).textContent = w ? `Win ${fmtChips(Math.max(w, Math.round(w * dec)))} chips` : "";
+    const payout = Math.min(payoutForWager(w, m.odds), singlePayoutCap());
+    $("#bet-payout", overlay).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
   });
   $("#bet-cancel", overlay).addEventListener("click", () => overlay.remove());
   $("#bet-go", overlay).addEventListener("click", async () => {
@@ -812,18 +1378,51 @@ async function openBetModal(marketId) {
   });
 }
 
-function openWagerModal({ title, onSubmit, after }) {
+function openFeatureParlayModal() {
+  const overlay = modal(`
+    <h3>Feature Parlay</h3>
+    <div class="dim">Turns your current slip into a no-wager GM parlay on the tail board and clears your slip.</div>
+    <input id="feature-name" class="input" type="text" maxlength="100" placeholder="Name (required)">
+    <textarea id="feature-desc" class="input" maxlength="500" placeholder="Description (optional)"></textarea>
+    <div class="row-buttons">
+      <button class="btn btn-primary" id="feature-go">Feature</button>
+      <button class="btn btn-outline" id="feature-cancel">Cancel</button>
+    </div>`);
+  $("#feature-cancel", overlay).addEventListener("click", () => overlay.remove());
+  $("#feature-go", overlay).addEventListener("click", async () => {
+    const name = $("#feature-name", overlay).value.trim();
+    const description = $("#feature-desc", overlay).value.trim();
+    if (!name) return toast("Enter a name for the featured parlay.", "error");
+    try {
+      const r = await api("/parlay/feature", { method: "POST", body: { name, description } });
+      toast(r.message);
+      overlay.remove();
+      location.hash = "#tail";
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+
+function openWagerModal({ title, odds, onSubmit, after }) {
   const overlay = modal(`
     <h3>${esc(title)}</h3>
     <div class="dim">Balance ${fmtChips(ME.chips)}</div>
     <input id="w-wager" class="input" type="number" min="1" placeholder="Wager (chips)">
+    <div class="modal-payout dim" id="w-payout"></div>
     <div class="row-buttons">
       <button class="btn btn-primary" id="w-go">Confirm</button>
       <button class="btn btn-outline" id="w-cancel">Cancel</button>
     </div>`);
+  const wagerEl = $("#w-wager", overlay);
+  if (odds != null) {
+    wagerEl.addEventListener("input", () => {
+      const w = Number(wagerEl.value) || 0;
+      const payout = Math.min(payoutForWager(w, odds), parlayPayoutCap());
+      $("#w-payout", overlay).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
+    });
+  }
   $("#w-cancel", overlay).addEventListener("click", () => overlay.remove());
   $("#w-go", overlay).addEventListener("click", async () => {
-    const wager = Number($("#w-wager", overlay).value);
+    const wager = Number(wagerEl.value);
     if (!wager || wager < 1) return toast("Enter a wager of at least 1 chip.", "error");
     try {
       const r = await onSubmit(wager);

@@ -25,11 +25,16 @@ class ActivityCog(commands.Cog):
         embed = discord.Embed(
             title="⚔ Panem Sportsbook",
             description=(
-                "Launch the **Panem Sportsbook** Activity to browse markets and odds, "
-                "place bets and parlays, tail public slips, and watch the leaderboard — "
-                "all without leaving Discord.\n\n"
-                "**To open it:** join a voice channel, click the **Activities** (rocket) "
-                "button, and pick **Panem Sportsbook**."
+                "Launch the **Panem Sportsbook** Activity or visit the "
+                "[Website](https://panem-sportsbook.phqen1x.com) to browse markets and odds, "
+                "place bets and build parlays, tail public parlay slips, and watch the "
+                "leaderboards!\n\n"
+                "**To open the activity:** Click the activity icon next to your chat bar "
+                "and pick **Panem Sportsbook**.\n\n"
+                "**To access the website,** click on the link below or type it into your "
+                "address bar! The website requires you to log in via Discord, so there is "
+                "no need to make a new log in or provide any personal information.\n\n"
+                "https://panem-sportsbook.phqen1x.com"
             ),
             color=0xC9A227,
         )
@@ -42,7 +47,7 @@ class ActivityCog(commands.Cog):
                 discord.ui.Button(
                     label="Open in browser",
                     style=discord.ButtonStyle.link,
-                    url=f"{config.WEB_BASE_URL}/activity",
+                    url=f"{config.WEB_BASE_URL}",
                 )
             )
 

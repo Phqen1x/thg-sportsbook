@@ -7,7 +7,10 @@
   <p class="text-dim">Copy a pre-built parlay — you pick the wager, legs are locked in.</p>
 </div>
 
+{% if templates or member_parlays %}
+
 {% if templates %}
+<h2>Featured</h2>
 <div class="tail-grid">
   {% for tpl in templates %}
   {% set legs = tpl_legs.get(tpl.id, []) %}
@@ -43,16 +46,32 @@
       </tbody>
     </table>
 
+    {% set combo = tpl_combined.get(tpl.id) %}
+    {% if combo is not none %}
+    <div class="tail-combined-row">
+      <span class="text-dim">Combined odds</span>
+      <span class="{% if combo >= 0 %}text-pos{% else %}text-neg{% endif %} font-bold">{{ combo | fmt_odds }}</span>
+    </div>
+    {% endif %}
+
     {% if user and db_user %}
     <form method="post" action="/tail/{{ tpl.id }}" class="tail-form mt-1">
       <div class="form-group">
         <label class="form-label">Wager (chips)</label>
         <div class="input-row">
-          <input type="number" name="wager" class="form-control" min="1" max="{{ db_user.chips }}" value="100" required>
+          <input type="number" name="wager" class="form-control tail-wager" min="1" max="{{ db_user.chips }}" value="100" required
+                 data-odds="{{ combo if combo is not none else 0 }}" oninput="updateTailPayout(this)">
           <button type="submit" class="btn btn-primary">Tail</button>
+        </div>
+        <div class="payout-preview">
+          <span class="text-dim">Potential payout</span>
+          <span class="tail-payout text-gold font-bold">—</span>
         </div>
         <div class="text-dim" style="font-size:0.8rem">Balance: {{ db_user.chips | fmt_chips }} chips</div>
       </div>
+    </form>
+    <form method="post" action="/tail/{{ tpl.id }}/add-to-slip" class="mt-1">
+      <button type="submit" class="btn btn-outline btn-full btn-sm">Add to My Slip (edit before betting)</button>
     </form>
     {% else %}
     <div class="mt-1">
@@ -62,10 +81,92 @@
   </div>
   {% endfor %}
 </div>
+{% endif %}
+
+{% if member_parlays %}
+<h2 class="mt-2">Member Parlays</h2>
+<div class="tail-grid">
+  {% for mp in member_parlays %}
+  {% set legs = member_parlay_legs.get(mp.id, []) %}
+  {% set owner = member_parlay_owners.get(mp.id, 'Member') %}
+  <div class="card tail-card">
+    <div class="tail-card-header">
+      <div class="tail-title">{{ owner }}'s Parlay</div>
+      <span class="difficulty-badge">MEMBER</span>
+    </div>
+    <table class="table table-sm mt-1">
+      <tbody>
+        {% for leg in legs %}
+        {% set mkt = member_parlay_markets.get(leg.market_id) %}
+        <tr>
+          <td class="text-dim">{{ loop.index }}</td>
+          <td>{{ mkt.label if mkt else 'Unknown Market' }}</td>
+          <td>
+            {% if mkt %}
+            <span class="{% if mkt.odds > 0 %}text-pos{% else %}text-neg{% endif %} font-bold">
+              {{ mkt.odds | fmt_odds }}
+            </span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% if user and db_user %}
+    <form method="post" action="/tail/parlay/{{ mp.id }}" class="tail-form mt-1">
+      <div class="form-group">
+        <label class="form-label">Wager (chips)</label>
+        <div class="input-row">
+          <input type="number" name="wager" class="form-control tail-wager" min="1" max="{{ db_user.chips }}" value="100" required
+                 data-odds="{{ member_parlay_combined.get(mp.id) if member_parlay_combined.get(mp.id) is not none else 0 }}" oninput="updateTailPayout(this)">
+          <button type="submit" class="btn btn-primary">Tail</button>
+        </div>
+        <div class="payout-preview">
+          <span class="text-dim">Potential payout</span>
+          <span class="tail-payout text-gold font-bold">—</span>
+        </div>
+        <div class="text-dim" style="font-size:0.8rem">Balance: {{ db_user.chips | fmt_chips }} chips</div>
+      </div>
+    </form>
+    <form method="post" action="/tail/parlay/{{ mp.id }}/add-to-slip" class="mt-1">
+      <button type="submit" class="btn btn-outline btn-full btn-sm">Add to My Slip (edit before betting)</button>
+    </form>
+    {% else %}
+    <div class="mt-1">
+      <a href="/auth/login" class="btn btn-outline btn-full">Login to Tail</a>
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 {% else %}
 <div class="empty-state">
   No public parlays available to tail right now.<br>
   <a href="/parlay" class="btn btn-outline mt-2">Build Your Own</a>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+function calcTailPayout(wager, odds) {
+  if (!odds) return 0;
+  if (odds > 0) return Math.round(wager * (odds / 100 + 1));
+  return Math.round(wager * (100 / Math.abs(odds) + 1));
+}
+
+function updateTailPayout(input) {
+  const odds = parseInt(input.dataset.odds) || 0;
+  const w = parseInt(input.value) || 0;
+  const display = input.closest('.form-group').querySelector('.tail-payout');
+  if (!display) return;
+  const p = w > 0 ? calcTailPayout(w, odds) : 0;
+  display.textContent = p > 0 ? p.toLocaleString() + ' chips' : '—';
+}
+
+document.querySelectorAll('.tail-wager').forEach(updateTailPayout);
+</script>
 {% endblock %}

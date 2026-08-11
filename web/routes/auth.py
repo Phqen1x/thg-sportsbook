@@ -8,6 +8,7 @@ from fastapi.responses import RedirectResponse
 from urllib.parse import urlencode
 
 from web import config, discord_api
+from web.database import available_guilds
 from web.session import SessionUser, clear_session, set_session
 
 router = APIRouter(tags=["auth"])
@@ -56,14 +57,30 @@ async def callback(code: str | None = None, state: str | None = None, error: str
         member = await discord_api.get_member(uid)
         if member is None:
             return RedirectResponse("/?error=You+must+be+a+server+member+to+log+in.")
+        if not await discord_api.can_use_bot(member, uid):
+            return RedirectResponse("/?error=You+don't+have+permission+to+use+this+bot!")
         admin = await discord_api.check_admin(member)
+        guilds = available_guilds()
+        # Auto-select guild if there's only one option; otherwise let the user pick.
+        guild_id: int | None = guilds[0] if len(guilds) == 1 else None
+
+        from bot.database.engine import get_tribute_lock, TRIBUTE_LOCK_MESSAGE
+        from web.database import set_request_guild, get_db
+        lock_gid = guild_id or config.GUILD_ID or 0
+        set_request_guild(lock_gid)
+        async with get_db() as db:
+            if await get_tribute_lock(db, lock_gid, uid) is not None:
+                return RedirectResponse(f"/?{urlencode({'error': TRIBUTE_LOCK_MESSAGE})}")
+
         user = SessionUser(
             discord_id=uid,
             username=user_data.get("global_name") or user_data.get("username", "Unknown"),
             avatar=user_data.get("avatar"),
             is_admin=admin,
+            guild_id=guild_id,
         )
-        resp = RedirectResponse("/")
+        dest = "/" if guild_id else "/select-server"
+        resp = RedirectResponse(dest)
         set_session(resp, user)
         return resp
     except Exception:
