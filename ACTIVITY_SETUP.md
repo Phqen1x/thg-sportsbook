@@ -116,3 +116,29 @@ alliances, settings) stays in the browser dashboard. To add more admin actions l
 add a `bearer_admin`-guarded endpoint in `web/routes/activity.py` and surface it from
 the matching section in `web/activity/static/app.js` (`viewAdmin` / `admin*`
 functions) — the patterns mirror the existing live-ops actions.
+
+### Promotions admin (bonus bets / profit boosts / deposit match)
+
+The **Promos** sub-tab in the Activity (and `/admin/promotions` on the website)
+manages bonus bets, profit-boost templates/grants, and deposit-match promos. Grants
+target **one member at a time** or **every new member on first interaction** — no
+privileged intents are required.
+
+To hand a reward to **a role** or **the whole server**, post a **claim drop** — a
+channel message with a **Claim** button anyone can press once to be granted the
+configured bonus bets or profit-boost template. Optionally cap it with a max number of
+claims and/or a button lifetime; the button self-deactivates when either limit is
+reached. Only members with a full ("ALL") betting ban are turned away — partial
+restrictions and public-parlay blocks can still claim.
+
+Post one from either surface:
+
+- **Activity → Admin → Promos → "Post a claim drop"** (pick a channel, reward, message).
+- **Discord:** `/promo drop channel:#promos reward:"Bonus bets" bonus_amount:2500 message:"..." max_claims:50 duration_hours:24`
+
+The web app posts the message via the bot token; the bot registers the button handler
+on startup and services clicks regardless of which surface created the drop.
+
+New members are seeded with `signup_bonus_bet_amount` (Settings, default 2500) in bonus
+bets instead of real chips — set `default_chips` above 0 if you also want new members to
+start with spendable chips.

@@ -632,11 +632,22 @@ async function viewMyBets(view) {
   const M = data.markets;
   const mlabel = (id) => (M[id] ? M[id].label : `Market #${id}`);
 
+  // Bonus / boost breakdown line — the bonus stake is not returned on a win, so
+  // payouts shown here are net of it.
+  const promoLine = (stake, bonus, pct, rawPayout, boostedPayout) => {
+    if (!bonus && !pct) return "";
+    const parts = [];
+    if (bonus) parts.push(`${fmtChips(bonus)} bonus + ${fmtChips(stake - bonus)} chips (bonus stake not returned)`);
+    if (pct) parts.push(`+${pct}% boost: payout ${fmtChips(rawPayout - bonus)} &rarr; ${fmtChips(boostedPayout - bonus)}`);
+    return `<div class="dim" style="font-size:0.85em">Stake ${fmtChips(stake)} — ${parts.join(" · ")}</div>`;
+  };
+
   const straight = data.straight_bets.map((b) => `
     <div class="card bet-row">
       <div class="bet-main">
         <div class="bet-label">${esc(mlabel(b.market_id))}</div>
-        <div class="dim">Wager ${fmtChips(b.wager)} @ ${fmtOdds(b.odds_at_placement)} · win ${fmtChips(b.payout_if_win)}</div>
+        <div class="dim">Wager ${fmtChips(b.wager)} @ ${fmtOdds(b.odds_at_placement)} · win ${fmtChips(b.payout_if_win - b.bonus_bet_amount)}</div>
+        ${promoLine(b.wager, b.bonus_bet_amount, b.profit_boost_pct, b.raw_payout, b.payout_if_win)}
       </div>
       <span class="status status-${esc(b.status.toLowerCase())}">${esc(b.status)}</span>
       ${b.status === "PENDING" && b.cashout_preview != null ? `<button class="btn btn-outline btn-sm" data-act="cashout-bet" data-id="${b.id}" data-amount="${b.cashout_preview}">Cash out (${fmtChips(b.cashout_preview)})</button>` : ""}
@@ -648,7 +659,8 @@ async function viewMyBets(view) {
         <span>Parlay · ${p.legs.length} legs</span>
         <span class="status status-${esc(p.status.toLowerCase())}">${esc(p.status)}</span>
       </div>
-      <div class="dim">Wager ${fmtChips(p.total_wager)} · payout ${fmtChips(p.total_payout)}</div>
+      <div class="dim">Wager ${fmtChips(p.total_wager)} · payout ${fmtChips(p.total_payout - p.bonus_bet_amount)}</div>
+      ${promoLine(p.total_wager, p.bonus_bet_amount, p.profit_boost_pct, p.raw_total_payout, p.total_payout)}
       <ul class="parlay-legs">
         ${p.legs.map((l) => `<li><span class="leg-status status-${esc(l.status.toLowerCase())}">${esc(l.status)}</span> ${esc(mlabel(l.market_id))}</li>`).join("")}
       </ul>
@@ -678,6 +690,9 @@ async function viewMyBets(view) {
 async function viewParlay(view) {
   const data = await api("/parlay");
   const legs = data.legs.filter((l) => l.market);
+  let promoInfo = { bonus_balance: 0, boosts: [] };
+  try { promoInfo = await api("/my-boosts"); } catch (e) { /* non-fatal */ }
+  const bonusBal = promoInfo.bonus_balance || 0;
   view.innerHTML = `
     <div class="parlay-builder">
       <div class="parlay-summary card">
@@ -696,7 +711,12 @@ async function viewParlay(view) {
       </div>
       ${legs.length >= 2 ? `
         <div class="card parlay-submit">
-          <input id="parlay-wager" type="number" min="1" placeholder="Wager (chips)" class="input">
+          <input id="parlay-wager" type="number" min="0" placeholder="${bonusBal ? "Wager in chips (optional with bonus bets)" : "Wager (chips)"}" class="input">
+          ${bonusBal ? `<input id="parlay-bonus" class="input" type="number" min="0" max="${bonusBal}" value="0" placeholder="Bonus bets to stake (max ${fmtChips(bonusBal)})">` : ""}
+          ${promoInfo.boosts.length ? `<select id="parlay-boost" class="input">
+            <option value="">No profit boost</option>
+            ${promoInfo.boosts.map((b) => `<option value="${b.id}">${esc(b.label)}</option>`).join("")}
+          </select>` : ""}
           <div class="modal-payout dim" id="parlay-payout"></div>
           <label class="checkbox"><input type="checkbox" id="parlay-public" checked> List on tail board</label>
           <div class="row-buttons">
@@ -714,20 +734,42 @@ async function viewParlay(view) {
   const feature = $("#parlay-feature", view);
   if (feature) feature.addEventListener("click", () => openFeatureParlayModal());
   const wagerEl = $("#parlay-wager", view);
+  const pBonusEl = $("#parlay-bonus", view);
+  const pBoostEl = $("#parlay-boost", view);
   if (wagerEl && data.combined_odds != null) {
-    wagerEl.addEventListener("input", () => {
+    const recalc = () => {
       const w = Number(wagerEl.value) || 0;
-      const payout = Math.min(payoutForWager(w, data.combined_odds), parlayPayoutCap());
-      $("#parlay-payout", view).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
-    });
+      const bonus = pBonusEl ? (Number(pBonusEl.value) || 0) : 0;
+      const stake = w + bonus;
+      let payout = payoutForWager(stake, data.combined_odds);
+      let pct = 0;
+      if (pBoostEl && pBoostEl.value) {
+        const b = promoInfo.boosts.find((x) => String(x.id) === pBoostEl.value);
+        if (b) pct = b.pct;
+      }
+      // client preview only — server applies the boost per matching leg
+      if (pct) payout = stake + Math.round((payout - stake) * (1 + pct / 100));
+      payout = Math.min(payout, parlayPayoutCap());
+      const shown = payout - bonus;
+      $("#parlay-payout", view).textContent = stake
+        ? `Win ~${fmtChips(shown)} chips${pct ? ` (+${pct}% boost, applied to matching legs)` : ""}${bonus ? ` — winnings only, bonus stake not returned` : ""}`
+        : "";
+    };
+    wagerEl.addEventListener("input", recalc);
+    if (pBonusEl) pBonusEl.addEventListener("input", recalc);
+    if (pBoostEl) pBoostEl.addEventListener("change", recalc);
   }
   const go = $("#parlay-go", view);
   if (go) go.addEventListener("click", async () => {
-    const wager = Number($("#parlay-wager", view).value);
+    const wager = Number($("#parlay-wager", view).value) || 0;
     const is_public = $("#parlay-public", view).checked;
-    if (!wager || wager < 1) return toast("Enter a wager of at least 1 chip.", "error");
+    const bonusV = pBonusEl ? (Number(pBonusEl.value) || 0) : 0;
+    if (wager < 1 && bonusV < 1) return toast("Enter a wager or apply bonus bets.", "error");
+    const body = { wager, is_public };
+    if (bonusV > 0) body.bonus_amount = bonusV;
+    if (pBoostEl && pBoostEl.value) body.profit_boost_token_id = Number(pBoostEl.value);
     try {
-      const r = await api("/parlay/submit", { method: "POST", body: { wager, is_public } });
+      const r = await api("/parlay/submit", { method: "POST", body });
       toast(r.message);
       await refreshMe();
       location.hash = "#mybets";
@@ -799,18 +841,31 @@ async function viewBalance(view) {
       <div class="card balance-chip-card">
         <div class="balance-chip-count">${fmtChips(meData.chips)}</div>
         <div class="dim">chips</div>
+        ${meData.bonus_bet_balance ? `<div class="odds-pos" id="bonus-toggle" role="button" tabindex="0" style="margin-top:6px;cursor:pointer;text-decoration:underline dotted">${fmtChips(meData.bonus_bet_balance)} bonus bets ▸</div>
+          <div class="dim" style="font-size:0.8rem">${meData.bonus_bet_next_expiry ? "next expiry " + meData.bonus_bet_next_expiry.slice(0, 10) : "no expiry"}</div>
+          <div id="bonus-breakdown" hidden style="margin-top:8px;text-align:left"></div>` : ""}
       </div>
       <div class="card">
         <table class="balance-stats-table">
           <tr><td class="dim">Total Wagered</td><td class="chips">${fmtChips(meData.total_wagered)}</td></tr>
           <tr><td class="dim">Total Won</td><td class="odds-pos">${fmtChips(meData.total_won)}</td></tr>
           <tr><td class="dim">ROI</td><td class="${roi >= 0 ? "odds-pos" : "odds-neg"}">${roi >= 0 ? "+" : ""}${roi}%</td></tr>
+          ${meData.bonus_wagered ? `<tr><td class="dim">Bonus Wagered</td><td>${fmtChips(meData.bonus_wagered)}</td></tr>` : ""}
+          ${meData.bonus_won ? `<tr><td class="dim">Bonus Won</td><td class="odds-pos">${fmtChips(meData.bonus_won)}</td></tr>` : ""}
           <tr><td class="dim">Straight Bets</td><td>${straight.length}</td></tr>
           <tr><td class="dim">Parlays</td><td>${parlays.length}</td></tr>
           <tr><td class="dim">Win Rate</td><td>${winRate}</td></tr>
         </table>
       </div>
     </div>
+    ${(meData.active_boosts && meData.active_boosts.length) ? `
+      <h2 class="section-title">Your Profit Boosts</h2>
+      <div class="list">
+        ${meData.active_boosts.map((b) => {
+          let s = b.scope_type === "DISTRICT" ? `District ${b.scope_id}` : b.scope_type === "ALLIANCE" ? `Alliance #${b.scope_id}` : "Any bet";
+          return `<div class="card bet-row"><span class="odds-pos">+${b.pct}%</span> · ${s}${b.expires_at ? ` · <span class="dim">exp ${b.expires_at.slice(0, 10)}</span>` : ""}</div>`;
+        }).join("")}
+      </div>` : ""}
     <h2 class="section-title">Recent Activity</h2>
     <div class="list">
       ${activity.length ? activity.map((a) => `
@@ -822,6 +877,36 @@ async function viewBalance(view) {
           <span class="status status-${esc(a.status.toLowerCase())}">${esc(a.status)}</span>
         </div>`).join("") : `<div class="empty">No activity yet.</div>`}
     </div>`;
+
+  const toggle = $("#bonus-toggle", view);
+  if (toggle) {
+    const panel = $("#bonus-breakdown", view);
+    let loaded = false;
+    const open = async () => {
+      if (!loaded) {
+        try {
+          const d = await api("/my-bonus-lots");
+          panel.innerHTML = d.lots.length
+            ? d.lots.map((l) => `<div class="card bet-row" style="display:block">
+                <span class="odds-pos">${fmtChips(l.amount_remaining)}</span>
+                <span class="dim"> / ${fmtChips(l.original_amount)}</span> · ${esc(l.source)}
+                <div class="dim" style="font-size:0.8rem">${l.expires_at ? "expires " + l.expires_at.slice(0, 10) : "no expiry"}</div>
+              </div>`).join("")
+            : `<div class="dim">No active bonus bets.</div>`;
+        } catch (e) {
+          panel.innerHTML = `<div class="dim">${esc(e.message)}</div>`;
+        }
+        loaded = true;
+      }
+      const showing = !panel.hidden;
+      panel.hidden = showing;
+      toggle.textContent = `${fmtChips(meData.bonus_bet_balance)} bonus bets ${showing ? "▸" : "▾"}`;
+    };
+    toggle.addEventListener("click", open);
+    toggle.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); open(); }
+    });
+  }
 }
 
 // ── Views: Admin (live-game ops) ───────────────────────────────────────────────
@@ -846,6 +931,7 @@ async function viewAdmin(view) {
       <a href="${base}#admin/banners"  class="${sub === "banners"  ? "active" : ""}">Banners</a>
       <a href="${base}#admin/parlays"  class="${sub === "parlays"  ? "active" : ""}">Parlays</a>
       <a href="${base}#admin/rates"    class="${sub === "rates"    ? "active" : ""}">Rates</a>
+      <a href="${base}#admin/promos"   class="${sub === "promos"   ? "active" : ""}">Promos</a>
     </div>
     <div id="admin-body"><div class="loading-inline">Loading…</div></div>`;
   const startBtn = $("#admin-start-game", view);
@@ -861,7 +947,315 @@ async function viewAdmin(view) {
   if (sub === "banners")  return adminBanners(body);
   if (sub === "parlays")  return adminParlays(body);
   if (sub === "rates")    return adminRates(body);
+  if (sub === "promos")   return adminPromos(body);
   return adminMarkets(body);
+}
+
+async function adminPromos(body) {
+  let data;
+  try {
+    data = await api("/admin/promos");
+  } catch (e) {
+    body.innerHTML = `<div class="card dim">${esc(e.message)}</div>`;
+    return;
+  }
+  // promo timestamps come back as naive-UTC ISO (no zone) — render in local time
+  const fmtDt = (iso) => {
+    if (!iso) return "";
+    const d = new Date(/[Z+]/.test(iso) ? iso : iso + "Z");
+    return isNaN(d) ? iso : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  };
+  const scopeSel = (name) => `
+    <select id="${name}" class="input">
+      <option value="USER">A user</option>
+      <option value="FIRST_TOUCH">Every new member (first interaction)</option>
+    </select>`;
+  const channels = data.channels || [];
+  const roles = data.roles || [];
+  const channelField = channels.length
+    ? `<select id="cd-channel" class="input">${channels.map((c) => `<option value="${c.id}">#${esc(c.name)}</option>`).join("")}</select>`
+    : `<input id="cd-channel" class="input" placeholder="Channel ID">`;
+  const roleField = roles.length
+    ? `<select id="cd-role" class="input"><option value="">No role ping</option>${roles.map((r) => `<option value="${r.id}">@${esc(r.name)}</option>`).join("")}</select>`
+    : `<input id="cd-role" class="input" placeholder="Ping role ID (optional)">`;
+  body.innerHTML = `
+    <div class="cd-row" style="display:flex;flex-wrap:wrap;gap:.6rem;margin-bottom:.6rem">
+    <div class="card admin-form" style="flex:1 1 260px">
+      <div class="card-label">POST A CLAIM DROP</div>
+      <div class="dim" style="width:100%">Posts an embed with a Claim button in a channel. Any member who isn't blocked from betting can claim once.</div>
+      ${channelField}
+      ${roleField}
+      <select id="cd-kind" class="input">
+        <option value="BONUS">Bonus bets</option>
+        <option value="BOOST">Profit boost</option>
+      </select>
+      <input id="cd-amount" class="input" type="number" min="1" value="2500" placeholder="Bonus amount (chips)">
+      <select id="cd-tpl" class="input" style="display:none">
+        ${data.templates.map((t) => `<option value="${t.id}">${esc(t.name)} (+${t.boost_pct}%, ${t.scope_type})</option>`).join("")}
+      </select>
+      <textarea id="cd-msg" class="input" rows="3" placeholder="Announcement text, shown inside the embed"></textarea>
+      <input id="cd-max" class="input" type="number" min="1" placeholder="Max claims (blank = unlimited)">
+      <input id="cd-dur" class="input" type="number" min="1" placeholder="Button open for N hours (blank = no limit)">
+      <input id="cd-rexp" class="input" type="number" min="1" placeholder="Reward expires after N days (blank = permanent)">
+      <button class="btn btn-primary" id="cd-go">Post Drop</button>
+    </div>
+    <div class="card" style="flex:1 1 260px">
+      <div class="card-label">MESSAGE PREVIEW</div>
+      <div id="cd-preview"></div>
+    </div>
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">GRANT BONUS BETS</div>
+      <div class="dim" style="width:100%">Free credit in chips. A win pays winnings only; a loss costs nothing; no cash value. To reach a role or the whole server, use <code>/promo drop</code> in Discord.</div>
+      ${scopeSel("bg-scope")}
+      <input id="bg-target" class="input" placeholder="Discord user ID (blank for first-interaction)">
+      <input id="bg-amount" class="input" type="number" min="1" value="2500" placeholder="Amount (chips)">
+      <input id="bg-days" class="input" type="number" min="1" placeholder="Valid days (blank = permanent)">
+      <input id="bg-hours" class="input" type="number" min="1" placeholder="Valid hours (optional)">
+      <input id="bg-note" class="input" placeholder="Note (optional)">
+      <button class="btn btn-primary" id="bg-go">Grant Bonus</button>
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">DEDUCT BONUS BETS</div>
+      <select id="bd-scope" class="input"><option value="USER">A user</option></select>
+      <input id="bd-target" class="input" placeholder="Discord user ID">
+      <input id="bd-amount" class="input" type="number" min="1" placeholder="Amount (blank = wipe balance)">
+      <button class="btn btn-danger" id="bd-go">Deduct</button>
+    </div>
+
+    ${data.ft_bonus.length ? `<div class="card">
+      <div class="card-label">FIRST-INTERACTION BONUS RULES</div>
+      ${data.ft_bonus.map((g) => `<div class="list-row">
+        <span>${fmtChips(g.amount)}${g.expiry_hours ? ` · ${g.expiry_hours}h` : ""}${g.note ? ` · ${esc(g.note)}` : ""}</span>
+        <button class="btn btn-sm btn-danger" data-act="ft-del" data-id="${g.id}">Remove</button>
+      </div>`).join("")}
+    </div>` : ""}
+
+    <div class="card">
+      <div class="card-label">OUTSTANDING BONUS BALANCES</div>
+      ${data.bonus_users.length ? data.bonus_users.map((e) => `<div class="list-row">
+        <span>${esc(e.name)} <span class="dim">${e.uid}</span> — <span class="odds-pos">${fmtChips(e.total)}</span>${e.expiry ? ` <span class="dim">exp ${e.expiry.slice(0, 16).replace("T", " ")}</span>` : ""}</span>
+        <button class="btn btn-sm btn-danger" data-act="bu-revoke" data-id="${e.uid}">Revoke all</button>
+      </div>`).join("") : `<div class="dim">No outstanding bonus bets.</div>`}
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">NEW PROFIT BOOST TEMPLATE</div>
+      <div class="dim" style="width:100%">Single-use token that lifts a wager's winnings by a %. Consumed on use, win or lose.</div>
+      <input id="bt-name" class="input" placeholder="Name">
+      <input id="bt-pct" class="input" type="number" min="1" value="50" placeholder="Boost %">
+      <select id="bt-scope" class="input">
+        <option value="ANY">Any bet</option>
+        <option value="DISTRICT">A district</option>
+        <option value="ALLIANCE">An alliance</option>
+      </select>
+      <input id="bt-scopeid" class="input" placeholder="District # / alliance ID (scoped only)">
+      <input id="bt-maxwager" class="input" type="number" min="0" placeholder="Max wager (optional)">
+      <label class="dim" style="width:100%"><input type="checkbox" id="bt-ft"> Grant to every new member on first interaction</label>
+      <button class="btn btn-primary" id="bt-go">Create Template</button>
+    </div>
+
+    <div class="card">
+      <div class="card-label">BOOST TEMPLATES</div>
+      ${data.templates.length ? data.templates.map((t) => `<div class="list-row">
+        <span>${esc(t.name)} — <span class="odds-pos">+${t.boost_pct}%</span> ${t.scope_type}${t.scope_id != null ? ` #${t.scope_id}` : ""}${t.max_wager ? ` · max ${fmtChips(t.max_wager)}` : ""}${t.grant_on_first_touch ? " · first-touch" : ""} ${t.active ? "" : "<span class='dim'>(disabled)</span>"}</span>
+        <span>
+          <button class="btn btn-sm" data-act="bt-toggle" data-id="${t.id}">${t.active ? "Disable" : "Enable"}</button>
+          <button class="btn btn-sm btn-danger" data-act="bt-del" data-id="${t.id}">Delete</button>
+        </span>
+      </div>`).join("") : `<div class="dim">No templates yet.</div>`}
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">GRANT A BOOST</div>
+      <select id="bgr-tpl" class="input">
+        ${data.templates.map((t) => `<option value="${t.id}">${esc(t.name)} (+${t.boost_pct}%, ${t.scope_type})</option>`).join("")}
+      </select>
+      ${scopeSel("bgr-scope")}
+      <input id="bgr-target" class="input" placeholder="Discord user ID (blank for first-interaction)">
+      <input id="bgr-days" class="input" type="number" min="1" placeholder="Valid days (blank = no expiry)">
+      <input id="bgr-hours" class="input" type="number" min="1" placeholder="Valid hours (optional)">
+      <button class="btn btn-primary" id="bgr-go">Grant Boost</button>
+    </div>
+
+    <div class="card">
+      <div class="card-label">OUTSTANDING BOOST TOKENS</div>
+      ${data.tokens.length ? data.tokens.map((t) => `<div class="list-row">
+        <span>${esc(t.name)} <span class="dim">${t.uid}</span> — <span class="odds-pos">+${t.boost_pct}%</span> ${t.scope_type}${t.scope_id != null ? ` #${t.scope_id}` : ""}${t.expires_at ? ` <span class="dim">exp ${t.expires_at.slice(0, 16).replace("T", " ")}</span>` : ""}</span>
+        <button class="btn btn-sm btn-danger" data-act="tok-revoke" data-id="${t.id}">Revoke</button>
+      </div>`).join("") : `<div class="dim">No outstanding tokens.</div>`}
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">NEW DEPOSIT MATCH PROMO</div>
+      <div class="dim" style="width:100%">On "Mark Done" of a member's /deposit during the window, grant the match % as bonus bets, up to the per-member cap (cumulative).</div>
+      <input id="dm-name" class="input" placeholder="Name">
+      <input id="dm-pct" class="input" type="number" min="1" value="100" placeholder="Match %">
+      <input id="dm-cap" class="input" type="number" min="1" value="5000" placeholder="Max match per member (bonus bets)">
+      <input id="dm-bexp" class="input" type="number" min="1" placeholder="Matched bonus bets expire after N days (blank = permanent)">
+      <input id="dm-start" class="input" type="datetime-local" placeholder="Starts (blank = now)">
+      <input id="dm-end" class="input" type="datetime-local" placeholder="Ends">
+      <input id="dm-role" class="input" placeholder="Restrict to role ID (optional)">
+      <button class="btn btn-primary" id="dm-go">Create Promo</button>
+    </div>
+
+    <div class="card">
+      <div class="card-label">DEPOSIT MATCH PROMOS</div>
+      ${data.deposit_promos.length ? data.deposit_promos.map((p) => `<div class="list-row">
+        <span>${esc(p.name)} ${p.live ? "<span class='odds-pos'>● live</span>" : ""} — ${p.match_pct}% up to ${fmtChips(p.max_match_per_user)} in bonus bets · <span class="dim">${p.match_bonus_expiry_days ? `${p.match_bonus_expiry_days}d expiry · ` : ""}${fmtDt(p.starts_at)} → ${fmtDt(p.ends_at)}${p.role_id ? ` · role ${p.role_id}` : ""} · ${p.claims.members} claim(s), ${fmtChips(p.claims.matched)} matched</span></span>
+        <span>
+          ${p.live ? `<button class="btn btn-sm" data-act="dm-end" data-id="${p.id}">End now</button>` : ""}
+          <button class="btn btn-sm btn-danger" data-act="dm-del" data-id="${p.id}">Delete</button>
+        </span>
+      </div>`).join("") : `<div class="dim">No promos.</div>`}
+    </div>`;
+
+  const val = (id) => $("#" + id, body).value.trim();
+  const num = (id) => Number($("#" + id, body).value) || 0;
+  // <input type="datetime-local"> is local wall-clock with no zone; send it as
+  // a UTC ISO string so the server (which compares against utcnow) reads it right.
+  const isoUtc = (id) => {
+    const v = $("#" + id, body).value;
+    return v ? new Date(v).toISOString() : "";
+  };
+  const reload = () => adminPromos(body);
+  const call = async (path, opts) => {
+    try {
+      const r = await api(path, opts);
+      toast(r.message || "Done.");
+      reload();
+    } catch (e) { toast(e.message, "error"); }
+  };
+  // window.confirm() is inert in the Discord Activity's sandboxed iframe (no
+  // allow-modals) — it returns false, so a confirm-gated handler silently does
+  // nothing. Use a two-press "click again to confirm" on the button instead.
+  const _armed = new WeakSet();
+  const armConfirm = (btn, run) => {
+    if (_armed.has(btn)) {
+      _armed.delete(btn);
+      btn.textContent = btn.dataset.confirmLabel || btn.textContent;
+      run();
+      return;
+    }
+    _armed.add(btn);
+    btn.dataset.confirmLabel = btn.dataset.confirmLabel || btn.textContent;
+    btn.textContent = "Confirm?";
+    setTimeout(() => {
+      if (_armed.has(btn)) { _armed.delete(btn); btn.textContent = btn.dataset.confirmLabel; }
+    }, 4000);
+  };
+
+  const cdKind = $("#cd-kind", body);
+  const cdRoleName = () => {
+    const el = $("#cd-role", body);
+    if (!el.value) return "";
+    if (el.tagName === "SELECT") return (el.selectedOptions[0].textContent || "").replace(/^@/, "");
+    return "role";
+  };
+  const cdRewardLabel = () => {
+    if (cdKind.value === "BONUS") return `${fmtChips(num("cd-amount"))} bonus bets`;
+    const t = data.templates.find((x) => String(x.id) === $("#cd-tpl", body).value);
+    if (!t) return "a profit boost";
+    const scope = t.scope_type === "DISTRICT" ? `District ${t.scope_id}`
+      : t.scope_type === "ALLIANCE" ? `Alliance #${t.scope_id}` : "any bet";
+    return `+${t.boost_pct}% profit boost (${scope})`;
+  };
+  const renderCdPreview = () => {
+    const p = $("#cd-preview", body);
+    const msg = $("#cd-msg", body).value.trim();
+    const roleName = cdRoleName();
+    let contains = cdRewardLabel();
+    const rexp = num("cd-rexp"), maxc = num("cd-max");
+    const extras = [];
+    if (rexp) extras.push(`expires ${rexp}d after you claim`);
+    if (maxc) extras.push(`first ${fmtChips(maxc)} claimers only`);
+    if (extras.length) contains += `<br><span class="dim">${esc(extras.join(" · "))}</span>`;
+    p.innerHTML = `
+      ${roleName ? `<div style="color:var(--cashed-out);font-weight:600;margin-bottom:.3rem">@${esc(roleName)}</div>` : ""}
+      <div style="border-left:4px solid var(--header-gold);background:var(--bg-mid);border-radius:4px;padding:.5rem .6rem">
+        <div style="font-weight:700;color:var(--text-white);margin-bottom:.25rem">🎁 Promo Drop</div>
+        <div style="white-space:pre-wrap">${esc(msg) || `<span class="dim">Your announcement text appears here…</span>`}</div>
+        <div style="margin-top:.5rem;font-size:.72rem;font-weight:700;color:var(--text-dim);letter-spacing:.05em">THIS DROP CONTAINS</div>
+        <div>${contains}</div>
+        <div class="dim" style="margin-top:.4rem;font-size:.75rem">Panem Sportsbook — press Claim below.</div>
+      </div>
+      <button class="btn btn-primary" disabled style="margin-top:.4rem;background:var(--won);border-color:var(--won)">🎁 Claim</button>`;
+  };
+  const syncCd = () => {
+    const boost = cdKind.value === "BOOST";
+    $("#cd-amount", body).style.display = boost ? "none" : "";
+    $("#cd-tpl", body).style.display = boost ? "" : "none";
+    renderCdPreview();
+  };
+  ["cd-kind", "cd-role", "cd-amount", "cd-tpl", "cd-msg", "cd-max", "cd-rexp"].forEach((id) => {
+    const el = $("#" + id, body);
+    el.addEventListener("input", renderCdPreview);
+    el.addEventListener("change", renderCdPreview);
+  });
+  cdKind.addEventListener("change", syncCd);
+  syncCd();
+  $("#cd-go", body).addEventListener("click", () => {
+    const msg = $("#cd-msg", body).value.trim();
+    if (!msg) { toast("Enter a message.", "error"); return; }
+    call("/admin/promos/claim-drop", {
+      method: "POST",
+      body: {
+        channel_id: val("cd-channel"), reward_kind: cdKind.value,
+        ping_role_id: val("cd-role"),
+        bonus_amount: num("cd-amount"),
+        boost_template_id: Number($("#cd-tpl", body).value) || 0,
+        message: msg, max_claims: num("cd-max"),
+        duration_hours: num("cd-dur"), reward_expiry_days: num("cd-rexp"),
+      },
+    });
+  });
+  $("#bg-go", body).addEventListener("click", () => call("/admin/promos/bonus/grant", {
+    method: "POST",
+    body: { scope: val("bg-scope"), target_id: val("bg-target"), amount: num("bg-amount"),
+      expiry_days: num("bg-days"), expiry_hours: num("bg-hours"), note: val("bg-note") },
+  }));
+  $("#bd-go", body).addEventListener("click", (ev) => armConfirm(ev.currentTarget, () =>
+    call("/admin/promos/bonus/deduct", { method: "POST",
+      body: { scope: val("bd-scope"), target_id: val("bd-target"), amount: num("bd-amount") } })));
+  $("#bt-go", body).addEventListener("click", () => call("/admin/promos/boost-template", {
+    method: "POST",
+    body: { name: val("bt-name"), boost_pct: num("bt-pct"), scope_type: val("bt-scope"),
+      scope_id: val("bt-scopeid"), max_wager: val("bt-maxwager"), grant_on_first_touch: $("#bt-ft", body).checked },
+  }));
+  $("#bgr-go", body).addEventListener("click", () => call("/admin/promos/boost/grant", {
+    method: "POST",
+    body: { template_id: Number($("#bgr-tpl", body).value), scope: val("bgr-scope"),
+      target_id: val("bgr-target"), expiry_days: num("bgr-days"), expiry_hours: num("bgr-hours") },
+  }));
+  $("#dm-go", body).addEventListener("click", () => call("/admin/promos/deposit-match", {
+    method: "POST",
+    body: { name: val("dm-name"), match_pct: num("dm-pct"), max_match_per_user: num("dm-cap"),
+      match_bonus_expiry_days: num("dm-bexp"),
+      starts_at: isoUtc("dm-start"), ends_at: isoUtc("dm-end"), role_id: val("dm-role") },
+  }));
+  body.querySelectorAll("[data-act]").forEach((btn) => {
+    const id = btn.dataset.id;
+    const map = {
+      "ft-del": ["/admin/promos/bonus/first-touch/" + id, "DELETE"],
+      "bu-revoke": ["/admin/promos/bonus/user/" + id + "/revoke", "POST"],
+      "bt-toggle": ["/admin/promos/boost-template/" + id + "/toggle", "POST"],
+      "bt-del": ["/admin/promos/boost-template/" + id, "DELETE"],
+      "tok-revoke": ["/admin/promos/boost/token/" + id + "/revoke", "POST"],
+      "dm-end": ["/admin/promos/deposit-match/" + id + "/end", "POST"],
+      "dm-del": ["/admin/promos/deposit-match/" + id, "DELETE"],
+    };
+    btn.addEventListener("click", () => {
+      const m = map[btn.dataset.act];
+      if (!m) return;
+      if (btn.dataset.act.endsWith("-del") || btn.dataset.act === "bu-revoke") {
+        armConfirm(btn, () => call(m[0], { method: m[1] }));
+      } else {
+        call(m[0], { method: m[1] });
+      }
+    });
+  });
 }
 
 async function adminMarkets(body) {
@@ -1447,27 +1841,56 @@ async function openBetModal(marketId) {
   const data = await api(`/markets?status=open`);
   const m = data.markets.find((x) => x.id === marketId);
   if (!m) return toast("Market is no longer open.", "error");
+  let promoInfo = { bonus_balance: 0, boosts: [] };
+  try { promoInfo = await api(`/my-boosts?market_id=${marketId}`); } catch (e) { /* non-fatal */ }
+  const bonusBal = promoInfo.bonus_balance || 0;
   const overlay = modal(`
     <h3>${esc(m.label)}</h3>
-    <div class="dim">Odds <span class="${oddsClass(m.odds)}">${fmtOdds(m.odds)}</span> · Balance ${fmtChips(ME.chips)}</div>
-    <input id="bet-wager" class="input" type="number" min="1" max="${ME.chips}" placeholder="Wager (chips)">
+    <div class="dim">Odds <span class="${oddsClass(m.odds)}">${fmtOdds(m.odds)}</span> · Balance ${fmtChips(ME.chips)}${bonusBal ? ` · Bonus ${fmtChips(bonusBal)}` : ""}</div>
+    <input id="bet-wager" class="input" type="number" min="0" placeholder="${bonusBal ? "Wager in chips (optional with bonus bets)" : "Wager (chips)"}">
+    ${bonusBal ? `<input id="bet-bonus" class="input" type="number" min="0" max="${bonusBal}" value="0" placeholder="Bonus bets to stake (max ${fmtChips(bonusBal)})">` : ""}
+    ${promoInfo.boosts.length ? `<select id="bet-boost" class="input">
+      <option value="">No profit boost</option>
+      ${promoInfo.boosts.map((b) => `<option value="${b.id}">${esc(b.label)}${b.max_wager ? ` (max ${fmtChips(b.max_wager)})` : ""}</option>`).join("")}
+    </select>` : ""}
     <div class="modal-payout dim" id="bet-payout"></div>
     <div class="row-buttons">
       <button class="btn btn-primary" id="bet-go">Place Bet</button>
       <button class="btn btn-outline" id="bet-cancel">Cancel</button>
     </div>`);
   const wagerEl = $("#bet-wager", overlay);
-  wagerEl.addEventListener("input", () => {
+  const bonusEl = $("#bet-bonus", overlay);
+  const boostEl = $("#bet-boost", overlay);
+  const recalc = () => {
     const w = Number(wagerEl.value) || 0;
-    const payout = Math.min(payoutForWager(w, m.odds), singlePayoutCap());
-    $("#bet-payout", overlay).textContent = w ? `Win ${fmtChips(payout)} chips` : "";
-  });
+    const bonus = bonusEl ? (Number(bonusEl.value) || 0) : 0;
+    const stake = w + bonus;
+    let payout = payoutForWager(stake, m.odds);
+    let pct = 0;
+    if (boostEl && boostEl.value) {
+      const b = promoInfo.boosts.find((x) => String(x.id) === boostEl.value);
+      if (b) pct = b.pct;
+    }
+    if (pct) payout = stake + Math.round((payout - stake) * (1 + pct / 100));
+    payout = Math.min(payout, singlePayoutCap());
+    const shown = payout - bonus;
+    $("#bet-payout", overlay).textContent = stake
+      ? `Win ${fmtChips(shown)} chips${pct ? ` (+${pct}% boost)` : ""}${bonus ? ` — winnings only, bonus stake not returned` : ""}`
+      : "";
+  };
+  wagerEl.addEventListener("input", recalc);
+  if (bonusEl) bonusEl.addEventListener("input", recalc);
+  if (boostEl) boostEl.addEventListener("change", recalc);
   $("#bet-cancel", overlay).addEventListener("click", () => overlay.remove());
   $("#bet-go", overlay).addEventListener("click", async () => {
-    const wager = Number(wagerEl.value);
-    if (!wager || wager < 1) return toast("Enter a wager of at least 1 chip.", "error");
+    const wager = Number(wagerEl.value) || 0;
+    const bonusV = bonusEl ? (Number(bonusEl.value) || 0) : 0;
+    if (wager < 1 && bonusV < 1) return toast("Enter a wager or apply bonus bets.", "error");
+    const body = { market_id: marketId, wager };
+    if (bonusV > 0) body.bonus_amount = bonusV;
+    if (boostEl && boostEl.value) body.profit_boost_token_id = Number(boostEl.value);
     try {
-      const r = await api("/bet", { method: "POST", body: { market_id: marketId, wager } });
+      const r = await api("/bet", { method: "POST", body });
       toast(r.message);
       overlay.remove();
       await refreshMe();

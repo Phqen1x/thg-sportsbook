@@ -121,6 +121,10 @@ class User(Base):
     chips: Mapped[int] = mapped_column(Integer, default=1000, nullable=False)
     total_wagered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_won: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Lifetime bonus-credit action, tracked apart from total_wagered/total_won so
+    # ROI and the wagered/won leaderboards stay real-chips only.
+    bonus_wagered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    bonus_won: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
@@ -150,6 +154,13 @@ class Parlay(Base):
     # WON parlay's gross payout is total_payout * this value (then capped, then
     # house cut). 1.0 = no boost. Only applied on a win; refunds are untouched.
     payout_rate_at_placement: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    # Promotions. bonus_bet_amount = slice of total_wager funded from free credit
+    # (its stake is not returned on a win). profit_boost_pct is frozen at
+    # placement and ALREADY baked into total_payout; profit_boost_token_id points
+    # at the consumed ProfitBoostToken so it can be restored on void/un-resolve.
+    bonus_bet_amount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    profit_boost_pct: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    profit_boost_token_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # When True the parlay is listed on the public tailing board so other members
     # can copy it. Members can opt out at submit time; tailed copies default off.
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -184,6 +195,11 @@ class Bet(Base):
     # time (see Parlay.payout_rate_at_placement). Used for straight bets only;
     # parlay-leg rows keep the default and the Parlay row's value is used instead.
     payout_rate_at_placement: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    # Promotions (straight bets only — parlay legs keep the defaults and the
+    # Parlay row carries the real values). See Parlay for field semantics.
+    bonus_bet_amount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    profit_boost_pct: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    profit_boost_token_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     parlay: Mapped["Parlay | None"] = relationship("Parlay", back_populates="legs")
@@ -462,3 +478,196 @@ class PublicBetRestriction(Base):
     scope: Mapped[str] = mapped_column(String(5), nullable=False)  # ROLE | USER
     target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+# ── Promotions: bonus bets, profit boosts, deposit match ──────────────────────
+
+
+class BonusBetLot(Base):
+    """A lot of free betting credit (denominated in chips) held by one member.
+
+    Multiple lots stack so credit with different expiries can coexist. A member's
+    spendable bonus balance is the sum of ``amount_remaining`` across lots whose
+    ``status`` is ACTIVE and whose ``expires_at`` is null or still in the future.
+    Placing a (partly) bonus-funded wager debits lots soonest-expiry-first; a
+    voided wager's bonus portion returns as a fresh ``source='REFUND'`` lot.
+    """
+    __tablename__ = "bonus_bet_lots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    original_amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_remaining: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # SIGNUP | GRANT_USER | ADMIN | REFUND | CLAIM | DEPOSIT_MATCH
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="ADMIN")
+    grant_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # ACTIVE | EXHAUSTED | EXPIRED | REVOKED
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class BonusGrant(Base):
+    """Audit record of one admin bonus-bet grant action, and — for
+    ``scope='FIRST_TOUCH'`` — a standing rule consulted when a brand-new user
+    row is created. For ``scope='USER'`` the grant is materialised eagerly into
+    a ``BonusBetLot`` row at grant time and this row is audit-only.
+    """
+    __tablename__ = "bonus_grants"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    scope: Mapped[str] = mapped_column(String(12), nullable=False)  # USER|FIRST_TOUCH
+    target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    expiry_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    note: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    recipients_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ProfitBoostTemplate(Base):
+    """An admin-authored profit-boost definition. Grants create per-user
+    ``ProfitBoostToken`` rows that freeze a copy of these fields."""
+    __tablename__ = "profit_boost_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    boost_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(10), nullable=False, default="ANY")  # ANY|DISTRICT|ALLIANCE
+    scope_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # district number or alliance id
+    max_wager: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    grant_on_first_touch: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ProfitBoostToken(Base):
+    """One member's single-use profit boost. Scope/percent are frozen copies of
+    the template so later template edits don't change an outstanding token.
+    Consumed (``status='USED'``) the moment it is applied to a wager, win or
+    lose; restored to ACTIVE only if that wager is voided or un-resolved."""
+    __tablename__ = "profit_boost_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    template_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    boost_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(10), nullable=False, default="ANY")
+    scope_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_wager: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="ACTIVE")  # ACTIVE|USED|EXPIRED|REVOKED
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    granted_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    grant_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    used_bet_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    used_parlay_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class ProfitBoostGrant(Base):
+    """Audit record of one profit-boost grant action, and — for
+    ``scope='FIRST_TOUCH'`` — a standing rule consulted at user creation."""
+    __tablename__ = "profit_boost_grants"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    template_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    scope: Mapped[str] = mapped_column(String(12), nullable=False)  # USER|FIRST_TOUCH
+    target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expiry_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    recipients_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class DepositMatchPromo(Base):
+    """A time-boxed promotion: when a member's deposit is fulfilled during the
+    window, the sportsbook grants ``match_pct`` of it as *bonus bets*, capped per
+    member by ``max_match_per_user`` measured against cumulative matched chips."""
+    __tablename__ = "deposit_match_promos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    match_pct: Mapped[float] = mapped_column(Float, nullable=False, default=100.0)
+    max_match_per_user: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Expiry applied to the granted bonus-bet lot (days). Null = permanent.
+    match_bonus_expiry_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    starts_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    role_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # null = everyone
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class DepositMatchClaim(Base):
+    """Per-member running totals for one deposit-match promo, so the match
+    can't be farmed across several smaller deposits."""
+    __tablename__ = "deposit_match_claims"
+    __table_args__ = (
+        UniqueConstraint("promo_id", "discord_user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    promo_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    total_deposited: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_matched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class PromoClaimDrop(Base):
+    """An admin-posted message in a channel carrying a "Claim" button. Any
+    member who presses it (and isn't blocked from betting) is granted the
+    configured reward — a fixed bonus-bet amount or a profit-boost template —
+    once. The button self-deactivates when ``max_claims`` redemptions have
+    happened or ``expires_at`` passes."""
+    __tablename__ = "promo_claim_drops"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    reward_kind: Mapped[str] = mapped_column(String(10), nullable=False)  # BONUS | BOOST
+    bonus_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    boost_template_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Expiry applied to the granted lot/token (hours). Null = permanent.
+    reward_expiry_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Role mentioned above the announcement embed when posted. Null = no ping.
+    ping_role_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The announcement body is rendered inside an embed above the Claim button.
+    message_text: Mapped[str] = mapped_column(String(2000), nullable=False, default="")
+    max_claims: Mapped[int | None] = mapped_column(Integer, nullable=True)  # null = unlimited
+    claims_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # button lifetime
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class PromoClaimRedemption(Base):
+    """One member's claim of a ``PromoClaimDrop`` — the unique constraint stops
+    a member claiming the same drop twice."""
+    __tablename__ = "promo_claim_redemptions"
+    __table_args__ = (
+        UniqueConstraint("drop_id", "discord_user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    drop_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reward_kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    amount_or_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

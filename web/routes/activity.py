@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -22,8 +23,11 @@ from bot.cogs.betting import (
 )
 from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
 from bot.database.models import (
-    Alliance, Bet, BettingPhase, DistrictRecord, ExchangeRateOverride, Market, MarketTemplate,
-    Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, PublicBetRestriction, Tribute, User,
+    Alliance, Bet, BettingPhase, BonusBetLot, BonusGrant, DepositMatchClaim,
+    DepositMatchPromo, DistrictRecord, ExchangeRateOverride, Market, MarketTemplate,
+    Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg,
+    ProfitBoostGrant, ProfitBoostTemplate, ProfitBoostToken, PromoClaimDrop,
+    PublicBetRestriction, Tribute, User,
 )
 from bot.odds.calculator import (
     combined_american, parlay_payout, resolve_cashout, straight_payout,
@@ -38,6 +42,7 @@ from bot.utils.house_cut import (
     set_house_cut_high_odds_rule,
 )
 from bot.utils.payout_caps import get_payout_cap, set_payout_cap
+from bot.utils import promos
 from bot.utils.restrictions import (
     is_fully_restricted, is_public_bet_blocked, list_public_blocks, set_public_block,
 )
@@ -115,8 +120,12 @@ def _bet_dict(b: Bet) -> dict:
         "wager": b.wager,
         "odds_at_placement": b.odds_at_placement,
         "payout_if_win": b.payout_if_win,
+        # un-boosted payout on the same stake — for the My Bets boost comparison
+        "raw_payout": straight_payout(b.wager, b.odds_at_placement) if b.parlay_id is None else b.payout_if_win,
         "status": b.status,
         "cashout_amount": b.cashout_amount,
+        "bonus_bet_amount": b.bonus_bet_amount,
+        "profit_boost_pct": b.profit_boost_pct,
         "placed_at": b.placed_at.isoformat() if b.placed_at else None,
     }
 
@@ -129,6 +138,8 @@ def _parlay_dict(p: Parlay) -> dict:
         "status": p.status,
         "cashout_amount": p.cashout_amount,
         "is_public": p.is_public,
+        "bonus_bet_amount": p.bonus_bet_amount,
+        "profit_boost_pct": p.profit_boost_pct,
         "placed_at": p.placed_at.isoformat() if p.placed_at else None,
     }
 
@@ -152,23 +163,23 @@ async def _paused() -> bool:
     return await _betting_paused()
 
 
-async def _single_cap_error_activity(amount: int, odds: int) -> str | None:
+async def _single_cap_error_activity(amount: int, odds: int, payout_override: int | None = None) -> str | None:
     """Guild-context-bound wrapper — see _paused() for why this is needed.
     Strips the Discord-markdown ** the shared helper wraps chip amounts in,
     since this surface renders errors as plain text."""
     from bot.database.engine import set_guild_context
     set_guild_context(_GUILD_ID())
-    err = await _single_cap_error(amount, odds)
+    err = await _single_cap_error(amount, odds, payout_override=payout_override)
     return err.replace("**", "") if err else None
 
 
-async def _parlay_cap_error_activity(wager: int, odds_list: list[int]) -> str | None:
+async def _parlay_cap_error_activity(wager: int, odds_list: list[int], payout_override: int | None = None) -> str | None:
     """Guild-context-bound wrapper — see _paused() for why this is needed.
     Strips the Discord-markdown ** the shared helper wraps chip amounts in,
     since this surface renders errors as plain text."""
     from bot.database.engine import set_guild_context
     set_guild_context(_GUILD_ID())
-    err = await _parlay_cap_error(wager, odds_list)
+    err = await _parlay_cap_error(wager, odds_list, payout_override=payout_override)
     return err.replace("**", "") if err else None
 
 
@@ -199,13 +210,15 @@ async def _get_or_create_user(db, session_user: SessionUser) -> User:
         default_raw = (await db.execute(
             text("SELECT value FROM game_settings WHERE key='default_chips'")
         )).fetchone()
-        default = json.loads(default_raw[0]) if default_raw else config.DEFAULT_CHIPS
+        default = json.loads(default_raw[0]) if default_raw else 0
         u = User(
             guild_id=_GUILD_ID(), discord_id=session_user.discord_id,
             username=session_user.username, chips=default,
         )
         db.add(u)
         await db.flush()
+        from bot.utils.promos import apply_first_touch_grants
+        await apply_first_touch_grants(db, _GUILD_ID(), session_user.discord_id)
     return u
 
 
@@ -229,6 +242,8 @@ async def _cashout_settings(db) -> tuple[bool, float, dict]:
 
 
 def _bet_cashout_preview(bet: Bet, market: Market | None, settings: tuple[bool, float, dict]) -> tuple[bool, int]:
+    if bet.bonus_bet_amount:
+        return (False, 0)  # bonus-funded wagers can't be cashed out
     global_allowed, global_rate, cashout_by_type = settings
     type_override = cashout_by_type.get(market.type) if market else None
     return resolve_cashout(
@@ -242,6 +257,8 @@ def _bet_cashout_preview(bet: Bet, market: Market | None, settings: tuple[bool, 
 
 
 def _parlay_cashout_preview(parlay: Parlay, settings: tuple[bool, float, dict]) -> tuple[bool, int]:
+    if parlay.bonus_bet_amount:
+        return (False, 0)  # bonus-funded wagers can't be cashed out
     global_allowed, global_rate, _by_type = settings
     return resolve_cashout(
         wager=parlay.total_wager, payout_if_win=parlay.total_payout,
@@ -341,11 +358,27 @@ async def me(user: SessionUser = Depends(bearer_user)):
         wagered = db_user.total_wagered
         roi = ((db_user.total_won - wagered) / wagered * 100) if wagered else 0.0
 
+        await promos.expire_stale(db, _GUILD_ID(), user.discord_id)
+        bonus_bal = await promos.bonus_balance(db, _GUILD_ID(), user.discord_id)
+        bonus_exp = await promos.next_bonus_expiry(db, _GUILD_ID(), user.discord_id)
+        active_boosts = await promos.active_boost_tokens(db, _GUILD_ID(), user.discord_id)
+        await db.commit()
+
     return {
         **_user_dict(db_user),
         "is_admin": user.is_admin,
         "avatar_url": user.avatar_url,
         "roi": round(roi, 1),
+        "bonus_bet_balance": bonus_bal,
+        "bonus_bet_next_expiry": bonus_exp.isoformat() if bonus_exp else None,
+        "bonus_wagered": db_user.bonus_wagered,
+        "bonus_won": db_user.bonus_won,
+        "active_boosts": [
+            {"id": t.id, "pct": t.boost_pct, "scope_type": t.scope_type,
+             "scope_id": t.scope_id,
+             "expires_at": t.expires_at.isoformat() if t.expires_at else None}
+            for t in active_boosts
+        ],
         # Exposed here (rather than only on the admin-gated /admin/payout-caps
         # endpoint) so the bet/parlay wager UI can preview an accurate payout —
         # every member already fetches /me on load and after each bet.
@@ -484,7 +517,12 @@ async def my_bets(user: SessionUser = Depends(bearer_user)):
             )).scalars().all()
             for leg in legs:
                 market_ids.add(leg.market_id)
-            parlay_out.append({**_parlay_dict(p), "legs": [_bet_dict(b) for b in legs]})
+            leg_odds = [l.odds_at_placement for l in legs]
+            raw_total = parlay_payout(p.total_wager, leg_odds) if leg_odds else p.total_payout
+            parlay_out.append({
+                **_parlay_dict(p), "legs": [_bet_dict(b) for b in legs],
+                "raw_total_payout": raw_total,
+            })
 
         if market_ids:
             mkts = (await db.execute(select(Market).where(Market.id.in_(market_ids)))).scalars().all()
@@ -517,9 +555,11 @@ async def place_bet(
     user: SessionUser = Depends(bearer_user),
     market_id: Annotated[int, Body()] = 0,
     wager: Annotated[int, Body()] = 0,
+    bonus_amount: Annotated[int, Body()] = 0,
+    profit_boost_token_id: Annotated[int | None, Body()] = None,
 ):
-    if wager < 1:
-        raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if wager < 1 and bonus_amount < 1:
+        raise HTTPException(status_code=400, detail="Enter a wager or apply bonus bets.")
     if await _paused():
         raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
@@ -531,8 +571,6 @@ async def place_bet(
         db_user = await _get_or_create_user(db, user)
         if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
             raise HTTPException(status_code=403, detail=BETTING_BLOCKED_MSG)
-        if db_user.chips < wager:
-            raise HTTPException(status_code=400, detail="Insufficient chips.")
 
         existing = (await db.execute(
             select(Bet).where(
@@ -546,31 +584,49 @@ async def place_bet(
         if existing:
             raise HTTPException(status_code=400, detail="You already have a pending bet on this market.")
 
-        cap_err = await _single_cap_error_activity(wager, market.odds)
+        info, perr = await promos.validate_wager_promos(
+            db, _GUILD_ID(), user.discord_id, db_user.chips,
+            wager=wager, bonus_amount=bonus_amount, boost_token_id=profit_boost_token_id,
+            markets=[market], is_parlay=False,
+        )
+        if perr:
+            raise HTTPException(status_code=400, detail=perr)
+        payout = info["payout"]
+        total_stake = info["total_stake"]
+        net_if_win = info["net_if_win"]
+
+        cap_err = await _single_cap_error_activity(total_stake, market.odds, payout_override=payout)
         if cap_err:
             raise HTTPException(status_code=400, detail=cap_err)
 
-        payout = straight_payout(wager, market.odds)
         bet = Bet(
             guild_id=_GUILD_ID(),
             user_id=user.discord_id,
             market_id=market_id,
-            wager=wager,
+            wager=total_stake,
             odds_at_placement=market.odds,
             payout_if_win=payout,
             payout_rate_at_placement=await _payout_rate_activity(db, user),
             status="PENDING",
+            bonus_bet_amount=info["bonus_amount"],
+            profit_boost_pct=info["boost_pct"],
+            profit_boost_token_id=info["boost_token"].id if info["boost_token"] else None,
         )
-        db_user.chips -= wager
-        db_user.total_wagered += wager
+        db_user.chips -= info["real_part"]
+        db_user.total_wagered += info["real_part"]
         db.add(bet)
+        await db.flush()
+        await promos.commit_wager_promos(db, _GUILD_ID(), db_user, info, bet_id=bet.id)
         await db.commit()
         chips_left = db_user.chips
         market_label = market.label
+        bonus_used = info["bonus_amount"]
 
-    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "BET", [market_label], wager, payout))
-    return {"ok": True, "payout_if_win": payout, "chips": chips_left,
-            "message": f"Bet placed! Win {payout:,} chips if correct."}
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "BET", [market_label], total_stake, net_if_win))
+    msg = f"Bet placed! Win {net_if_win:,} chips if correct."
+    if bonus_used:
+        msg = f"Bonus bet placed! Win {net_if_win:,} chips (winnings only — bonus stake not returned)."
+    return {"ok": True, "payout_if_win": net_if_win, "chips": chips_left, "message": msg}
 
 
 @router.post("/cashout/bet/{bet_id}")
@@ -728,9 +784,11 @@ async def parlay_submit(
     user: SessionUser = Depends(bearer_user),
     wager: Annotated[int, Body()] = 0,
     is_public: Annotated[bool, Body()] = False,
+    bonus_amount: Annotated[int, Body()] = 0,
+    profit_boost_token_id: Annotated[int | None, Body()] = None,
 ):
-    if wager < 1:
-        raise HTTPException(status_code=400, detail="Wager must be at least 1 chip.")
+    if wager < 1 and bonus_amount < 1:
+        raise HTTPException(status_code=400, detail="Enter a wager or apply bonus bets.")
     if await _paused():
         raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
@@ -755,14 +813,21 @@ async def parlay_submit(
                 raise HTTPException(status_code=400, detail="One or more markets are no longer open.")
             leg_markets.append(mkt)
 
-        if db_user.chips < wager:
-            raise HTTPException(status_code=400, detail="Insufficient chips.")
-
         odds_list = [m.odds for m in leg_markets]
-        cap_err = await _parlay_cap_error_activity(wager, odds_list)
+        info, perr = await promos.validate_wager_promos(
+            db, _GUILD_ID(), user.discord_id, db_user.chips,
+            wager=wager, bonus_amount=bonus_amount, boost_token_id=profit_boost_token_id,
+            markets=leg_markets, is_parlay=True,
+        )
+        if perr:
+            raise HTTPException(status_code=400, detail=perr)
+        total_payout = info["payout"]
+        total_stake = info["total_stake"]
+        net_if_win = info["net_if_win"]
+
+        cap_err = await _parlay_cap_error_activity(total_stake, odds_list, payout_override=total_payout)
         if cap_err:
             raise HTTPException(status_code=400, detail=cap_err)
-        total_payout = parlay_payout(wager, odds_list)
 
         role_ids = await live_role_ids(user.discord_id, user.guild_id)
         downgraded = is_public and await is_public_bet_blocked(db, _GUILD_ID(), user.discord_id, role_ids)
@@ -771,11 +836,14 @@ async def parlay_submit(
         p = Parlay(
             guild_id=_GUILD_ID(),
             user_id=user.discord_id,
-            total_wager=wager,
+            total_wager=total_stake,
             total_payout=total_payout,
             payout_rate_at_placement=await _payout_rate_activity(db, user, role_ids),
             status="PENDING",
             is_public=is_public,
+            bonus_bet_amount=info["bonus_amount"],
+            profit_boost_pct=info["boost_pct"],
+            profit_boost_token_id=info["boost_token"].id if info["boost_token"] else None,
         )
         db.add(p)
         await db.flush()
@@ -784,22 +852,26 @@ async def parlay_submit(
             db.add(Bet(
                 guild_id=_GUILD_ID(),
                 user_id=user.discord_id, parlay_id=p.id, market_id=mkt.id,
-                wager=wager, odds_at_placement=mkt.odds, payout_if_win=0, status="PENDING",
+                wager=total_stake, odds_at_placement=mkt.odds, payout_if_win=0, status="PENDING",
             ))
 
-        db_user.chips -= wager
-        db_user.total_wagered += wager
+        db_user.chips -= info["real_part"]
+        db_user.total_wagered += info["real_part"]
         for l in legs_raw:
             await db.delete(l)
+        await promos.commit_wager_promos(db, _GUILD_ID(), db_user, info, parlay_id=p.id)
         await db.commit()
         chips_left = db_user.chips
         labels = [m.label for m in leg_markets]
+        bonus_used = info["bonus_amount"]
 
-    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout))
-    message = f"Parlay submitted! Potential payout: {total_payout:,} chips."
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, total_stake, net_if_win))
+    message = f"Parlay submitted! Potential payout: {net_if_win:,} chips."
+    if bonus_used:
+        message += f" {bonus_used:,} staked as a bonus bet — winnings only on a win."
     if downgraded:
         message += " Kept private — public posting is restricted for you."
-    return {"ok": True, "total_payout": total_payout, "chips": chips_left, "message": message}
+    return {"ok": True, "total_payout": net_if_win, "chips": chips_left, "message": message}
 
 
 @router.post("/parlay/feature")
@@ -1211,14 +1283,25 @@ async def _settle_parlay(db, parlay_id: int) -> None:
             parlay.house_cut = cut
             await record_house_cut_taken(cut)
             db_user = await _fetch_user(db, parlay.user_id)
+            credited, real_won, bonus_won = promos.split_won_credit(
+                parlay.total_wager, parlay.bonus_bet_amount, paid
+            )
             if db_user:
-                db_user.chips += paid
-                db_user.total_won += paid
+                db_user.chips += credited
+                db_user.total_won += real_won
+                db_user.bonus_won += bonus_won
         elif all(l.status == "VOIDED" for l in legs):
             parlay.status = "WON"
             db_user = await _fetch_user(db, parlay.user_id)
+            refund = promos.void_chip_refund(parlay.total_wager, parlay.bonus_bet_amount)
             if db_user:
-                db_user.chips += parlay.total_wager
+                db_user.chips += refund
+            if parlay.bonus_bet_amount:
+                await promos.refund_bonus(
+                    db, parlay.guild_id, parlay.user_id, parlay.bonus_bet_amount
+                )
+            if parlay.profit_boost_token_id:
+                await promos.restore_boost_for_parlay(db, parlay.guild_id, parlay.id)
 
 
 @router.get("/banners")
@@ -1755,8 +1838,13 @@ async def admin_market_resolve(
             if bool_result is None:
                 bet.status = "VOIDED"
                 db_user = await _fetch_user(db, bet.user_id)
+                refund = promos.void_chip_refund(bet.wager, bet.bonus_bet_amount)
                 if db_user:
-                    db_user.chips += bet.wager
+                    db_user.chips += refund
+                if bet.bonus_bet_amount and bet.parlay_id is None:
+                    await promos.refund_bonus(db, bet.guild_id, bet.user_id, bet.bonus_bet_amount)
+                if bet.profit_boost_token_id and bet.parlay_id is None:
+                    await promos.restore_boost_for_bet(db, bet.guild_id, bet.id)
             elif bool_result and bet.parlay_id is None:
                 bet.status = "WON"
                 paid, cut = net_payout(
@@ -1767,9 +1855,13 @@ async def admin_market_resolve(
                 bet.house_cut = cut
                 cut_taken += cut
                 db_user = await _fetch_user(db, bet.user_id)
+                credited, real_won, bonus_won = promos.split_won_credit(
+                    bet.wager, bet.bonus_bet_amount, paid
+                )
                 if db_user:
-                    db_user.chips += paid
-                    db_user.total_won += paid
+                    db_user.chips += credited
+                    db_user.total_won += real_won
+                    db_user.bonus_won += bonus_won
             elif not bool_result and bet.parlay_id is None:
                 bet.status = "LOST"
             elif bet.parlay_id is not None:
@@ -2003,3 +2095,522 @@ async def admin_chips_set(
         name = db_user.username
     asyncio.create_task(post_admin_action(admin, "Chips set", {"user": name, "amount": f"{amount:,}"}, source="Discord Activity"))
     return {"ok": True, "message": f"Set {name} balance to {amount:,}."}
+
+
+# ── Promotions admin (Discord Activity) ──────────────────────────────────────
+
+
+def _promo_expiry_hours(days, hours) -> int | None:
+    total = int(days or 0) * 24 + int(hours or 0)
+    return total if total > 0 else None
+
+
+def _iso_to_naive_utc(s: str) -> datetime:
+    """Parse an ISO datetime (with or without a zone) to a naive-UTC datetime —
+    the form every promo timestamp is stored and compared in. A bare
+    ``datetime-local`` string (no zone) is taken as already-UTC."""
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+async def _promo_resolve_target_ids(scope: str, target_id) -> tuple[list[int], str | None]:
+    """Only per-user grants are supported. Bulk role/server distribution goes
+    through a claim drop (/promo drop in Discord) instead of enumerating members
+    (which would need the SERVER MEMBERS privileged intent)."""
+    if (scope or "").upper() != "USER":
+        return [], ("Only per-user grants are supported here — use /promo drop "
+                    "in Discord to reach a role or the whole server.")
+    try:
+        return [int(str(target_id).strip())], None
+    except (TypeError, ValueError):
+        return [], "Invalid Discord user ID."
+
+
+@router.get("/my-boosts")
+async def my_boosts(market_id: int = 0, user: SessionUser = Depends(bearer_user)):
+    """Profit-boost tokens the caller can apply — filtered to a market if given,
+    else every active token with a short scope description."""
+    async with get_db() as db:
+        gid = _GUILD_ID()
+        await promos.expire_stale(db, gid, user.discord_id)
+        await db.commit()
+        markets = []
+        if market_id:
+            m = await db.get(Market, market_id)
+            if m is not None:
+                markets = [m]
+        if markets:
+            toks = await promos.eligible_boost_tokens(db, gid, user.discord_id, markets)
+        else:
+            toks = await promos.active_boost_tokens(db, gid, user.discord_id)
+        bal = await promos.bonus_balance(db, gid, user.discord_id)
+    def _desc(t):
+        s = t.scope_type.title()
+        if t.scope_type == "DISTRICT":
+            s = f"District {t.scope_id}"
+        elif t.scope_type == "ALLIANCE":
+            s = f"Alliance #{t.scope_id}"
+        return f"+{t.boost_pct:g}% · {s}"
+    return {
+        "bonus_balance": bal,
+        "boosts": [
+            {"id": t.id, "label": _desc(t), "pct": t.boost_pct,
+             "scope_type": t.scope_type, "scope_id": t.scope_id,
+             "max_wager": t.max_wager,
+             "expires_at": t.expires_at.isoformat() if t.expires_at else None}
+            for t in toks
+        ],
+    }
+
+
+@router.get("/my-bonus-lots")
+async def my_bonus_lots(user: SessionUser = Depends(bearer_user)):
+    """Per-lot breakdown of the caller's bonus-bet balance (soonest expiry
+    first), for the balance-screen drill-down."""
+    _SRC_LABEL = {
+        "SIGNUP": "Sign-up bonus", "GRANT_USER": "Admin grant", "ADMIN": "Admin grant",
+        "REFUND": "Refunded from a voided bet", "CLAIM": "Claim drop",
+    }
+    async with get_db() as db:
+        gid = _GUILD_ID()
+        await promos.expire_stale(db, gid, user.discord_id)
+        await db.commit()
+        lots = await promos.active_bonus_lots(db, gid, user.discord_id)
+        total = sum(l.amount_remaining for l in lots)
+    return {
+        "total": total,
+        "lots": [
+            {"amount_remaining": l.amount_remaining,
+             "original_amount": l.original_amount,
+             "source": _SRC_LABEL.get(l.source, l.source.title()),
+             "expires_at": l.expires_at.isoformat() if l.expires_at else None}
+            for l in lots
+        ],
+    }
+
+
+@router.get("/admin/promos")
+async def admin_promos(admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        gid = _GUILD_ID()
+        await promos.expire_stale(db, gid)
+        await db.commit()
+        lots = (await db.execute(
+            select(BonusBetLot).where(BonusBetLot.guild_id == gid, BonusBetLot.status == "ACTIVE")
+        )).scalars().all()
+        agg: dict[int, dict] = {}
+        for lot in lots:
+            e = agg.setdefault(lot.discord_user_id, {"uid": str(lot.discord_user_id), "total": 0, "expiry": None})
+            e["total"] += lot.amount_remaining
+            if lot.expires_at and (e["expiry"] is None or lot.expires_at.isoformat() < e["expiry"]):
+                e["expiry"] = lot.expires_at.isoformat()
+        ft_bonus = (await db.execute(
+            select(BonusGrant).where(
+                BonusGrant.guild_id == gid, BonusGrant.scope == "FIRST_TOUCH",
+                BonusGrant.active == True,  # noqa: E712
+            )
+        )).scalars().all()
+        templates = (await db.execute(
+            select(ProfitBoostTemplate).where(ProfitBoostTemplate.guild_id == gid)
+            .order_by(ProfitBoostTemplate.id.desc())
+        )).scalars().all()
+        tokens = (await db.execute(
+            select(ProfitBoostToken).where(
+                ProfitBoostToken.guild_id == gid, ProfitBoostToken.status == "ACTIVE"
+            ).order_by(ProfitBoostToken.id.desc())
+        )).scalars().all()
+        names: dict[int, str] = {}
+        name_uids = set(agg) | {t.discord_user_id for t in tokens}
+        if name_uids:
+            for uid, nm in (await db.execute(
+                select(User.discord_id, User.username).where(
+                    User.guild_id == gid, User.discord_id.in_(list(name_uids))
+                )
+            )).all():
+                names[uid] = nm
+        for uid, e in agg.items():
+            e["name"] = names.get(uid, str(uid))
+        dpromos = (await db.execute(
+            select(DepositMatchPromo).where(DepositMatchPromo.guild_id == gid)
+            .order_by(DepositMatchPromo.id.desc())
+        )).scalars().all()
+        claims: dict[int, dict] = {}
+        if dpromos:
+            for c in (await db.execute(
+                select(DepositMatchClaim).where(
+                    DepositMatchClaim.promo_id.in_([p.id for p in dpromos])
+                )
+            )).scalars().all():
+                d = claims.setdefault(c.promo_id, {"members": 0, "matched": 0})
+                d["members"] += 1
+                d["matched"] += c.total_matched
+    now = datetime.utcnow()
+    channels = await discord_api.list_guild_text_channels(gid)
+    roles = await discord_api.list_guild_roles(gid)
+    return {
+        "channels": channels,
+        "roles": roles,
+        "bonus_users": sorted(agg.values(), key=lambda x: -x["total"]),
+        "ft_bonus": [{"id": g.id, "amount": g.amount, "expiry_hours": g.expiry_hours, "note": g.note} for g in ft_bonus],
+        "templates": [
+            {"id": t.id, "name": t.name, "boost_pct": t.boost_pct, "scope_type": t.scope_type,
+             "scope_id": t.scope_id, "max_wager": t.max_wager,
+             "grant_on_first_touch": t.grant_on_first_touch, "active": t.active}
+            for t in templates
+        ],
+        "tokens": [
+            {"id": t.id, "uid": str(t.discord_user_id),
+             "name": names.get(t.discord_user_id, str(t.discord_user_id)),
+             "boost_pct": t.boost_pct,
+             "scope_type": t.scope_type, "scope_id": t.scope_id,
+             "expires_at": t.expires_at.isoformat() if t.expires_at else None}
+            for t in tokens
+        ],
+        "deposit_promos": [
+            {"id": p.id, "name": p.name, "match_pct": p.match_pct,
+             "max_match_per_user": p.max_match_per_user,
+             "match_bonus_expiry_days": p.match_bonus_expiry_days,
+             "starts_at": p.starts_at.isoformat(), "ends_at": p.ends_at.isoformat(),
+             "role_id": str(p.role_id) if p.role_id else None,
+             "live": (p.active and p.starts_at <= now < p.ends_at),
+             "claims": claims.get(p.id, {"members": 0, "matched": 0})}
+            for p in dpromos
+        ],
+    }
+
+
+@router.post("/admin/promos/claim-drop")
+async def admin_promos_claim_drop(
+    admin: SessionUser = Depends(bearer_admin),
+    channel_id: Annotated[str, Body()] = "",
+    reward_kind: Annotated[str, Body()] = "BONUS",
+    bonus_amount: Annotated[int, Body()] = 0,
+    boost_template_id: Annotated[int, Body()] = 0,
+    message: Annotated[str, Body()] = "",
+    ping_role_id: Annotated[str, Body()] = "",
+    max_claims: Annotated[int, Body()] = 0,
+    duration_hours: Annotated[int, Body()] = 0,
+    reward_expiry_days: Annotated[int, Body()] = 0,
+):
+    """Post a channel message with a persistent Claim button. The bot registers
+    the button handler on startup, so it services clicks regardless of the fact
+    that the web app posted the message."""
+    kind = (reward_kind or "BONUS").upper()
+    message = (message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="The message can't be empty.")
+    if len(message) > 1900:
+        raise HTTPException(status_code=400, detail="Keep the message under 1900 characters.")
+    if kind not in ("BONUS", "BOOST"):
+        raise HTTPException(status_code=400, detail="Invalid reward type.")
+    try:
+        chan_id = int(str(channel_id).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Pick a channel.")
+
+    role_id = int(str(ping_role_id).strip()) if str(ping_role_id).strip().isdigit() else None
+    reward_expiry_hours = int(reward_expiry_days) * 24 if reward_expiry_days else None
+    max_claims_val = int(max_claims) if max_claims else None
+
+    gid = _GUILD_ID()
+    tpl_id = None
+    reward_label = ""
+    async with get_db() as db:
+        if kind == "BONUS":
+            if bonus_amount <= 0:
+                raise HTTPException(status_code=400, detail="Set a positive bonus amount.")
+            reward_label = f"{bonus_amount:,} bonus bets"
+        else:
+            tpl = await db.get(ProfitBoostTemplate, int(boost_template_id or 0))
+            if tpl is None or tpl.guild_id != gid:
+                raise HTTPException(status_code=400, detail="Pick a boost template.")
+            tpl_id = tpl.id
+            reward_label = (
+                f"+{tpl.boost_pct:g}% profit boost "
+                f"({promos.boost_scope_text(tpl.scope_type, tpl.scope_id)})"
+            )
+        expires_at = (
+            datetime.utcnow() + timedelta(hours=duration_hours) if duration_hours else None
+        )
+        drop = PromoClaimDrop(
+            guild_id=gid, channel_id=chan_id, reward_kind=kind,
+            bonus_amount=int(bonus_amount) if kind == "BONUS" else None,
+            boost_template_id=tpl_id,
+            reward_expiry_hours=reward_expiry_hours,
+            ping_role_id=role_id,
+            message_text=message[:2000],
+            max_claims=max_claims_val,
+            expires_at=expires_at, created_by=admin.discord_id,
+        )
+        db.add(drop)
+        await db.flush()
+        drop_id = drop.id
+        await db.commit()
+
+    components = [{
+        "type": 1,
+        "components": [{
+            "type": 2, "style": 3, "label": "🎁 Claim",
+            "custom_id": f"promoclaim:{drop_id}",
+        }],
+    }]
+    embed = promos.build_claim_drop_embed(
+        message, reward_label, reward_expiry_hours=reward_expiry_hours,
+        max_claims=max_claims_val,
+    )
+    sent = await discord_api.post_channel_message(
+        chan_id, f"<@&{role_id}>" if role_id else "", components=components,
+        embeds=[embed],
+        allowed_mentions={"roles": [str(role_id)]} if role_id else {"parse": []},
+    )
+    if sent is None:
+        async with get_db() as db:
+            orphan = await db.get(PromoClaimDrop, drop_id)
+            if orphan is not None:
+                await db.delete(orphan)
+                await db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't post in that channel — check the bot is present with Send Messages permission.",
+        )
+
+    async with get_db() as db:
+        saved = await db.get(PromoClaimDrop, drop_id)
+        if saved is not None:
+            saved.message_id = int(sent["id"])
+            await db.commit()
+
+    asyncio.create_task(post_admin_action(
+        admin, "Promo claim drop posted",
+        {"reward": reward_label, "channel": str(chan_id)}, source="Discord Activity",
+    ))
+    limits = []
+    if role_id:
+        limits.append("with role ping")
+    if max_claims:
+        limits.append(f"first {max_claims:,} claimers")
+    if duration_hours:
+        limits.append(f"open {duration_hours}h")
+    tail = f" ({', '.join(limits)})" if limits else ""
+    return {"ok": True, "message": f"Posted a claim drop for {reward_label}{tail}."}
+
+
+@router.post("/admin/promos/bonus/grant")
+async def admin_promos_bonus_grant(
+    admin: SessionUser = Depends(bearer_admin),
+    scope: Annotated[str, Body()] = "USER",
+    target_id: Annotated[str, Body()] = "",
+    amount: Annotated[int, Body()] = 0,
+    expiry_days: Annotated[int, Body()] = 0,
+    expiry_hours: Annotated[int, Body()] = 0,
+    note: Annotated[str, Body()] = "",
+):
+    scope = scope.upper()
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive.")
+    hours = _promo_expiry_hours(expiry_days, expiry_hours)
+    async with get_db() as db:
+        gid = _GUILD_ID()
+        grant = BonusGrant(
+            guild_id=gid, scope=scope,
+            target_id=int(target_id) if scope == "USER" and str(target_id).strip().isdigit() else None,
+            amount=amount, expiry_hours=hours, note=(note or "").strip()[:200] or None,
+            created_by=admin.discord_id,
+        )
+        db.add(grant)
+        await db.flush()
+        if scope == "FIRST_TOUCH":
+            await db.commit()
+            return {"ok": True, "message": "First-interaction bonus rule added."}
+        ids, err = await _promo_resolve_target_ids(scope, target_id)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        n = await promos.grant_bonus_to_users(db, gid, ids, amount, hours, "GRANT_USER", grant_id=grant.id)
+        grant.recipients_count = n
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Bonus bets granted", {"scope": scope, "amount": f"{amount:,}", "recipients": str(n)}, source="Discord Activity"))
+    return {"ok": True, "message": f"Granted {amount:,} bonus bets to {n} member(s)."}
+
+
+@router.post("/admin/promos/bonus/deduct")
+async def admin_promos_bonus_deduct(
+    admin: SessionUser = Depends(bearer_admin),
+    scope: Annotated[str, Body()] = "USER",
+    target_id: Annotated[str, Body()] = "",
+    amount: Annotated[int, Body()] = 0,
+):
+    scope = scope.upper()
+    async with get_db() as db:
+        ids, err = await _promo_resolve_target_ids(scope, target_id)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        n = await promos.deduct_bonus_from_users(db, _GUILD_ID(), ids, amount if amount > 0 else 0)
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Bonus bets deducted", {"scope": scope, "members": str(n)}, source="Discord Activity"))
+    return {"ok": True, "message": f"Deducted bonus bets from {n} member(s)."}
+
+
+@router.post("/admin/promos/bonus/user/{uid}/revoke")
+async def admin_promos_bonus_user_revoke(uid: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        await promos.deduct_bonus_from_users(db, _GUILD_ID(), [uid], 0)
+        await db.commit()
+    return {"ok": True, "message": "Revoked that member's bonus bets."}
+
+
+@router.delete("/admin/promos/bonus/first-touch/{grant_id}")
+async def admin_promos_bonus_ft_delete(grant_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        g = await db.get(BonusGrant, grant_id)
+        if g:
+            g.active = False
+            await db.commit()
+    return {"ok": True, "message": "Rule removed."}
+
+
+@router.post("/admin/promos/boost-template")
+async def admin_promos_boost_template_new(
+    admin: SessionUser = Depends(bearer_admin),
+    name: Annotated[str, Body()] = "",
+    boost_pct: Annotated[float, Body()] = 0.0,
+    scope_type: Annotated[str, Body()] = "ANY",
+    scope_id: Annotated[str, Body()] = "",
+    max_wager: Annotated[str, Body()] = "",
+    grant_on_first_touch: Annotated[bool, Body()] = False,
+):
+    if not name.strip() or boost_pct <= 0:
+        raise HTTPException(status_code=400, detail="Name and a positive boost % are required.")
+    scope_type = scope_type.upper()
+    async with get_db() as db:
+        db.add(ProfitBoostTemplate(
+            guild_id=_GUILD_ID(), name=name.strip()[:100], boost_pct=boost_pct,
+            scope_type=scope_type if scope_type in ("ANY", "DISTRICT", "ALLIANCE") else "ANY",
+            scope_id=int(scope_id) if str(scope_id).strip().isdigit() and scope_type != "ANY" else None,
+            max_wager=int(max_wager) if str(max_wager).strip().isdigit() else None,
+            grant_on_first_touch=bool(grant_on_first_touch), created_by=admin.discord_id,
+        ))
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Profit boost template created", {"name": name.strip()[:100]}, source="Discord Activity"))
+    return {"ok": True, "message": "Profit boost template created."}
+
+
+@router.post("/admin/promos/boost-template/{tpl_id}/toggle")
+async def admin_promos_boost_template_toggle(tpl_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        t = await db.get(ProfitBoostTemplate, tpl_id)
+        if t:
+            t.active = not t.active
+            await db.commit()
+    return {"ok": True, "message": "Template updated."}
+
+
+@router.delete("/admin/promos/boost-template/{tpl_id}")
+async def admin_promos_boost_template_delete(tpl_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        t = await db.get(ProfitBoostTemplate, tpl_id)
+        if t:
+            await db.delete(t)
+            await db.commit()
+    return {"ok": True, "message": "Template deleted."}
+
+
+@router.post("/admin/promos/boost/grant")
+async def admin_promos_boost_grant(
+    admin: SessionUser = Depends(bearer_admin),
+    template_id: Annotated[int, Body()] = 0,
+    scope: Annotated[str, Body()] = "USER",
+    target_id: Annotated[str, Body()] = "",
+    expiry_days: Annotated[int, Body()] = 0,
+    expiry_hours: Annotated[int, Body()] = 0,
+):
+    scope = scope.upper()
+    hours = _promo_expiry_hours(expiry_days, expiry_hours)
+    async with get_db() as db:
+        gid = _GUILD_ID()
+        tpl = await db.get(ProfitBoostTemplate, template_id)
+        if not tpl or tpl.guild_id != gid:
+            raise HTTPException(status_code=400, detail="Pick a boost template.")
+        grant = ProfitBoostGrant(
+            guild_id=gid, template_id=tpl.id, scope=scope,
+            target_id=int(target_id) if scope == "USER" and str(target_id).strip().isdigit() else None,
+            expiry_hours=hours, created_by=admin.discord_id,
+        )
+        db.add(grant)
+        await db.flush()
+        if scope == "FIRST_TOUCH":
+            await db.commit()
+            return {"ok": True, "message": "First-interaction boost rule added."}
+        ids, err = await _promo_resolve_target_ids(scope, target_id)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        n = await promos.grant_boost_to_users(db, gid, tpl, ids, hours, admin.discord_id, grant_id=grant.id)
+        grant.recipients_count = n
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Profit boosts granted", {"template": tpl.name, "recipients": str(n)}, source="Discord Activity"))
+    return {"ok": True, "message": f"Granted the boost to {n} member(s)."}
+
+
+@router.post("/admin/promos/boost/token/{tok_id}/revoke")
+async def admin_promos_boost_token_revoke(tok_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        t = await db.get(ProfitBoostToken, tok_id)
+        if t and t.status == "ACTIVE":
+            t.status = "REVOKED"
+            await db.commit()
+    return {"ok": True, "message": "Boost token revoked."}
+
+
+@router.post("/admin/promos/deposit-match")
+async def admin_promos_deposit_match_new(
+    admin: SessionUser = Depends(bearer_admin),
+    name: Annotated[str, Body()] = "",
+    match_pct: Annotated[float, Body()] = 100.0,
+    max_match_per_user: Annotated[int, Body()] = 0,
+    match_bonus_expiry_days: Annotated[int, Body()] = 0,
+    starts_at: Annotated[str, Body()] = "",
+    ends_at: Annotated[str, Body()] = "",
+    role_id: Annotated[str, Body()] = "",
+):
+    if not name.strip() or match_pct <= 0 or max_match_per_user <= 0:
+        raise HTTPException(status_code=400, detail="Name, match % and per-user cap are required.")
+    try:
+        sa = _iso_to_naive_utc(starts_at) if starts_at else datetime.utcnow()
+        ea = _iso_to_naive_utc(ends_at)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid start/end time.")
+    if ea <= sa:
+        raise HTTPException(status_code=400, detail="End must be after start.")
+    async with get_db() as db:
+        db.add(DepositMatchPromo(
+            guild_id=_GUILD_ID(), name=name.strip()[:100], match_pct=match_pct,
+            max_match_per_user=max_match_per_user, starts_at=sa, ends_at=ea,
+            match_bonus_expiry_days=int(match_bonus_expiry_days) or None,
+            role_id=int(role_id) if str(role_id).strip().isdigit() else None,
+            created_by=admin.discord_id,
+        ))
+        await db.commit()
+    asyncio.create_task(post_admin_action(admin, "Deposit match promo created", {"name": name.strip()[:100]}, source="Discord Activity"))
+    return {"ok": True, "message": "Deposit match promo created."}
+
+
+@router.post("/admin/promos/deposit-match/{promo_id}/end")
+async def admin_promos_deposit_match_end(promo_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        p = await db.get(DepositMatchPromo, promo_id)
+        if p:
+            p.ends_at = datetime.utcnow()
+            p.active = False
+            await db.commit()
+    return {"ok": True, "message": "Promo ended."}
+
+
+@router.delete("/admin/promos/deposit-match/{promo_id}")
+async def admin_promos_deposit_match_delete(promo_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        p = await db.get(DepositMatchPromo, promo_id)
+        if p:
+            await db.delete(p)
+            await db.commit()
+    return {"ok": True, "message": "Promo deleted."}

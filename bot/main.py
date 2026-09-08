@@ -121,8 +121,8 @@ class SportsBookBot(commands.Bot):
         _install_component_guild_context()
 
     async def setup_hook(self) -> None:
-        from bot.utils.action_views import BlockToggleButton, RequestDoneButton
-        self.add_dynamic_items(BlockToggleButton, RequestDoneButton)
+        from bot.utils.action_views import BlockToggleButton, PromoClaimButton, RequestDoneButton
+        self.add_dynamic_items(BlockToggleButton, RequestDoneButton, PromoClaimButton)
 
         log.info("Loading cogs...")
         await self.load_extension("bot.cogs.admin")

@@ -146,7 +146,9 @@ class RequestDoneButton(
 
         from bot.database.engine import get_session
         from bot.database.models import ChipRequest
+        from bot.utils import promos
 
+        deposit_match = 0
         async with get_session() as session:
             req = await session.get(ChipRequest, self.request_id)
             if req is None:
@@ -163,15 +165,123 @@ class RequestDoneButton(
             )
             blocked = await is_fully_restricted(session, guild_id, user_id)
 
+            # Deposit-match promo: crediting the base deposit stays a manual admin
+            # step, but "Mark Done" is the one deterministic "a deposit happened"
+            # event, so the match is applied here.
+            if kind == "DEPOSIT":
+                role_ids = None
+                guild = interaction.guild
+                if guild is not None:
+                    gm = guild.get_member(user_id)
+                    if gm is None:
+                        # Not cached (the bot runs without the members intent) —
+                        # a REST fetch still works and lets role-restricted
+                        # deposit-match promos apply.
+                        try:
+                            gm = await guild.fetch_member(user_id)
+                        except (discord.NotFound, discord.HTTPException):
+                            gm = None
+                    if gm is not None:
+                        role_ids = {r.id for r in gm.roles}
+                # apply_deposit_match grants the matched amount as a bonus-bet
+                # lot itself — no real chips are credited here.
+                deposit_match = await promos.apply_deposit_match(
+                    session, guild_id, user_id, converted_amount, member_role_ids=role_ids
+                )
+
         content = render_request_content(
             kind, user_id, amount, converted_amount,
             processed_by=member, processed_at=datetime.now(timezone.utc),
         )
+        if deposit_match > 0:
+            content += (
+                f"\n\n➕ **Deposit match promo:** <@{user_id}> was granted "
+                f"**{fmt_chips(deposit_match)}** in bonus bets."
+            )
         new_view = build_request_view(None, guild_id, user_id, blocked)
         try:
             await interaction.response.edit_message(content=content, view=new_view)
         except discord.NotFound:
             pass
+
+
+class PromoClaimButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"promoclaim:(?P<drop_id>[0-9]+)",
+):
+    """Persistent "Claim" button on an admin-posted promo drop message. Any
+    member may press it once to be granted the drop's bonus bets or profit
+    boost; only members with a FULL ("ALL") betting ban are turned away —
+    partial restrictions (district/tribute) and public-parlay blocks still get
+    to claim. When the drop's claim limit or expiry is reached, the next press
+    disables the button and appends a closing line to the message."""
+
+    def __init__(self, drop_id: int, *, disabled: bool = False) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="🎁 Claim",
+                style=discord.ButtonStyle.success,
+                custom_id=f"promoclaim:{drop_id}",
+                disabled=disabled,
+            )
+        )
+        self.drop_id = drop_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["drop_id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "You can only claim this from within the server.", ephemeral=True
+            )
+            return
+
+        from bot.database.engine import get_session
+        from bot.database.models import PromoClaimDrop
+        from bot.utils import promos
+
+        message = "This drop is no longer available."
+        closed_embed: discord.Embed | None = None
+        async with get_session() as session:
+            drop = await session.get(PromoClaimDrop, self.drop_id)
+            if drop is not None:
+                if await is_fully_restricted(session, drop.guild_id, member.id):
+                    message = "You're fully blocked from betting in this server, so you can't claim promos."
+                else:
+                    result, err = await promos.claim_drop_redeem(session, drop, member.id)
+                    message = err if err is not None else result["message"]
+
+                now = datetime.utcnow()
+                if drop.active and drop.expires_at is not None and drop.expires_at <= now:
+                    drop.active = False
+                if not drop.active:
+                    reason = (
+                        "expired"
+                        if drop.expires_at is not None and drop.expires_at <= now
+                        else "claimed"
+                    )
+                    closed_embed = discord.Embed.from_dict(
+                        await promos.claim_drop_embed_for(session, drop, closed_reason=reason)
+                    )
+
+        await interaction.response.send_message(message, ephemeral=True)
+        if closed_embed is not None:
+            try:
+                await interaction.message.edit(
+                    embed=closed_embed,
+                    view=build_promo_claim_view(self.drop_id, disabled=True),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+
+def build_promo_claim_view(drop_id: int, *, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(PromoClaimButton(drop_id, disabled=disabled))
+    return view
 
 
 class _BlockConfirmView(discord.ui.View):

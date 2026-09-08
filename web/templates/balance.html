@@ -11,6 +11,12 @@
     <div class="card-label">CHIP BALANCE</div>
     <div class="chip-count">{{ db_user.chips | fmt_chips }}</div>
     <div class="text-dim chip-label">chips</div>
+    {% if bonus_balance %}
+    <div class="text-pos font-bold mt-1">{{ bonus_balance | fmt_chips }} bonus bets</div>
+    <div class="text-dim" style="font-size:0.8rem">
+      {% if bonus_expiry %}next expiry {{ bonus_expiry.strftime('%Y-%m-%d') }}{% else %}no expiry{% endif %}
+    </div>
+    {% endif %}
   </div>
 
   <div class="card stats-card">
@@ -19,6 +25,8 @@
       <tbody>
         <tr><td class="text-dim">Total Wagered</td><td class="font-bold">{{ db_user.total_wagered | fmt_chips }}</td></tr>
         <tr><td class="text-dim">Total Won</td><td class="text-pos font-bold">{{ db_user.total_won | fmt_chips }}</td></tr>
+        {% if db_user.bonus_wagered %}<tr><td class="text-dim">Bonus Wagered</td><td>{{ db_user.bonus_wagered | fmt_chips }}</td></tr>{% endif %}
+        {% if db_user.bonus_won %}<tr><td class="text-dim">Bonus Won</td><td class="text-pos">{{ db_user.bonus_won | fmt_chips }}</td></tr>{% endif %}
         <tr>
           <td class="text-dim">ROI</td>
           <td class="{% if roi >= 0 %}text-pos{% else %}text-neg{% endif %} font-bold">
@@ -39,6 +47,23 @@
     </table>
   </div>
 </div>
+
+{% if active_boosts %}
+<div class="section-header mt-3"><h2>Your Profit Boosts</h2></div>
+<div class="card">
+  <table class="table table-sm">
+    <tbody>
+      {% for b in active_boosts %}
+      <tr>
+        <td class="text-pos font-bold">+{{ b.boost_pct }}%</td>
+        <td>{% if b.scope_type == 'DISTRICT' %}District {{ b.scope_id }}{% elif b.scope_type == 'ALLIANCE' %}Alliance #{{ b.scope_id }}{% else %}Any bet{% endif %}</td>
+        <td class="text-dim">{% if b.expires_at %}expires {{ b.expires_at.strftime('%Y-%m-%d') }}{% else %}no expiry{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
 
 <div class="section-header mt-3">
   <h2>Recent Activity</h2>

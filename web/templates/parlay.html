@@ -57,8 +57,8 @@
     {% if legs | length >= 2 %}
     <form method="post" action="/parlay/submit" id="parlay-form" class="mt-2">
       <div class="form-group">
-        <label class="form-label">Wager (chips)</label>
-        <input type="number" name="wager" class="form-control" min="1" max="{{ db_user.chips }}" value="100" required oninput="updateParlayPayout(this.value)">
+        <label class="form-label">Wager (chips){% if bonus_balance %} <span class="text-dim">(optional if you use bonus bets)</span>{% endif %}</label>
+        <input type="number" name="wager" class="form-control" min="0" value="100" oninput="updateParlayPayout()">
         <div class="quick-amounts">
           <button type="button" class="btn btn-sm btn-ghost" onclick="setParlayWager(100)">100</button>
           <button type="button" class="btn btn-sm btn-ghost" onclick="setParlayWager(500)">500</button>
@@ -66,6 +66,24 @@
           <button type="button" class="btn btn-sm btn-ghost" onclick="setParlayWager({{ db_user.chips }})">MAX</button>
         </div>
       </div>
+      {% if bonus_balance %}
+      <div class="form-group">
+        <label class="form-label">Bonus bets to stake <span class="text-dim">(max {{ bonus_balance | fmt_chips }} — staked on top of your wager; winnings only on a win)</span></label>
+        <input type="number" name="bonus_amount" class="form-control" min="0" max="{{ bonus_balance }}" value="0" oninput="updateParlayPayout()">
+      </div>
+      {% endif %}
+      {% if eligible_boosts %}
+      <div class="form-group">
+        <label class="form-label">Profit boost <span class="text-dim">(applied to matching legs)</span></label>
+        <select name="profit_boost_token_id" class="form-control" id="parlay-boost" onchange="updateParlayPayout()">
+          <option value="0" data-pct="0">No boost</option>
+          {% for b in eligible_boosts %}
+          <option value="{{ b.id }}" data-pct="{{ b.boost_pct }}">+{{ b.boost_pct }}% —
+            {% if b.scope_type == 'DISTRICT' %}District {{ b.scope_id }}{% elif b.scope_type == 'ALLIANCE' %}Alliance #{{ b.scope_id }}{% else %}Any bet{% endif %}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endif %}
       <div class="payout-preview">
         <span class="text-dim">Potential payout</span>
         <span id="parlay-payout" class="text-gold font-bold">—</span>
@@ -144,15 +162,27 @@ function calcParlayPayout(wager, odds) {
   return Math.round(wager * (100 / Math.abs(odds) + 1));
 }
 
-function updateParlayPayout(val) {
-  const w = parseInt(val) || 0;
-  const p = w > 0 && combinedOdds ? calcParlayPayout(w, combinedOdds) : 0;
-  document.getElementById('parlay-payout').textContent = p > 0 ? p.toLocaleString() + ' chips' : '—';
+function updateParlayPayout() {
+  const input = document.querySelector('#parlay-form input[name=wager]');
+  const w = input ? parseInt(input.value) || 0 : 0;
+  const bonusEl = document.querySelector('#parlay-form input[name=bonus_amount]');
+  const bonus = bonusEl ? (parseInt(bonusEl.value) || 0) : 0;
+  const stake = w + bonus;
+  let p = stake > 0 && combinedOdds ? calcParlayPayout(stake, combinedOdds) : 0;
+  let pct = 0;
+  const sel = document.getElementById('parlay-boost');
+  if (sel && sel.selectedOptions.length) pct = parseFloat(sel.selectedOptions[0].dataset.pct) || 0;
+  if (pct && p) p = stake + Math.round((p - stake) * (1 + pct / 100));
+  const shown = p - bonus;   // bonus stake not returned on a win
+  let txt = p > 0 ? '~' + shown.toLocaleString() + ' chips' : '—';
+  if (p > 0 && pct) txt += ' (+' + pct + '% boost)';
+  if (p > 0 && bonus) txt += ' — winnings only, bonus stake not returned';
+  document.getElementById('parlay-payout').textContent = txt;
 }
 
 function setParlayWager(n) {
   const input = document.querySelector('#parlay-form input[name=wager]');
-  if (input) { input.value = n; updateParlayPayout(n); }
+  if (input) { input.value = n; updateParlayPayout(); }
 }
 
 function openFeatureParlayModal() {
@@ -162,6 +192,6 @@ function closeFeatureParlayModal() {
   document.getElementById('feature-parlay-modal').classList.add('hidden');
 }
 
-updateParlayPayout(100);
+updateParlayPayout();
 </script>
 {% endblock %}

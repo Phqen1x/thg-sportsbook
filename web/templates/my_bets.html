@@ -43,6 +43,15 @@
             {% endif %}
           </td>
         </tr>
+        {% if bet.id in bet_promo %}{% set pm = bet_promo[bet.id] %}
+        <tr class="promo-detail">
+          <td colspan="6" class="text-dim" style="font-size:0.8rem">
+            Stake {{ pm.stake | fmt_chips }}
+            {%- if pm.bonus %} — {{ pm.bonus | fmt_chips }} bonus + {{ pm.real | fmt_chips }} chips (bonus stake not returned on a win){% endif %}
+            {%- if pm.boost_pct %} · <span class="text-pos">+{{ pm.boost_pct }}% boost</span>: payout {{ pm.net_no_boost | fmt_chips }} → <span class="text-gold">{{ pm.net_boosted | fmt_chips }}</span>{% endif %}
+          </td>
+        </tr>
+        {% endif %}
         {% else %}
         <tr><td colspan="6" class="text-dim text-center">No straight bets yet.</td></tr>
         {% endfor %}
@@ -76,6 +85,13 @@
         {% endif %}
       </div>
     </div>
+    {% if parlay.id in parlay_promo %}{% set pm = parlay_promo[parlay.id] %}
+    <div class="text-dim mt-1" style="font-size:0.8rem">
+      Stake {{ pm.stake | fmt_chips }}
+      {%- if pm.bonus %} — {{ pm.bonus | fmt_chips }} bonus + {{ pm.real | fmt_chips }} chips (bonus stake not returned on a win){% endif %}
+      {%- if pm.boost_pct %} · <span class="text-pos">+{{ pm.boost_pct }}% boost</span>: payout {{ pm.net_no_boost | fmt_chips }} → <span class="text-gold">{{ pm.net_boosted | fmt_chips }}</span>{% endif %}
+    </div>
+    {% endif %}
     <table class="table table-sm mt-1">
       <tbody>
         {% for leg in parlay_legs.get(parlay.id, []) %}

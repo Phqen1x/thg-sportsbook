@@ -12,8 +12,9 @@ from bot import config
 from bot.database.engine import get_session, get_setting, current_guild_id
 from bot.database.models import (
     Alliance, Bet, BettingRestriction, ChipRequest, Market, MarketTemplate, Parlay,
-    ParlayTemplate, ParlayTemplateLeg, PendingParlayLeg, Tribute, User,
+    ParlayTemplate, ParlayTemplateLeg, PendingParlayLeg, ProfitBoostToken, Tribute, User,
 )
+from bot.utils import promos
 from bot.imaging.bet_slip import ParlayLegData, render_parlay_slip
 from bot.imaging.my_bets import (
     BetRowData, ParlayData, render_my_bets, render_tail_board, render_tail_detail,
@@ -53,13 +54,15 @@ async def _betting_paused() -> bool:
     return json.loads(raw) if raw else False
 
 
-async def _single_cap_error(amount: int, odds: int) -> str | None:
+async def _single_cap_error(amount: int, odds: int, payout_override: int | None = None) -> str | None:
     """None if a straight bet of ``amount`` at ``odds`` stays within the single-bet
     payout cap; otherwise a message naming the largest wager that would still
     qualify, so the member knows exactly what they can do instead of just being
-    told no."""
+    told no. ``payout_override`` (a profit-boosted payout) is checked in place of
+    the raw ``straight_payout`` when given."""
     cap = await get_payout_cap("SINGLE")
-    if straight_payout(amount, odds) <= cap:
+    payout = payout_override if payout_override is not None else straight_payout(amount, odds)
+    if payout <= cap:
         return None
     max_wager = max_wager_for_cap(american_to_decimal(odds), cap)
     return (
@@ -68,10 +71,13 @@ async def _single_cap_error(amount: int, odds: int) -> str | None:
     )
 
 
-async def _parlay_cap_error(wager: int, legs_odds: list[int]) -> str | None:
+async def _parlay_cap_error(
+    wager: int, legs_odds: list[int], payout_override: int | None = None
+) -> str | None:
     """Same as _single_cap_error but for a parlay's combined odds."""
     cap = await get_payout_cap("PARLAY")
-    if parlay_payout(wager, legs_odds) <= cap:
+    payout = payout_override if payout_override is not None else parlay_payout(wager, legs_odds)
+    if payout <= cap:
         return None
     max_wager = max_wager_for_cap(american_to_decimal(combined_american(legs_odds)), cap)
     return (
@@ -887,10 +893,12 @@ async def _get_or_create_user(session, member: discord.Member, guild_id: int) ->
     u = result.scalar_one_or_none()
     if u is None:
         default_raw = await get_setting("default_chips")
-        default = json.loads(default_raw) if default_raw else 1000
+        default = json.loads(default_raw) if default_raw else 0
         u = User(guild_id=guild_id, discord_id=member.id, username=member.display_name, chips=default)
         session.add(u)
         await session.flush()
+        from bot.utils.promos import apply_first_touch_grants
+        await apply_first_touch_grants(session, guild_id, member.id)
     else:
         u.username = member.display_name
     return u
@@ -1055,6 +1063,56 @@ async def open_market_autocomplete(
         if current.lower() in m.label.lower():
             choices.append(app_commands.Choice(name=m.label[:100], value=str(m.id)))
     return choices[:25]
+
+
+def _boost_choice_label(tok: ProfitBoostToken) -> str:
+    scope = tok.scope_type.title()
+    if tok.scope_type == "DISTRICT":
+        scope = f"District {tok.scope_id}"
+    elif tok.scope_type == "ALLIANCE":
+        scope = f"Alliance #{tok.scope_id}"
+    pct = f"+{tok.boost_pct:g}%"
+    exp = ""
+    if tok.expires_at is not None:
+        exp = f" · exp {tok.expires_at:%b %d}"
+    return f"{pct} · {scope}{exp}"[:100]
+
+
+async def owned_boost_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Profit-boost tokens the caller owns that apply to the wager being built —
+    the market picked in `market_id` for /bet, or the pending parlay slip for
+    /parlay submit."""
+    gid = current_guild_id()
+    uid = interaction.user.id
+    async with get_session() as session:
+        raw_mid = getattr(interaction.namespace, "market_id", None)
+        markets: list[Market] = []
+        if raw_mid:
+            mid = _parse_id(str(raw_mid))
+            if mid:
+                m = await session.get(Market, mid)
+                if m is not None:
+                    markets = [m]
+        if not markets:
+            legs = (await session.execute(
+                select(PendingParlayLeg).where(
+                    PendingParlayLeg.guild_id == gid, PendingParlayLeg.user_id == uid
+                )
+            )).scalars().all()
+            leg_ids = [leg.market_id for leg in legs]
+            if leg_ids:
+                markets = list((await session.execute(
+                    select(Market).where(Market.id.in_(leg_ids))
+                )).scalars().all())
+        if not markets:
+            return []
+        tokens = await promos.eligible_boost_tokens(session, gid, uid, markets)
+    return [
+        app_commands.Choice(name=_boost_choice_label(t), value=str(t.id))
+        for t in tokens[:25]
+    ]
 
 
 async def parlay_market_autocomplete(
@@ -1701,6 +1759,8 @@ async def _resolve_cashout_target(session, user: User, cashout_type: str, cid: i
             return False, "Bet not found.", 0, None, None
         if b.status != "PENDING" or b.parlay_id is not None:
             return False, "You can only cash out pending straight bets.", 0, None, None
+        if b.bonus_bet_amount:
+            return False, "Bonus-funded bets can't be cashed out early.", 0, None, None
 
         mkt = await session.get(Market, b.market_id)
         by_type_raw = await get_setting("cashout_by_type")
@@ -1725,6 +1785,8 @@ async def _resolve_cashout_target(session, user: User, cashout_type: str, cid: i
             return False, "Parlay not found.", 0, None, None
         if p.status != "PENDING":
             return False, "That parlay is no longer pending.", 0, None, None
+        if p.bonus_bet_amount:
+            return False, "Bonus-funded parlays can't be cashed out early.", 0, None, None
 
         allowed, amount = resolve_cashout(
             wager=p.total_wager, payout_if_win=p.total_payout,
@@ -1834,13 +1896,16 @@ class BettingCog(commands.Cog):
         subject="Specific tribute/district/alliance to narrow further (optional)",
         market_type="Market category to narrow further (optional)",
         market_id="Market to bet on",
-        amount="Amount of chips to wager",
+        amount="Real chips to wager (optional if you apply bonus bets)",
+        bonus="Bonus-bet credit to stake on top of your chips (optional)",
+        boost="A profit boost you own to apply to this bet (optional)",
     )
     @app_commands.choices(subject_type=SUBJECT_TYPE_CHOICES)
     @app_commands.autocomplete(
         subject=market_subject_autocomplete,
         market_type=market_type_autocomplete,
         market_id=open_market_autocomplete,
+        boost=owned_boost_autocomplete,
     )
     async def bet(
         self,
@@ -1849,7 +1914,9 @@ class BettingCog(commands.Cog):
         subject: str | None = None,
         market_type: str | None = None,
         market_id: str | None = None,
-        amount: app_commands.Range[int, 1, 500000] | None = None,
+        amount: app_commands.Range[int, 0, 500000] | None = None,
+        bonus: app_commands.Range[int, 0, 500000] = 0,
+        boost: str | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
@@ -1866,9 +1933,12 @@ class BettingCog(commands.Cog):
                 ephemeral=True,
             )
             return
-        if amount is None:
-            await interaction.followup.send("Specify an `amount` of chips to wager.", ephemeral=True)
+        if not amount and not bonus:
+            await interaction.followup.send(
+                "Specify an `amount` of chips to wager, or apply `bonus` bets.", ephemeral=True
+            )
             return
+        amount = amount or 0
 
         mid = _parse_id(market_id)
         if mid is None:
@@ -1892,53 +1962,80 @@ class BettingCog(commands.Cog):
             user = await _get_or_create_user(session, interaction.user, current_guild_id())
             # A full ("ALL") betting restriction is already checked above via
             # _get_restriction_msg — no separate check needed here.
-            if user.chips < amount:
-                await interaction.followup.send(
-                    f"Insufficient chips. You have **{fmt_chips(user.chips)}** but need **{fmt_chips(amount)}**.",
-                    ephemeral=True,
-                )
+            info, perr = await promos.validate_wager_promos(
+                session, user.guild_id, user.discord_id, user.chips,
+                wager=amount, bonus_amount=bonus, boost_token_id=boost,
+                markets=[mkt], is_parlay=False,
+            )
+            if perr:
+                await interaction.followup.send(perr, ephemeral=True)
                 return
+            payout = info["payout"]
+            total_stake = info["total_stake"]
 
-            cap_err = await _single_cap_error(amount, mkt.odds)
+            cap_err = await _single_cap_error(total_stake, mkt.odds, payout_override=payout)
             if cap_err:
                 await interaction.followup.send(cap_err, ephemeral=True)
                 return
 
-            payout = straight_payout(amount, mkt.odds)
             payout_rate = await effective_rate(
                 session, user.guild_id,
                 user_id=user.discord_id, role_ids=member_role_ids(interaction.user),
             )
-            user.chips -= amount
-            user.total_wagered += amount
+            user.chips -= info["real_part"]
+            user.total_wagered += info["real_part"]
 
             b = Bet(
                 guild_id=user.guild_id,
                 user_id=user.discord_id,
                 market_id=mkt.id,
-                wager=amount,
+                wager=total_stake,
                 odds_at_placement=mkt.odds,
                 payout_if_win=payout,
                 payout_rate_at_placement=payout_rate,
+                bonus_bet_amount=info["bonus_amount"],
+                profit_boost_pct=info["boost_pct"],
+                profit_boost_token_id=info["boost_token"].id if info["boost_token"] else None,
             )
             session.add(b)
             await session.flush()
+            await promos.commit_wager_promos(session, user.guild_id, user, info, bet_id=b.id)
             bet_id = b.id
             label = mkt.label
             odds = mkt.odds
             new_balance = user.chips
+            bonus_used = info["bonus_amount"]
+            boost_pct = info["boost_pct"]
+            real_chips = info["real_part"]
+            net_if_win = info["net_if_win"]
+            raw_net_if_win = info["raw_payout"] - bonus_used
 
         embed = discord.Embed(title="Bet Placed!", color=0x4CAF50)
         embed.add_field(name="Market", value=label, inline=False)
-        embed.add_field(name="Wager", value=fmt_chips(amount))
+        if bonus_used:
+            embed.add_field(
+                name="Wager",
+                value=f"{fmt_chips(total_stake)} ({fmt_chips(bonus_used)} bonus + {fmt_chips(real_chips)} chips)",
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Wager", value=fmt_chips(total_stake))
         embed.add_field(name="Odds", value=fmt_odds(odds))
-        embed.add_field(name="Potential Payout", value=fmt_chips(payout))
+        payout_value = fmt_chips(net_if_win)
+        if boost_pct:
+            payout_value += f"\nwithout boost: {fmt_chips(raw_net_if_win)}"
+        if bonus_used:
+            payout_value += "\nwinnings only — bonus stake not returned"
+        embed.add_field(
+            name="Potential Payout" + (f" (+{boost_pct:g}% boost)" if boost_pct else ""),
+            value=payout_value,
+        )
         embed.add_field(name="Bet ID", value=f"#{bet_id}")
         embed.set_footer(text=f"Remaining balance: {fmt_chips(new_balance)}")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
         if isinstance(interaction.user, discord.Member):
-            await post_bet_log(self.bot, interaction.user, "BET", [label], amount, payout)
+            await post_bet_log(self.bot, interaction.user, "BET", [label], total_stake, net_if_win)
 
     # ── /parlay ───────────────────────────────────────────────────────────────
 
@@ -2100,16 +2197,21 @@ class BettingCog(commands.Cog):
 
     @parlay_group.command(name="submit", description="Submit your parlay with a wager amount")
     @app_commands.describe(
-        wager="Amount of chips to wager on this parlay",
+        wager="Real chips to wager on this parlay (optional if you apply bonus bets)",
         public="List this parlay on the tailing board for others to copy (default: yes)",
         name="Custom title shown on the tail board (default: \"{you}'s Parlay #{id}\")",
+        bonus="Bonus-bet credit to stake on top of your chips (optional)",
+        boost="A profit boost you own to apply to this parlay (optional)",
     )
+    @app_commands.autocomplete(boost=owned_boost_autocomplete)
     async def parlay_submit(
         self,
         interaction: discord.Interaction,
-        wager: app_commands.Range[int, 1, 500000],
+        wager: app_commands.Range[int, 0, 500000] = 0,
         public: bool = True,
         name: app_commands.Range[str, 1, 80] | None = None,
+        bonus: app_commands.Range[int, 0, 500000] = 0,
+        boost: str | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
@@ -2122,11 +2224,6 @@ class BettingCog(commands.Cog):
             user = await _get_or_create_user(session, interaction.user, current_guild_id())
             if await is_fully_restricted(session, user.guild_id, user.discord_id):
                 await interaction.followup.send(BETTING_BLOCKED_MSG, ephemeral=True)
-                return
-            if user.chips < wager:
-                await interaction.followup.send(
-                    f"Insufficient chips. You have **{fmt_chips(user.chips)}**.", ephemeral=True
-                )
                 return
 
             legs_result = await session.execute(
@@ -2166,14 +2263,24 @@ class BettingCog(commands.Cog):
                     return
 
             all_odds = [m.odds for m in markets]
-            cap_err = await _parlay_cap_error(wager, all_odds)
+            info, perr = await promos.validate_wager_promos(
+                session, user.guild_id, user.discord_id, user.chips,
+                wager=wager, bonus_amount=bonus, boost_token_id=boost,
+                markets=markets, is_parlay=True,
+            )
+            if perr:
+                await interaction.followup.send(perr, ephemeral=True)
+                return
+            total_payout = info["payout"]
+            total_stake = info["total_stake"]
+
+            cap_err = await _parlay_cap_error(total_stake, all_odds, payout_override=total_payout)
             if cap_err:
                 await interaction.followup.send(cap_err, ephemeral=True)
                 return
-            total_payout = parlay_payout(wager, all_odds)
 
-            user.chips -= wager
-            user.total_wagered += wager
+            user.chips -= info["real_part"]
+            user.total_wagered += info["real_part"]
 
             role_ids = {r.id for r in interaction.user.roles} if isinstance(interaction.user, discord.Member) else set()
             downgraded = public and await is_public_bet_blocked(session, user.guild_id, user.discord_id, role_ids)
@@ -2188,10 +2295,13 @@ class BettingCog(commands.Cog):
                 guild_id=user.guild_id,
                 user_id=user.discord_id,
                 name=name,
-                total_wager=wager,
+                total_wager=total_stake,
                 total_payout=total_payout,
                 payout_rate_at_placement=payout_rate,
                 is_public=public,
+                bonus_bet_amount=info["bonus_amount"],
+                profit_boost_pct=info["boost_pct"],
+                profit_boost_token_id=info["boost_token"].id if info["boost_token"] else None,
             )
             session.add(parlay)
             await session.flush()
@@ -2203,7 +2313,7 @@ class BettingCog(commands.Cog):
                     user_id=user.discord_id,
                     parlay_id=parlay.id,
                     market_id=mkt.id,
-                    wager=wager,
+                    wager=total_stake,
                     odds_at_placement=mkt.odds,
                     payout_if_win=total_payout,
                 )
@@ -2211,10 +2321,17 @@ class BettingCog(commands.Cog):
                 leg_data.append(ParlayLegData(leg_num=i, market_label=mkt.label, odds=mkt.odds))
                 await session.delete(leg)
 
+            await promos.commit_wager_promos(
+                session, user.guild_id, user, info, parlay_id=parlay.id
+            )
             parlay_id = parlay.id
             new_balance = user.chips
+            bonus_used = info["bonus_amount"]
+            net_if_win = info["net_if_win"]
+            raw_net_if_win = info["raw_payout"] - bonus_used
+            boost_pct = info["boost_pct"]
 
-        buf = await render_async(render_parlay_slip, leg_data, wager, total_payout, True)
+        buf = await render_async(render_parlay_slip, leg_data, total_stake, net_if_win, True)
         f = buf_to_discord_file(buf, f"parlay_{parlay_id}.png")
         if downgraded:
             listed = "🔒 Kept private — public posting is restricted for you."
@@ -2222,9 +2339,17 @@ class BettingCog(commands.Cog):
             listed = "📣 Listed on the tailing board for others to copy."
         else:
             listed = "🔒 Kept private — not listed for tailing."
+        bonus_note = (
+            f"\n{fmt_chips(bonus_used)} of the stake was a bonus bet — a win pays winnings only."
+            if bonus_used else ""
+        )
+        boost_note = (
+            f"\n+{boost_pct:g}% profit boost applied (without it: {fmt_chips(raw_net_if_win)})."
+            if boost_pct else ""
+        )
         await interaction.followup.send(
-            f"**Parlay #{parlay_id} submitted!** Wagered **{fmt_chips(wager)}** for a potential **{fmt_chips(total_payout)}**.\n"
-            f"Remaining balance: {fmt_chips(new_balance)}\n{listed}",
+            f"**Parlay #{parlay_id} submitted!** Staked **{fmt_chips(total_stake)}** for a potential **{fmt_chips(net_if_win)}**.\n"
+            f"Remaining balance: {fmt_chips(new_balance)}\n{listed}{bonus_note}{boost_note}",
             file=f,
             ephemeral=True,
         )
@@ -2232,7 +2357,7 @@ class BettingCog(commands.Cog):
         if isinstance(interaction.user, discord.Member):
             await post_bet_log(
                 self.bot, interaction.user, "PARLAY",
-                [mkt.label for mkt in markets], wager, total_payout,
+                [mkt.label for mkt in markets], total_stake, net_if_win,
             )
 
     @parlay_group.command(name="remove", description="Remove a leg from your pending parlay slip by position")

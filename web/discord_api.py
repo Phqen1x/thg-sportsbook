@@ -72,6 +72,87 @@ async def get_member(user_id: int, *, guild_id: int | None = None) -> dict | Non
         return r.json() if r.status_code == 200 else None
 
 
+async def list_guild_text_channels(guild_id: int | None = None) -> list[dict]:
+    """Text / announcement channels in the guild (bot token — no privileged
+    intent needed). Returns ``[{"id", "name", "position"}]`` sorted by position,
+    or ``[]`` on any failure."""
+    gid = int(guild_id or config.GUILD_ID or 0)
+    if not gid:
+        return []
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{DISCORD_API}/guilds/{gid}/channels",
+                headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
+            )
+        if r.status_code != 200:
+            return []
+        chans = [
+            {"id": str(ch["id"]), "name": ch.get("name") or str(ch["id"]),
+             "position": ch.get("position", 0)}
+            for ch in r.json()
+            if ch.get("type") in (0, 5)  # GUILD_TEXT, GUILD_ANNOUNCEMENT
+        ]
+        chans.sort(key=lambda c: c["position"])
+        return chans
+    except Exception:
+        return []
+
+
+async def list_guild_roles(guild_id: int | None = None) -> list[dict]:
+    """Mentionable-ish roles in the guild (bot token). Returns
+    ``[{"id", "name", "position"}]`` highest-first, excluding @everyone and
+    managed/integration roles, or ``[]`` on any failure."""
+    gid = int(guild_id or config.GUILD_ID or 0)
+    if not gid:
+        return []
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{DISCORD_API}/guilds/{gid}/roles",
+                headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
+            )
+        if r.status_code != 200:
+            return []
+        roles = [
+            {"id": str(role["id"]), "name": role.get("name") or str(role["id"]),
+             "position": role.get("position", 0)}
+            for role in r.json()
+            if str(role["id"]) != str(gid) and not role.get("managed")
+        ]
+        roles.sort(key=lambda x: -x["position"])
+        return roles
+    except Exception:
+        return []
+
+
+async def post_channel_message(
+    channel_id: int, content: str, *, components: list | None = None,
+    embeds: list | None = None, allowed_mentions: dict | None = None,
+) -> dict | None:
+    """POST a message to a channel with the bot token. ``components`` is the raw
+    Discord component array (e.g. an action row with a button); ``embeds`` and
+    ``allowed_mentions`` are passed straight through. Returns the created message
+    dict, or None on failure."""
+    payload: dict = {"content": content}
+    if components:
+        payload["components"] = components
+    if embeds:
+        payload["embeds"] = embeds
+    if allowed_mentions is not None:
+        payload["allowed_mentions"] = allowed_mentions
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{DISCORD_API}/channels/{channel_id}/messages",
+                headers={"Authorization": f"Bot {config.BOT_TOKEN}"},
+                json=payload,
+            )
+        return r.json() if r.status_code in (200, 201) else None
+    except Exception:
+        return None
+
+
 async def check_admin(member: dict, *, guild_id: int | None = None) -> bool:
     """Check admin status from a pre-fetched member dict (see get_member).
 

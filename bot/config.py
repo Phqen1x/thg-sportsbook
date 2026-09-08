@@ -25,7 +25,10 @@ DEV_GUILD_ID: int | None = (
     int(os.environ["DEV_GUILD_ID"]) if os.environ.get("DEV_GUILD_ID") else None
 )
 
-DEFAULT_CHIPS: int = int(os.environ.get("DEFAULT_CHIPS", "1000"))
+# New members are seeded with bonus-bet credit (signup_bonus_bet_amount) instead
+# of real chips, so the real-chip starting balance defaults to 0. Admins can
+# raise it from the settings UI / `/admin settings default_chips`.
+DEFAULT_CHIPS: int = int(os.environ.get("DEFAULT_CHIPS", "0"))
 CASHOUT_ALLOWED: bool = os.environ.get("CASHOUT_ALLOWED", "false").lower() == "true"
 CASHOUT_RATE: float = float(os.environ.get("CASHOUT_RATE", "0.65"))
 # Maximum chips a single bet / a parlay is allowed to pay out on a win, regardless

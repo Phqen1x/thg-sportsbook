@@ -8,7 +8,7 @@ import random
 import re
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -40,6 +40,8 @@ from bot.database.models import (
     ParlayTemplate,
     ParlayTemplateLeg,
     PendingParlayLeg,
+    ProfitBoostTemplate,
+    PromoClaimDrop,
     Tribute,
     TributeLock,
     User,
@@ -107,6 +109,7 @@ from bot.utils.house_cut import (
 )
 from bot.utils.market_view import MarketPageView, MarketTypePageView, sort_markets
 from bot.utils.payout_caps import get_payout_cap, set_payout_cap
+from bot.utils import promos
 from bot.utils.restrictions import is_public_bet_blocked, set_public_block
 
 # Leg-compatibility validation lives in the betting cog; reused here so admin and
@@ -806,6 +809,29 @@ async def phase_autocomplete(
     for p in phases:
         if current.lower() in p.name.lower():
             choices.append(app_commands.Choice(name=p.name, value=str(p.id)))
+    return choices[:25]
+
+
+async def boost_template_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    async with get_read_session() as session:
+        result = await session.execute(
+            select(ProfitBoostTemplate)
+            .where(ProfitBoostTemplate.active == True)  # noqa: E712
+            .order_by(ProfitBoostTemplate.id.desc())
+        )
+        templates = result.scalars().all()
+    choices = []
+    for t in templates:
+        scope = t.scope_type.title()
+        if t.scope_type == "DISTRICT":
+            scope = f"District {t.scope_id}"
+        elif t.scope_type == "ALLIANCE":
+            scope = f"Alliance #{t.scope_id}"
+        label = f"{t.name} · +{t.boost_pct:g}% · {scope}"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=str(t.id)))
     return choices[:25]
 
 
@@ -1699,8 +1725,15 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                 )
             )
             user = _ur.scalar_one_or_none()
+            refund = promos.void_chip_refund(bet.wager, bet.bonus_bet_amount)
             if user:
-                user.chips += bet.wager
+                user.chips += refund
+            if bet.bonus_bet_amount and bet.parlay_id is None:
+                await promos.refund_bonus(
+                    session, bet.guild_id, bet.user_id, bet.bonus_bet_amount
+                )
+            if bet.profit_boost_token_id and bet.parlay_id is None:
+                await promos.restore_boost_for_bet(session, bet.guild_id, bet.id)
             if buf is not None and bet.parlay_id is None:
                 buf.append(
                     {
@@ -1710,7 +1743,7 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                         "market_label": market.label,
                         "odds": bet.odds_at_placement,
                         "wager": bet.wager,
-                        "payout": bet.wager,
+                        "payout": refund,
                     }
                 )
         elif result is True and bet.parlay_id is None:
@@ -1728,10 +1761,14 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                 )
             )
             user = _ur.scalar_one_or_none()
+            credited, real_won, bonus_won = promos.split_won_credit(
+                bet.wager, bet.bonus_bet_amount, paid
+            )
             if user:
-                user.chips += paid
-                user.total_won += paid
-            credits_issued += paid
+                user.chips += credited
+                user.total_won += real_won
+                user.bonus_won += bonus_won
+            credits_issued += credited
             if buf is not None:
                 buf.append(
                     {
@@ -3678,8 +3715,12 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
     if any(s == "PENDING" for s in statuses):
         active_legs = [l for l in legs if l.status != "VOIDED"]
         if len(active_legs) < len(legs):
-            parlay.total_payout = parlay_payout(
-                parlay.total_wager, [l.odds_at_placement for l in active_legs]
+            active_markets = [
+                await session.get(Market, l.market_id) for l in active_legs
+            ]
+            active_markets = [m for m in active_markets if m is not None]
+            parlay.total_payout = await promos.reprice_parlay_after_void(
+                session, parlay, active_markets
             )
         return []
     active_legs = [l for l in legs if l.status != "VOIDED"]
@@ -3699,9 +3740,14 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
             )
         )
         user = _pur.scalar_one_or_none()
+        credited, real_won, bonus_won = promos.split_won_credit(
+            parlay.total_wager, parlay.bonus_bet_amount, paid
+        )
         if user:
-            user.chips += paid
-            user.total_won += paid
+            user.chips += credited
+            user.total_won += real_won
+            user.bonus_won += bonus_won
+        paid = credited
         leg_data = []
         for leg in legs:
             mkt = await session.get(Market, leg.market_id)
@@ -3731,8 +3777,15 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
             )
         )
         user = _pur.scalar_one_or_none()
+        refund = promos.void_chip_refund(parlay.total_wager, parlay.bonus_bet_amount)
         if user:
-            user.chips += parlay.total_wager
+            user.chips += refund
+        if parlay.bonus_bet_amount:
+            await promos.refund_bonus(
+                session, parlay.guild_id, parlay.user_id, parlay.bonus_bet_amount
+            )
+        if parlay.profit_boost_token_id:
+            await promos.restore_boost_for_parlay(session, parlay.guild_id, parlay.id)
         leg_data = []
         for leg in legs:
             mkt = await session.get(Market, leg.market_id)
@@ -3749,7 +3802,7 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
                 "user_id": parlay.user_id,
                 "status": "VOIDED",
                 "wager": parlay.total_wager,
-                "payout": parlay.total_wager,
+                "payout": refund,
                 "legs": leg_data,
             }
         )
@@ -3794,15 +3847,31 @@ async def _unresolve_market(
                         )
                         all_legs = leg_res.scalars().all()
                         if all(l.status == "VOIDED" for l in all_legs):
+                            refund = promos.void_chip_refund(
+                                parlay.total_wager, parlay.bonus_bet_amount
+                            )
                             if p_user:
-                                p_user.chips -= parlay.total_wager
+                                p_user.chips -= refund
+                            if parlay.bonus_bet_amount:
+                                await promos.revoke_refund_lot(
+                                    session, parlay.guild_id, parlay.user_id,
+                                    parlay.bonus_bet_amount,
+                                )
+                            await promos.reconsume_boost(
+                                session, parlay.profit_boost_token_id,
+                                parlay_id=parlay.id,
+                            )
                         else:
+                            paid_net = boosted_gross(
+                                parlay.total_payout, parlay.payout_rate_at_placement, parlay_cap,
+                            ) - parlay.house_cut
+                            credited, real_won, bonus_won = promos.split_won_credit(
+                                parlay.total_wager, parlay.bonus_bet_amount, paid_net
+                            )
                             if p_user:
-                                paid = boosted_gross(
-                                    parlay.total_payout, parlay.payout_rate_at_placement, parlay_cap,
-                                ) - parlay.house_cut
-                                p_user.chips -= paid
-                                p_user.total_won -= paid
+                                p_user.chips -= credited
+                                p_user.total_won -= real_won
+                                p_user.bonus_won -= bonus_won
                             cut_reversed += parlay.house_cut
                     parlay.house_cut = 0
                     parlay.status = "PENDING"
@@ -3814,13 +3883,17 @@ async def _unresolve_market(
                 )
             )
             user = _ur.scalar_one_or_none()
-            paid = boosted_gross(
+            paid_net = boosted_gross(
                 bet.payout_if_win, bet.payout_rate_at_placement, single_cap,
             ) - bet.house_cut
+            credited, real_won, bonus_won = promos.split_won_credit(
+                bet.wager, bet.bonus_bet_amount, paid_net
+            )
             if user:
-                user.chips -= paid
-                user.total_won -= paid
-            chips_reclaimed += paid
+                user.chips -= credited
+                user.total_won -= real_won
+                user.bonus_won -= bonus_won
+            chips_reclaimed += credited
             cut_reversed += bet.house_cut
             bet.house_cut = 0
             bet.status = "PENDING"
@@ -3833,9 +3906,18 @@ async def _unresolve_market(
                 )
             )
             user = _ur.scalar_one_or_none()
+            refund = promos.void_chip_refund(bet.wager, bet.bonus_bet_amount)
             if user:
-                user.chips -= bet.wager
-            chips_reclaimed += bet.wager
+                user.chips -= refund
+            chips_reclaimed += refund
+            if bet.bonus_bet_amount and bet.parlay_id is None:
+                await promos.revoke_refund_lot(
+                    session, bet.guild_id, bet.user_id, bet.bonus_bet_amount
+                )
+            if bet.parlay_id is None:
+                await promos.reconsume_boost(
+                    session, bet.profit_boost_token_id, bet_id=bet.id
+                )
             bet.status = "PENDING"
         unresolved_count += 1
 
@@ -5286,6 +5368,11 @@ class AdminCog(commands.Cog):
     economy = app_commands.Group(
         name="economy",
         description="Chip/Panar exchange rates",
+        default_permissions=_ADMIN_PERMS,
+    )
+    promo = app_commands.Group(
+        name="promo",
+        description="Promotional claim drops (bonus bets / profit boosts)",
         default_permissions=_ADMIN_PERMS,
     )
 
@@ -11924,6 +12011,150 @@ class AdminCog(commands.Cog):
         role: discord.Role | None = None,
     ) -> None:
         await interaction.response.send_modal(AnnouncementModal(role))
+
+    @promo.command(
+        name="drop",
+        description="Post a claim message with a button that grants bonus bets or a profit boost",
+    )
+    @app_commands.describe(
+        channel="Channel to post the claim message in",
+        reward="What pressing the button grants",
+        message="The announcement body, shown inside the drop embed",
+        role="Role to ping above the announcement embed (optional)",
+        bonus_amount="Bonus-bets drop: chips of bonus credit each claimer gets",
+        boost_template="Profit-boost drop: which boost template to hand out",
+        max_claims="Stop accepting claims after this many people (blank = unlimited)",
+        duration_hours="Deactivate the button this many hours after posting (blank = never)",
+        reward_expiry_days="Expiry on the granted bonus/boost itself, in days (blank = permanent)",
+    )
+    @app_commands.choices(reward=[
+        app_commands.Choice(name="Bonus bets", value="bonus"),
+        app_commands.Choice(name="Profit boost", value="boost"),
+    ])
+    @app_commands.autocomplete(boost_template=boost_template_autocomplete)
+    @is_admin()
+    async def promo_drop(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        reward: app_commands.Choice[str],
+        message: str,
+        role: discord.Role | None = None,
+        bonus_amount: app_commands.Range[int, 1, 100_000_000] | None = None,
+        boost_template: str | None = None,
+        max_claims: app_commands.Range[int, 1, 100_000] | None = None,
+        duration_hours: app_commands.Range[int, 1, 8760] | None = None,
+        reward_expiry_days: app_commands.Range[int, 1, 3650] | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        from bot.utils.action_views import build_promo_claim_view
+
+        kind = reward.value
+        message = message.strip()
+        if not message:
+            await interaction.followup.send("The message can't be empty.", ephemeral=True)
+            return
+        if len(message) > 1900:
+            await interaction.followup.send(
+                "Keep the message under 1900 characters.", ephemeral=True
+            )
+            return
+
+        gid = current_guild_id()
+        tpl_id = None
+        reward_label = ""
+        if kind == "bonus":
+            if not bonus_amount:
+                await interaction.followup.send(
+                    "Set `bonus_amount` for a bonus-bets drop.", ephemeral=True
+                )
+                return
+            reward_label = f"{bonus_amount:,} bonus bets"
+        else:
+            if not boost_template or not str(boost_template).isdigit():
+                await interaction.followup.send(
+                    "Pick a `boost_template` from the autocomplete list.", ephemeral=True
+                )
+                return
+            async with get_read_session() as session:
+                tpl = await session.get(ProfitBoostTemplate, int(boost_template))
+                if tpl is None or tpl.guild_id != gid:
+                    await interaction.followup.send(
+                        "That profit boost template doesn't exist.", ephemeral=True
+                    )
+                    return
+                tpl_id = tpl.id
+                reward_label = f"+{tpl.boost_pct:g}% profit boost ({promos.boost_scope_text(tpl.scope_type, tpl.scope_id)})"
+
+        me = channel.guild.me if channel.guild else None
+        if me is not None and not channel.permissions_for(me).send_messages:
+            await interaction.followup.send(
+                f"I don't have permission to post in {channel.mention}.", ephemeral=True
+            )
+            return
+
+        expires_at = None
+        if duration_hours:
+            expires_at = datetime.utcnow() + timedelta(hours=duration_hours)
+
+        reward_expiry_hours = int(reward_expiry_days) * 24 if reward_expiry_days else None
+        max_claims_val = int(max_claims) if max_claims else None
+
+        async with get_session() as session:
+            drop = PromoClaimDrop(
+                guild_id=gid, channel_id=channel.id, reward_kind=kind.upper(),
+                bonus_amount=int(bonus_amount) if kind == "bonus" else None,
+                boost_template_id=tpl_id,
+                reward_expiry_hours=reward_expiry_hours,
+                ping_role_id=role.id if role else None,
+                message_text=message[:2000],
+                max_claims=max_claims_val,
+                expires_at=expires_at, created_by=interaction.user.id,
+            )
+            session.add(drop)
+            await session.flush()
+            drop_id = drop.id
+
+        embed = discord.Embed.from_dict(promos.build_claim_drop_embed(
+            message, reward_label, reward_expiry_hours=reward_expiry_hours,
+            max_claims=max_claims_val,
+        ))
+        try:
+            sent = await channel.send(
+                content=role.mention if role else None, embed=embed,
+                view=build_promo_claim_view(drop_id),
+                allowed_mentions=discord.AllowedMentions(roles=[role] if role else False),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            async with get_session() as session:
+                orphan = await session.get(PromoClaimDrop, drop_id)
+                if orphan is not None:
+                    await session.delete(orphan)
+            await interaction.followup.send(
+                f"Couldn't post in {channel.mention} — the drop was cancelled.", ephemeral=True
+            )
+            return
+
+        async with get_session() as session:
+            saved = await session.get(PromoClaimDrop, drop_id)
+            if saved is not None:
+                saved.message_id = sent.id
+
+        limits = []
+        if role:
+            limits.append(f"pinging {role.mention}")
+        if max_claims:
+            limits.append(f"first {max_claims:,} claimers")
+        if duration_hours:
+            limits.append(f"open for {duration_hours}h")
+        if reward_expiry_days:
+            limits.append(f"reward expires in {reward_expiry_days}d")
+        tail = f" ({'; '.join(limits)})" if limits else ""
+        await interaction.followup.send(
+            f"Posted a claim drop for **{reward_label}** in {channel.mention}{tail}.",
+            ephemeral=True,
+        )
 
     @settings.command(
         name="announce_channel",

@@ -667,6 +667,54 @@ async def _migrate_schema() -> None:
                 "ALTER TABLE parlays ADD COLUMN payout_rate_at_placement FLOAT NOT NULL DEFAULT 1.0"
             ))
 
+        # Promotions: bonus-bet portion + frozen profit-boost fields on each
+        # wager row. bonus_bet_amount is the slice of `wager` funded from free
+        # credit (its stake is never returned on a win); profit_boost_pct is the
+        # boost frozen at placement and already baked into payout_if_win /
+        # total_payout, so settlement and reversal need no boost-aware math.
+        for tbl in ("bets", "parlays"):
+            rows = await conn.execute(text(f"PRAGMA table_info({tbl})"))
+            cols = {row[1] for row in rows.fetchall()}
+            if "bonus_bet_amount" not in cols:
+                await conn.execute(text(
+                    f"ALTER TABLE {tbl} ADD COLUMN bonus_bet_amount INTEGER NOT NULL DEFAULT 0"
+                ))
+            if "profit_boost_pct" not in cols:
+                await conn.execute(text(
+                    f"ALTER TABLE {tbl} ADD COLUMN profit_boost_pct FLOAT NOT NULL DEFAULT 0.0"
+                ))
+            if "profit_boost_token_id" not in cols:
+                await conn.execute(text(
+                    f"ALTER TABLE {tbl} ADD COLUMN profit_boost_token_id INTEGER"
+                ))
+
+        # Promotions: lifetime bonus-credit action tracked apart from real-chip
+        # ROI so leaderboards stay "real money".
+        rows = await conn.execute(text("PRAGMA table_info(users)"))
+        user_cols = {row[1] for row in rows.fetchall()}
+        if "bonus_wagered" not in user_cols:
+            await conn.execute(text(
+                "ALTER TABLE users ADD COLUMN bonus_wagered INTEGER NOT NULL DEFAULT 0"
+            ))
+        if "bonus_won" not in user_cols:
+            await conn.execute(text(
+                "ALTER TABLE users ADD COLUMN bonus_won INTEGER NOT NULL DEFAULT 0"
+            ))
+
+        # Deposit match now pays out as bonus bets with an optional expiry.
+        rows = await conn.execute(text("PRAGMA table_info(deposit_match_promos)"))
+        if "match_bonus_expiry_days" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE deposit_match_promos ADD COLUMN match_bonus_expiry_days INTEGER"
+            ))
+
+        # Promo claim drops can now ping a role above their announcement embed.
+        rows = await conn.execute(text("PRAGMA table_info(promo_claim_drops)"))
+        if "ping_role_id" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE promo_claim_drops ADD COLUMN ping_role_id BIGINT"
+            ))
+
 
 _BUILTIN_MARKET_TYPES = [
     ("TRIBUTE_WINS",            "Tribute Wins (Victor)",                "HARD",      "Tribute wins the entire Hunger Games and is declared Victor."),
@@ -751,6 +799,9 @@ async def _seed_defaults() -> None:
         "game_active": json.dumps(False),
         "betting_paused": json.dumps(False),
         "default_chips": json.dumps(config.DEFAULT_CHIPS),
+        # New members are seeded with bonus-bet credit instead of real chips.
+        "signup_bonus_bet_amount": json.dumps(2500),
+        "signup_bonus_bet_expiry_hours": json.dumps(None),
         "current_phase_id": json.dumps(None),
         "sponsor_state": json.dumps(None),
         "num_games": json.dumps(0),

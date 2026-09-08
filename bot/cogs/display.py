@@ -118,10 +118,12 @@ async def _get_or_create_user(session, member: discord.Member, guild_id: int) ->
     u = result.scalar_one_or_none()
     if u is None:
         default_raw = await get_setting("default_chips")
-        default = json.loads(default_raw) if default_raw else 1000
+        default = json.loads(default_raw) if default_raw else 0
         u = User(guild_id=guild_id, discord_id=member.id, username=member.display_name, chips=default)
         session.add(u)
         await session.flush()
+        from bot.utils.promos import apply_first_touch_grants
+        await apply_first_touch_grants(session, guild_id, member.id)
     else:
         u.username = member.display_name
     return u
@@ -821,22 +823,54 @@ class DisplayCog(commands.Cog):
     @app_commands.command(name="balance", description="Check your chip balance and stats")
     async def balance(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
+        from datetime import timezone
+        from bot.utils import promos
+
+        gid = current_guild_id()
         async with get_session() as session:
-            user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            user = await _get_or_create_user(session, interaction.user, gid)
             chips = user.chips
             wagered = user.total_wagered
             won = user.total_won
+            bonus_wagered = user.bonus_wagered
+            bonus_won = user.bonus_won
+            await promos.expire_stale(session, gid, user.discord_id)
+            bonus_bal = await promos.bonus_balance(session, gid, user.discord_id)
+            bonus_next_exp = await promos.next_bonus_expiry(session, gid, user.discord_id)
+            boosts = await promos.active_boost_tokens(session, gid, user.discord_id)
+
+        def _ts(dt) -> str:
+            return f"<t:{int(dt.replace(tzinfo=timezone.utc).timestamp())}:R>"
 
         embed = discord.Embed(
             title=f"⚡ {interaction.user.display_name}'s Balance",
             color=0xC9A227,
         )
         embed.add_field(name="Chips", value=fmt_chips(chips), inline=False)
+        if bonus_bal > 0:
+            val = fmt_chips(bonus_bal)
+            if bonus_next_exp is not None:
+                val += f"\nnext expires {_ts(bonus_next_exp)}"
+            embed.add_field(name="Bonus Bets", value=val, inline=False)
         embed.add_field(name="Total Wagered", value=fmt_chips(wagered))
         embed.add_field(name="Total Won", value=fmt_chips(won))
         if wagered > 0:
             roi = ((won - wagered) / wagered) * 100
             embed.add_field(name="ROI", value=f"{roi:+.1f}%")
+        if bonus_wagered > 0:
+            embed.add_field(name="Bonus Wagered", value=fmt_chips(bonus_wagered))
+        if bonus_won > 0:
+            embed.add_field(name="Bonus Won", value=fmt_chips(bonus_won))
+        if boosts:
+            lines = []
+            for t in boosts[:12]:
+                line = f"• +{t.boost_pct:g}% · {promos.boost_scope_text(t.scope_type, t.scope_id)}"
+                if t.expires_at is not None:
+                    line += f" (expires {_ts(t.expires_at)})"
+                lines.append(line)
+            if len(boosts) > 12:
+                lines.append(f"…and {len(boosts) - 12} more")
+            embed.add_field(name="Profit Boosts", value="\n".join(lines), inline=False)
         embed.set_footer(text="May the odds be ever in your favor.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 

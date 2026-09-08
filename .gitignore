@@ -61,3 +61,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.code-workspace
+
+# ── Local filesystem images / build blobs ───────────────────────────────────
+*.squashfs
+folia.vandine.org

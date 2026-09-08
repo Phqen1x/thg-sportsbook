@@ -17,6 +17,7 @@ from bot.cogs.betting import (
 from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
 from bot.utils.restrictions import is_fully_restricted, is_public_bet_blocked
 from bot.utils.exchange_rates import effective_rate
+from bot.utils import promos
 from web.audit import post_bet_log
 from web.routes.public import _parlay_flavor
 from bot.odds.calculator import straight_payout, parlay_payout, combined_american, resolve_cashout
@@ -45,23 +46,23 @@ async def _paused() -> bool:
     return await _betting_paused()
 
 
-async def _single_cap_error_web(amount: int, odds: int) -> str | None:
+async def _single_cap_error_web(amount: int, odds: int, payout_override: int | None = None) -> str | None:
     """Guild-context-bound wrapper — see _paused() for why this is needed.
     Strips the Discord-markdown ** the shared helper wraps chip amounts in,
     since this surface renders errors as plain text."""
     from bot.database.engine import set_guild_context
     set_guild_context(_GUILD_ID())
-    err = await _single_cap_error(amount, odds)
+    err = await _single_cap_error(amount, odds, payout_override=payout_override)
     return err.replace("**", "") if err else None
 
 
-async def _parlay_cap_error_web(wager: int, odds_list: list[int]) -> str | None:
+async def _parlay_cap_error_web(wager: int, odds_list: list[int], payout_override: int | None = None) -> str | None:
     """Guild-context-bound wrapper — see _paused() for why this is needed.
     Strips the Discord-markdown ** the shared helper wraps chip amounts in,
     since this surface renders errors as plain text."""
     from bot.database.engine import set_guild_context
     set_guild_context(_GUILD_ID())
-    err = await _parlay_cap_error(wager, odds_list)
+    err = await _parlay_cap_error(wager, odds_list, payout_override=payout_override)
     return err.replace("**", "") if err else None
 
 
@@ -88,6 +89,8 @@ async def _cashout_settings(db) -> tuple[bool, float, dict]:
 
 
 async def _bet_cashout_preview(db, bet: Bet, market: Market | None, settings: tuple[bool, float, dict]) -> tuple[bool, int]:
+    if bet.bonus_bet_amount:
+        return (False, 0)  # bonus-funded wagers can't be cashed out
     global_allowed, global_rate, cashout_by_type = settings
     type_override = cashout_by_type.get(market.type) if market else None
     return resolve_cashout(
@@ -101,6 +104,8 @@ async def _bet_cashout_preview(db, bet: Bet, market: Market | None, settings: tu
 
 
 async def _parlay_cashout_preview(parlay: Parlay, settings: tuple[bool, float, dict]) -> tuple[bool, int]:
+    if parlay.bonus_bet_amount:
+        return (False, 0)  # bonus-funded wagers can't be cashed out
     global_allowed, global_rate, _by_type = settings
     return resolve_cashout(
         wager=parlay.total_wager, payout_if_win=parlay.total_payout,
@@ -118,13 +123,15 @@ async def _get_or_create_user(db, session_user: SessionUser) -> User:
         default_raw = (await db.execute(
             __import__("sqlalchemy").text("SELECT value FROM game_settings WHERE key='default_chips'")
         )).fetchone()
-        default = json.loads(default_raw[0]) if default_raw else _web_config.DEFAULT_CHIPS
+        default = json.loads(default_raw[0]) if default_raw else 0
         u = User(
             guild_id=_GUILD_ID(), discord_id=session_user.discord_id,
             username=session_user.username, chips=default,
         )
         db.add(u)
         await db.flush()
+        from bot.utils.promos import apply_first_touch_grants
+        await apply_first_touch_grants(db, _GUILD_ID(), session_user.discord_id)
     return u
 
 
@@ -187,6 +194,12 @@ async def balance(
         wagered = db_user.total_wagered
         roi = ((db_user.total_won - wagered) / wagered * 100) if wagered else 0.0
 
+        await promos.expire_stale(db, _GUILD_ID(), user.discord_id)
+        bonus_balance = await promos.bonus_balance(db, _GUILD_ID(), user.discord_id)
+        bonus_expiry = await promos.next_bonus_expiry(db, _GUILD_ID(), user.discord_id)
+        active_boosts = await promos.active_boost_tokens(db, _GUILD_ID(), user.discord_id)
+        await db.commit()
+
     return request.app.state.templates.TemplateResponse("balance.html", {
         "request": request,
         "user": user,
@@ -196,6 +209,9 @@ async def balance(
         "roi": roi,
         "success": success,
         "error": error,
+        "bonus_balance": bonus_balance,
+        "bonus_expiry": bonus_expiry,
+        "active_boosts": active_boosts,
     })
 
 
@@ -263,6 +279,37 @@ async def my_bets(
             if allowed:
                 parlay_cashout_preview[p.id] = amount
 
+        # Bonus-bet / profit-boost breakdown per bet & parlay (only where one
+        # applies). "wager" is the total stake; the bonus slice never returns on
+        # a win, so payouts here are net of it.
+        bet_promo: dict[int, dict] = {}
+        for b in straight_bets:
+            if not b.bonus_bet_amount and not b.profit_boost_pct:
+                continue
+            mkt = markets_map.get(b.market_id)
+            odds = b.odds_at_placement
+            raw = straight_payout(b.wager, odds)
+            bet_promo[b.id] = {
+                "stake": b.wager, "bonus": b.bonus_bet_amount,
+                "real": b.wager - b.bonus_bet_amount,
+                "boost_pct": b.profit_boost_pct,
+                "net_no_boost": raw - b.bonus_bet_amount,
+                "net_boosted": b.payout_if_win - b.bonus_bet_amount,
+            }
+        parlay_promo: dict[int, dict] = {}
+        for p in parlays:
+            if not p.bonus_bet_amount and not p.profit_boost_pct:
+                continue
+            leg_odds = [l.odds_at_placement for l in parlay_legs.get(p.id, [])]
+            raw = parlay_payout(p.total_wager, leg_odds) if leg_odds else p.total_payout
+            parlay_promo[p.id] = {
+                "stake": p.total_wager, "bonus": p.bonus_bet_amount,
+                "real": p.total_wager - p.bonus_bet_amount,
+                "boost_pct": p.profit_boost_pct,
+                "net_no_boost": raw - p.bonus_bet_amount,
+                "net_boosted": p.total_payout - p.bonus_bet_amount,
+            }
+
     return request.app.state.templates.TemplateResponse("my_bets.html", {
         "request": request,
         "user": user,
@@ -273,6 +320,8 @@ async def my_bets(
         "parlay_markets": parlay_markets,
         "bet_cashout_preview": bet_cashout_preview,
         "parlay_cashout_preview": parlay_cashout_preview,
+        "bet_promo": bet_promo,
+        "parlay_promo": parlay_promo,
         "success": success,
         "error": error,
     })
@@ -308,6 +357,13 @@ async def bet_form(
             )
         )).scalars().first()
 
+        await promos.expire_stale(db, _GUILD_ID(), user.discord_id)
+        bonus_balance = await promos.bonus_balance(db, _GUILD_ID(), user.discord_id)
+        eligible_boosts = await promos.eligible_boost_tokens(
+            db, _GUILD_ID(), user.discord_id, [market]
+        )
+        await db.commit()
+
     return request.app.state.templates.TemplateResponse("bet.html", {
         "request": request,
         "user": user,
@@ -317,6 +373,8 @@ async def bet_form(
         "tribute_b": tribute_b,
         "existing": existing,
         "error": error,
+        "bonus_balance": bonus_balance,
+        "eligible_boosts": eligible_boosts,
     })
 
 
@@ -326,9 +384,11 @@ async def place_bet(
     market_id: int,
     user: SessionUser = Depends(require_user),
     wager: Annotated[int, Form()] = 0,
+    bonus_amount: Annotated[int, Form()] = 0,
+    profit_boost_token_id: Annotated[int, Form()] = 0,
 ):
-    if wager < 1:
-        return _redirect(f"/bet/{market_id}", error="Wager+must+be+at+least+1+chip.")
+    if wager < 1 and bonus_amount < 1:
+        return _redirect(f"/bet/{market_id}", error="Enter+a+wager+or+apply+bonus+bets.")
     if await _paused():
         return _redirect(f"/bet/{market_id}", error=_PAUSED_ERROR)
 
@@ -341,8 +401,6 @@ async def place_bet(
 
         if await is_fully_restricted(db, _GUILD_ID(), user.discord_id):
             return _redirect(f"/bet/{market_id}", error=BETTING_BLOCKED_MSG.replace(" ", "+"))
-        if db_user.chips < wager:
-            return _redirect(f"/bet/{market_id}", error="Insufficient+chips.")
 
         existing = (await db.execute(
             select(Bet).where(
@@ -356,29 +414,45 @@ async def place_bet(
         if existing:
             return _redirect(f"/bet/{market_id}", error="You+already+have+a+pending+bet+on+this+market.")
 
-        cap_err = await _single_cap_error_web(wager, market.odds)
+        info, perr = await promos.validate_wager_promos(
+            db, _GUILD_ID(), user.discord_id, db_user.chips,
+            wager=wager, bonus_amount=bonus_amount,
+            boost_token_id=profit_boost_token_id or None,
+            markets=[market], is_parlay=False,
+        )
+        if perr:
+            return _redirect(f"/bet/{market_id}", error=quote_plus(perr))
+        payout = info["payout"]
+        total_stake = info["total_stake"]
+        net_if_win = info["net_if_win"]
+
+        cap_err = await _single_cap_error_web(total_stake, market.odds, payout_override=payout)
         if cap_err:
             return _redirect(f"/bet/{market_id}", error=quote_plus(cap_err))
 
-        payout = straight_payout(wager, market.odds)
         bet = Bet(
             guild_id=_GUILD_ID(),
             user_id=user.discord_id,
             market_id=market_id,
-            wager=wager,
+            wager=total_stake,
             odds_at_placement=market.odds,
             payout_if_win=payout,
             payout_rate_at_placement=await _payout_rate_web(db, user),
             status="PENDING",
+            bonus_bet_amount=info["bonus_amount"],
+            profit_boost_pct=info["boost_pct"],
+            profit_boost_token_id=info["boost_token"].id if info["boost_token"] else None,
         )
-        db_user.chips -= wager
-        db_user.total_wagered += wager
+        db_user.chips -= info["real_part"]
+        db_user.total_wagered += info["real_part"]
         db.add(bet)
+        await db.flush()
+        await promos.commit_wager_promos(db, _GUILD_ID(), db_user, info, bet_id=bet.id)
         await db.commit()
         market_label = market.label
 
-    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "BET", [market_label], wager, payout))
-    return _redirect("/my-bets", msg=f"Bet+placed!+Win+{payout:,}+chips+if+correct.")
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "BET", [market_label], total_stake, net_if_win))
+    return _redirect("/my-bets", msg=f"Bet+placed!+Win+{net_if_win:,}+chips+if+correct.")
 
 
 # ── Cashout ────────────────────────────────────────────────────────────────────
@@ -468,6 +542,15 @@ async def parlay_view(
         else:
             combined = None
 
+        await promos.expire_stale(db, _GUILD_ID(), user.discord_id)
+        bonus_balance = await promos.bonus_balance(db, _GUILD_ID(), user.discord_id)
+        slip_markets = list(leg_markets.values())
+        eligible_boosts = (
+            await promos.eligible_boost_tokens(db, _GUILD_ID(), user.discord_id, slip_markets)
+            if slip_markets else []
+        )
+        await db.commit()
+
     return request.app.state.templates.TemplateResponse("parlay.html", {
         "request": request,
         "user": user,
@@ -478,6 +561,8 @@ async def parlay_view(
         "max_legs": MAX_PARLAY_LEGS,
         "success": success,
         "error": error,
+        "bonus_balance": bonus_balance,
+        "eligible_boosts": eligible_boosts,
     })
 
 
@@ -543,9 +628,11 @@ async def parlay_submit(
     user: SessionUser = Depends(require_user),
     wager: Annotated[int, Form()] = 0,
     is_public: Annotated[str, Form()] = "",
+    bonus_amount: Annotated[int, Form()] = 0,
+    profit_boost_token_id: Annotated[int, Form()] = 0,
 ):
-    if wager < 1:
-        return _redirect("/parlay", error="Wager+must+be+at+least+1+chip.")
+    if wager < 1 and bonus_amount < 1:
+        return _redirect("/parlay", error="Enter+a+wager+or+apply+bonus+bets.")
     if await _paused():
         return _redirect("/parlay", error=_PAUSED_ERROR)
 
@@ -570,14 +657,22 @@ async def parlay_submit(
                 return _redirect("/parlay", error="One+or+more+markets+are+no+longer+open.")
             leg_markets.append(mkt)
 
-        if db_user.chips < wager:
-            return _redirect("/parlay", error="Insufficient+chips.")
-
         odds_list = [m.odds for m in leg_markets]
-        cap_err = await _parlay_cap_error_web(wager, odds_list)
+        info, perr = await promos.validate_wager_promos(
+            db, _GUILD_ID(), user.discord_id, db_user.chips,
+            wager=wager, bonus_amount=bonus_amount,
+            boost_token_id=profit_boost_token_id or None,
+            markets=leg_markets, is_parlay=True,
+        )
+        if perr:
+            return _redirect("/parlay", error=quote_plus(perr))
+        total_payout = info["payout"]
+        total_stake = info["total_stake"]
+        net_if_win = info["net_if_win"]
+
+        cap_err = await _parlay_cap_error_web(total_stake, odds_list, payout_override=total_payout)
         if cap_err:
             return _redirect("/parlay", error=quote_plus(cap_err))
-        total_payout = parlay_payout(wager, odds_list)
 
         public = is_public == "on"
         role_ids = await live_role_ids(user.discord_id, user.guild_id)
@@ -586,11 +681,14 @@ async def parlay_submit(
         p = Parlay(
             guild_id=_GUILD_ID(),
             user_id=user.discord_id,
-            total_wager=wager,
+            total_wager=total_stake,
             total_payout=total_payout,
             payout_rate_at_placement=await _payout_rate_web(db, user, role_ids),
             status="PENDING",
             is_public=public,
+            bonus_bet_amount=info["bonus_amount"],
+            profit_boost_pct=info["boost_pct"],
+            profit_boost_token_id=info["boost_token"].id if info["boost_token"] else None,
         )
         db.add(p)
         await db.flush()
@@ -601,24 +699,25 @@ async def parlay_submit(
                 user_id=user.discord_id,
                 parlay_id=p.id,
                 market_id=mkt.id,
-                wager=wager,
+                wager=total_stake,
                 odds_at_placement=mkt.odds,
                 payout_if_win=0,
                 status="PENDING",
             )
             db.add(bet)
 
-        db_user.chips -= wager
-        db_user.total_wagered += wager
+        db_user.chips -= info["real_part"]
+        db_user.total_wagered += info["real_part"]
 
         for l in legs_raw:
             await db.delete(l)
 
+        await promos.commit_wager_promos(db, _GUILD_ID(), db_user, info, parlay_id=p.id)
         await db.commit()
         labels = [m.label for m in leg_markets]
 
-    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, wager, total_payout))
-    msg = f"Parlay+submitted!+Potential+payout:+{total_payout:,}+chips."
+    asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, total_stake, net_if_win))
+    msg = f"Parlay+submitted!+Potential+payout:+{net_if_win:,}+chips."
     if downgraded:
         msg += "+(Kept+private+-+public+posting+is+restricted+for+you.)"
     return _redirect("/my-bets", msg=msg)

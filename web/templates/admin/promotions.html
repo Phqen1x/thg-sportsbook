@@ -1,0 +1,298 @@
+{% extends "admin/layout.html" %}
+{% block title %}Promotions — Admin{% endblock %}
+
+{% block admin_content %}
+<div class="page-header">
+  <h1>Promotions</h1>
+</div>
+
+<p class="text-dim">
+  Bonus bets are free credit (in chips): a win pays winnings only, a loss costs nothing,
+  they have no cash value and can't be withdrawn. New members are seeded with bonus bets
+  instead of real chips (amount set by <code>signup_bonus_bet_amount</code> in Settings).
+  Grants here go to one member at a time or to every new member on first interaction. To
+  hand a reward to a role or the whole server, post a claim drop with
+  <code>/promo drop</code> in Discord.
+</p>
+
+<!-- ── Bonus bets ─────────────────────────────────────────────────────────── -->
+<div class="section-header mt-3"><h2>Bonus Bets</h2></div>
+
+<div class="card">
+  <div class="card-label">GRANT BONUS BETS</div>
+  <form method="post" action="/admin/promotions/bonus/grant">
+    <div class="form-group">
+      <label class="form-label">Target</label>
+      <select name="scope" class="form-control">
+        <option value="USER">A user</option>
+        <option value="FIRST_TOUCH">Every new member (on first interaction)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Discord user ID <span class="text-dim">(leave blank for first-interaction)</span></label>
+      <input type="text" name="target_id" class="form-control" placeholder="123456789012345678">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Amount (chips)</label>
+      <input type="number" name="amount" class="form-control" min="1" value="2500" required>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Valid for <span class="text-dim">(leave both 0 for permanent — expires only when wagered)</span></label>
+      <div style="display:flex;gap:8px">
+        <input type="number" name="expiry_days" class="form-control" min="0" value="0" placeholder="days">
+        <input type="number" name="expiry_hours" class="form-control" min="0" value="0" placeholder="hours">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Note <span class="text-dim">(optional)</span></label>
+      <input type="text" name="note" class="form-control" maxlength="200">
+    </div>
+    <button type="submit" class="btn btn-primary">Grant</button>
+  </form>
+</div>
+
+<div class="card mt-3">
+  <div class="card-label">DEDUCT BONUS BETS</div>
+  <form method="post" action="/admin/promotions/bonus/deduct" onsubmit="return confirm('Deduct bonus bets now?')">
+    <div class="form-group">
+      <label class="form-label">Target</label>
+      <select name="scope" class="form-control">
+        <option value="USER">A user</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Discord user ID</label>
+      <input type="text" name="target_id" class="form-control" placeholder="123456789012345678">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Amount to remove <span class="text-dim">(0 = wipe their whole bonus balance)</span></label>
+      <input type="number" name="amount" class="form-control" min="0" value="0">
+    </div>
+    <button type="submit" class="btn btn-danger">Deduct</button>
+  </form>
+</div>
+
+{% if ft_bonus %}
+<div class="card mt-3">
+  <div class="card-label">FIRST-INTERACTION BONUS RULES</div>
+  <table class="table">
+    <thead><tr><th>Amount</th><th>Expiry (h)</th><th>Note</th><th></th></tr></thead>
+    <tbody>
+      {% for g in ft_bonus %}
+      <tr>
+        <td class="text-gold font-bold">{{ "{:,}".format(g.amount) }}</td>
+        <td>{{ g.expiry_hours or "—" }}</td>
+        <td class="text-dim">{{ g.note or "" }}</td>
+        <td>
+          <form method="post" action="/admin/promotions/bonus/first-touch/{{ g.id }}/delete">
+            <button class="btn btn-sm btn-danger">Remove</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<div class="section-header mt-3"><h2>Outstanding Bonus Balances</h2></div>
+<div class="card">
+  <table class="table">
+    <thead><tr><th>Member</th><th>Bonus balance</th><th>Soonest expiry</th><th></th></tr></thead>
+    <tbody>
+      {% for e in bonus_users %}
+      <tr>
+        <td>{{ e.name }} <span class="text-dim" style="font-size:0.8rem">{{ e.uid }}</span></td>
+        <td class="text-gold font-bold">{{ "{:,}".format(e.total) }}</td>
+        <td class="text-dim">{{ e.expiry.strftime("%Y-%m-%d %H:%M") if e.expiry else "permanent" }}</td>
+        <td>
+          <form method="post" action="/admin/promotions/bonus/user/{{ e.uid }}/revoke" onsubmit="return confirm('Wipe this member''s bonus balance?')">
+            <button class="btn btn-sm btn-danger">Revoke all</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="text-dim text-center">No outstanding bonus bets.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- ── Profit boosts ─────────────────────────────────────────────────────── -->
+<div class="section-header mt-3"><h2>Profit Boosts</h2></div>
+<p class="text-dim">A boost is a single-use token that lifts a wager's <em>winnings</em> by a %. Consumed on use, win or lose.</p>
+
+<div class="card">
+  <div class="card-label">NEW BOOST TEMPLATE</div>
+  <form method="post" action="/admin/promotions/boost-template/new">
+    <div class="form-group">
+      <label class="form-label">Name</label>
+      <input type="text" name="name" class="form-control" required maxlength="100">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Boost %</label>
+      <input type="number" name="boost_pct" class="form-control" step="1" min="1" value="50" required>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Applies to</label>
+      <select name="scope_type" class="form-control">
+        <option value="ANY">Any bet</option>
+        <option value="DISTRICT">A specific district</option>
+        <option value="ALLIANCE">A specific alliance</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">District number / alliance ID <span class="text-dim">(only for district / alliance scope)</span></label>
+      <input type="text" name="scope_id" class="form-control">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Max wager <span class="text-dim">(optional)</span></label>
+      <input type="text" name="max_wager" class="form-control">
+    </div>
+    <div class="form-group">
+      <label class="form-label"><input type="checkbox" name="grant_on_first_touch"> Grant one to every new member on first interaction</label>
+    </div>
+    <button type="submit" class="btn btn-primary">Create Template</button>
+  </form>
+</div>
+
+<div class="card mt-3">
+  <table class="table">
+    <thead><tr><th>Name</th><th>Boost</th><th>Scope</th><th>Max wager</th><th>First-touch</th><th>Active</th><th></th></tr></thead>
+    <tbody>
+      {% for t in templates %}
+      <tr>
+        <td>{{ t.name }}</td>
+        <td class="text-gold font-bold">+{{ t.boost_pct }}%</td>
+        <td>{{ t.scope_type }}{% if t.scope_id is not none %} #{{ t.scope_id }}{% endif %}</td>
+        <td>{{ "{:,}".format(t.max_wager) if t.max_wager else "—" }}</td>
+        <td>{{ "yes" if t.grant_on_first_touch else "—" }}</td>
+        <td>{{ "yes" if t.active else "no" }}</td>
+        <td style="display:flex;gap:6px">
+          <form method="post" action="/admin/promotions/boost-template/{{ t.id }}/toggle"><button class="btn btn-sm">{{ "Disable" if t.active else "Enable" }}</button></form>
+          <form method="post" action="/admin/promotions/boost-template/{{ t.id }}/delete" onsubmit="return confirm('Delete this template?')"><button class="btn btn-sm btn-danger">Delete</button></form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="text-dim text-center">No boost templates yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card mt-3">
+  <div class="card-label">GRANT A BOOST</div>
+  <form method="post" action="/admin/promotions/boost/grant">
+    <div class="form-group">
+      <label class="form-label">Template</label>
+      <select name="template_id" class="form-control" required>
+        {% for t in templates %}<option value="{{ t.id }}">{{ t.name }} (+{{ t.boost_pct }}%, {{ t.scope_type }})</option>{% endfor %}
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Target</label>
+      <select name="scope" class="form-control">
+        <option value="USER">A user</option>
+        <option value="FIRST_TOUCH">Every new member (on first interaction)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Discord user ID <span class="text-dim">(leave blank for first-interaction)</span></label>
+      <input type="text" name="target_id" class="form-control">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Valid for <span class="text-dim">(0/0 = no expiry)</span></label>
+      <div style="display:flex;gap:8px">
+        <input type="number" name="expiry_days" class="form-control" min="0" value="0" placeholder="days">
+        <input type="number" name="expiry_hours" class="form-control" min="0" value="0" placeholder="hours">
+      </div>
+    </div>
+    <button type="submit" class="btn btn-primary">Grant</button>
+  </form>
+</div>
+
+<div class="section-header mt-3"><h2>Outstanding Boost Tokens</h2></div>
+<div class="card">
+  <table class="table">
+    <thead><tr><th>Token</th><th>Member</th><th>Boost</th><th>Scope</th><th>Expires</th><th></th></tr></thead>
+    <tbody>
+      {% for t in tokens %}
+      <tr>
+        <td>#{{ t.id }}</td>
+        <td class="text-dim" style="font-size:0.8rem">{{ t.discord_user_id }}</td>
+        <td class="text-gold font-bold">+{{ t.boost_pct }}%</td>
+        <td>{{ t.scope_type }}{% if t.scope_id is not none %} #{{ t.scope_id }}{% endif %}</td>
+        <td class="text-dim">{{ t.expires_at.strftime("%Y-%m-%d %H:%M") if t.expires_at else "—" }}</td>
+        <td><form method="post" action="/admin/promotions/boost/token/{{ t.id }}/revoke"><button class="btn btn-sm btn-danger">Revoke</button></form></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="text-dim text-center">No outstanding boost tokens.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- ── Deposit match ────────────────────────────────────────────────────── -->
+<div class="section-header mt-3"><h2>Deposit Match</h2></div>
+<p class="text-dim">
+  When an admin marks a member's <code>/deposit</code> request <em>Done</em> during the
+  window, the sportsbook grants the match % of that deposit as <strong>bonus bets</strong>,
+  up to the per-member cap (measured against cumulative matched chips so it can't be
+  farmed).
+</p>
+
+<div class="card">
+  <div class="card-label">NEW DEPOSIT MATCH PROMO</div>
+  <form method="post" action="/admin/promotions/deposit-match/new" id="dm-new-form">
+    <div class="form-group"><label class="form-label">Name</label><input type="text" name="name" class="form-control" required maxlength="100"></div>
+    <div class="form-group"><label class="form-label">Match %</label><input type="number" name="match_pct" class="form-control" step="1" min="1" value="100" required></div>
+    <div class="form-group"><label class="form-label">Max match per member (bonus bets)</label><input type="number" name="max_match_per_user" class="form-control" min="1" value="5000" required></div>
+    <div class="form-group"><label class="form-label">Matched bonus bets expire after <span class="text-dim">(days — blank/0 = permanent)</span></label><input type="number" name="match_bonus_expiry_days" class="form-control" min="0" value="0"></div>
+    <div class="form-group"><label class="form-label">Starts <span class="text-dim">(blank = now, your local time)</span></label><input type="datetime-local" id="dm-starts" class="form-control"></div>
+    <div class="form-group"><label class="form-label">Ends <span class="text-dim">(your local time)</span></label><input type="datetime-local" id="dm-ends" class="form-control" required></div>
+    <div class="form-group"><label class="form-label">Restrict to role ID <span class="text-dim">(optional — blank = everyone)</span></label><input type="text" name="role_id" class="form-control"></div>
+    <input type="hidden" name="starts_at"><input type="hidden" name="ends_at">
+    <button type="submit" class="btn btn-primary">Create</button>
+  </form>
+</div>
+<script>
+  (function () {
+    var f = document.getElementById("dm-new-form");
+    if (!f) return;
+    f.addEventListener("submit", function () {
+      var s = document.getElementById("dm-starts").value;
+      var e = document.getElementById("dm-ends").value;
+      f.elements["starts_at"].value = s ? new Date(s).toISOString() : "";
+      f.elements["ends_at"].value = e ? new Date(e).toISOString() : "";
+    });
+  })();
+</script>
+
+<div class="card mt-3">
+  <table class="table">
+    <thead><tr><th>Name</th><th>Match</th><th>Cap</th><th>Bonus expiry</th><th>Window (UTC)</th><th>Role</th><th>Claims</th><th></th></tr></thead>
+    <tbody>
+      {% for p in deposit_promos %}
+      <tr>
+        <td>{{ p.name }}{% if p.starts_at <= now and p.ends_at > now and p.active %} <span class="text-gold">● live</span>{% endif %}</td>
+        <td class="text-gold font-bold">{{ p.match_pct }}%</td>
+        <td>{{ "{:,}".format(p.max_match_per_user) }}</td>
+        <td class="text-dim">{{ (p.match_bonus_expiry_days ~ "d") if p.match_bonus_expiry_days else "permanent" }}</td>
+        <td class="text-dim" style="font-size:0.8rem">{{ p.starts_at.strftime("%m-%d %H:%M") }} → {{ p.ends_at.strftime("%m-%d %H:%M") }}</td>
+        <td class="text-dim">{{ p.role_id or "all" }}</td>
+        <td class="text-dim">
+          {% set cs = claims_by_promo.get(p.id, []) %}
+          {{ cs|length }} member(s), {{ "{:,}".format(cs|sum(attribute="total_matched")) }} matched
+        </td>
+        <td style="display:flex;gap:6px">
+          {% if p.active and p.ends_at > now %}<form method="post" action="/admin/promotions/deposit-match/{{ p.id }}/end"><button class="btn btn-sm">End now</button></form>{% endif %}
+          <form method="post" action="/admin/promotions/deposit-match/{{ p.id }}/delete" onsubmit="return confirm('Delete this promo and its claim history?')"><button class="btn btn-sm btn-danger">Delete</button></form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="text-dim text-center">No deposit match promos.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
