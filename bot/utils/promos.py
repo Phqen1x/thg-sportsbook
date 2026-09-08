@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 
 from bot.database.models import (
-    BonusBetLot, BonusGrant, DepositMatchClaim, DepositMatchPromo,
+    BonusBetLot, BonusGrant, BoostShopItem, BoostShopPurchase,
+    DepositMatchClaim, DepositMatchPromo,
     ProfitBoostGrant, ProfitBoostTemplate, ProfitBoostToken,
     PromoClaimDrop, PromoClaimRedemption,
 )
@@ -770,3 +771,167 @@ async def apply_deposit_match(
             source="DEPOSIT_MATCH", grant_id=promo.id,
         )
     return matched
+
+
+# ── Settlement rebate (bonus bets back on settled wagers) ────────────────────
+# A configurable perk: when a wager settles, give the member a slice of their
+# real-chip stake back as bonus bets — separate rates for wins and losses. Set
+# ``bonus_rebate_mode`` to OFF (default), PCT (% of the stake) or FLAT (a fixed
+# bonus-bet amount per settled wager).
+
+
+async def _rebate_settings() -> dict:
+    from bot.database.engine import get_setting
+    import json
+
+    async def _j(key, default):
+        raw = await get_setting(key)
+        if raw is None or raw == "":
+            return default
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return raw  # plain string (web dashboard writes unquoted values)
+
+    return {
+        "mode": str(await _j("bonus_rebate_mode", "OFF")).upper(),
+        "win_pct": float(await _j("bonus_rebate_win_pct", 0) or 0),
+        "loss_pct": float(await _j("bonus_rebate_loss_pct", 0) or 0),
+        "win_flat": int(await _j("bonus_rebate_win_flat", 0) or 0),
+        "loss_flat": int(await _j("bonus_rebate_loss_flat", 0) or 0),
+        "expiry_days": await _j("bonus_rebate_expiry_days", None),
+    }
+
+
+def _rebate_amount(cfg: dict, wager_placed: int, won: bool) -> int:
+    if cfg["mode"] == "PCT":
+        pct = cfg["win_pct"] if won else cfg["loss_pct"]
+        return int(round(max(0, wager_placed) * pct / 100.0))
+    if cfg["mode"] == "FLAT":
+        return cfg["win_flat"] if won else cfg["loss_flat"]
+    return 0
+
+
+async def award_settle_rebate(
+    session, guild_id: int, user_id: int, *, wager_placed: int, won: bool,
+    bet_id: int | None = None, parlay_id: int | None = None,
+) -> int:
+    """Grant the configured bonus-bet rebate for a wager that just settled to
+    WON (``won=True``) or LOST (``won=False``). ``wager_placed`` is the real
+    chips the member risked (the bonus-funded slice is excluded). Returns the
+    bonus bets granted, or 0 when the perk is off / rounds to nothing."""
+    cfg = await _rebate_settings()
+    if cfg["mode"] not in ("PCT", "FLAT"):
+        return 0
+    amount = _rebate_amount(cfg, wager_placed, won)
+    if amount <= 0:
+        return 0
+    exp_days = cfg["expiry_days"]
+    source = "REBATE_BET" if bet_id is not None else "REBATE_PARLAY"
+    await grant_bonus_to_users(
+        session, guild_id, [user_id], amount,
+        int(exp_days) * 24 if exp_days else None,
+        source=source, grant_id=bet_id if bet_id is not None else parlay_id,
+    )
+    return amount
+
+
+async def revoke_settle_rebate(
+    session, guild_id: int, *, bet_id: int | None = None,
+    parlay_id: int | None = None,
+) -> None:
+    """Undo the rebate lot for a wager whose resolution is being reversed."""
+    source = "REBATE_BET" if bet_id is not None else "REBATE_PARLAY"
+    match_id = bet_id if bet_id is not None else parlay_id
+    if match_id is None:
+        return
+    lot = (await session.execute(
+        select(BonusBetLot).where(
+            BonusBetLot.guild_id == guild_id,
+            BonusBetLot.source == source,
+            BonusBetLot.grant_id == match_id,
+            BonusBetLot.status.in_(("ACTIVE", "EXHAUSTED")),
+        ).order_by(BonusBetLot.id.desc())
+    )).scalars().first()
+    if lot is None:
+        return
+    lot.amount_remaining = 0
+    lot.status = "REVOKED"
+
+
+# ── Profit-boost shop (spend bonus bets on boost tokens) ─────────────────────
+
+
+async def shop_listings(session, guild_id: int, *, active_only: bool = True):
+    """Shop items paired with their live boost template. Returns
+    ``[(BoostShopItem, ProfitBoostTemplate)]`` in ``sort_order`` then id order;
+    listings whose template was deleted or disabled are skipped when
+    ``active_only``."""
+    q = select(BoostShopItem).where(BoostShopItem.guild_id == guild_id)
+    if active_only:
+        q = q.where(BoostShopItem.active == True)  # noqa: E712
+    q = q.order_by(BoostShopItem.sort_order, BoostShopItem.id)
+    out = []
+    for item in (await session.execute(q)).scalars().all():
+        tpl = await session.get(ProfitBoostTemplate, item.boost_template_id)
+        if tpl is not None and tpl.guild_id != guild_id:
+            tpl = None
+        if active_only and (tpl is None or not tpl.active):
+            continue
+        out.append((item, tpl))
+    return out
+
+
+async def _shop_purchase_count(session, guild_id: int, item_id: int, user_id: int) -> int:
+    return (await session.execute(
+        select(func.count()).select_from(BoostShopPurchase).where(
+            BoostShopPurchase.guild_id == guild_id,
+            BoostShopPurchase.item_id == item_id,
+            BoostShopPurchase.discord_user_id == user_id,
+        )
+    )).scalar_one()
+
+
+async def purchase_boost(
+    session, guild_id: int, user_id: int, item_id: int,
+) -> tuple[dict | None, str | None]:
+    """Buy one shop listing: debit its bonus-bet price, grant the boost token,
+    log the purchase. Returns ``({"message", "price", "token_id"}, None)`` or
+    ``(None, error)``. The caller owns the transaction."""
+    item = await session.get(BoostShopItem, item_id)
+    if item is None or item.guild_id != guild_id or not item.active:
+        return None, "That shop item isn't available."
+    tpl = await session.get(ProfitBoostTemplate, item.boost_template_id)
+    if tpl is None or tpl.guild_id != guild_id or not tpl.active:
+        return None, "The profit boost for this item no longer exists."
+    if item.per_user_limit is not None:
+        taken = await _shop_purchase_count(session, guild_id, item_id, user_id)
+        if taken >= item.per_user_limit:
+            return None, "You've bought this as many times as allowed."
+
+    await expire_stale(session, guild_id, user_id)
+    bal = await bonus_balance(session, guild_id, user_id)
+    if bal < item.price_bonus_bets:
+        return None, (
+            f"Not enough bonus bets — this costs {item.price_bonus_bets:,}, "
+            f"you have {bal:,}."
+        )
+
+    await spend_bonus(session, guild_id, user_id, item.price_bonus_bets)
+    token = ProfitBoostToken(
+        guild_id=guild_id, discord_user_id=user_id, template_id=tpl.id,
+        boost_pct=tpl.boost_pct, scope_type=tpl.scope_type, scope_id=tpl.scope_id,
+        max_wager=tpl.max_wager, status="ACTIVE",
+        expires_at=_expiry_from_hours(item.expiry_days * 24 if item.expiry_days else None),
+    )
+    session.add(token)
+    await session.flush()
+    session.add(BoostShopPurchase(
+        guild_id=guild_id, item_id=item_id, discord_user_id=user_id,
+        template_id=tpl.id, price_paid=item.price_bonus_bets, token_id=token.id,
+    ))
+    label = f"+{tpl.boost_pct:g}% profit boost ({boost_scope_text(tpl.scope_type, tpl.scope_id)})"
+    return {
+        "message": f"Bought {label} for {item.price_bonus_bets:,} bonus bets.",
+        "price": item.price_bonus_bets, "token_id": token.id,
+    }, None

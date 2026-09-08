@@ -150,6 +150,7 @@ const TABS = [
   ["mybets", "My Bets"],
   ["parlay", "Parlay"],
   ["tail", "Tail"],
+  ["shop", "Shop"],
 ];
 
 function tabLink([id, label], extraClass = "") {
@@ -186,6 +187,7 @@ const VIEWS = {
   mybets: viewMyBets,
   parlay: viewParlay,
   tail: viewTail,
+  shop: viewShop,
   admin: viewAdmin,
   balance: viewBalance,
 };
@@ -909,6 +911,67 @@ async function viewBalance(view) {
   }
 }
 
+async function viewShop(view) {
+  let data;
+  try {
+    data = await api("/shop");
+  } catch (e) {
+    view.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    return;
+  }
+  const scopeText = (it) =>
+    it.scope_type === "DISTRICT" ? `District ${it.scope_id}`
+    : it.scope_type === "ALLIANCE" ? `Alliance #${it.scope_id}` : "Any bet";
+
+  const render = () => {
+    view.innerHTML = `
+      <h2 class="section-title">Profit Boost Shop</h2>
+      <div class="card" style="display:flex;justify-content:space-between;align-items:center">
+        <span class="dim">Spend bonus bets on single-use profit boosts.</span>
+        <span class="odds-pos">${fmtChips(data.bonus_balance)} bonus bets</span>
+      </div>
+      <div class="list" style="margin-top:.6rem">
+        ${data.items.length ? data.items.map((it) => {
+          const disabled = it.sold_out || !it.affordable;
+          const note = it.sold_out ? "Purchase limit reached"
+            : !it.affordable ? "Not enough bonus bets" : "";
+          return `<div class="card bet-row" style="display:block">
+            <div style="display:flex;justify-content:space-between;gap:.5rem">
+              <div>
+                <div><span class="odds-pos">+${it.boost_pct}%</span> profit boost · ${esc(scopeText(it))}</div>
+                <div class="dim" style="font-size:.8rem">
+                  ${esc(it.name)}${it.max_wager ? ` · max wager ${fmtChips(it.max_wager)}` : ""}${it.expiry_days ? ` · expires ${it.expiry_days}d after purchase` : ""}${it.per_user_limit ? ` · limit ${it.per_user_limit} (bought ${it.owned})` : ""}
+                </div>
+              </div>
+              <div style="text-align:right;white-space:nowrap">
+                <div class="chips">${fmtChips(it.price_bonus_bets)}</div>
+                <button class="btn btn-sm btn-primary" data-buy="${it.id}" ${disabled ? "disabled" : ""}>Buy</button>
+              </div>
+            </div>
+            ${note ? `<div class="dim" style="font-size:.78rem;margin-top:.3rem">${note}</div>` : ""}
+          </div>`;
+        }).join("") : `<div class="empty">Nothing in the shop right now.</div>`}
+      </div>`;
+
+    view.querySelectorAll("[data-buy]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try {
+          const r = await api("/shop/buy", { method: "POST", body: { item_id: Number(btn.dataset.buy) } });
+          toast(r.message || "Purchased.");
+          data = await api("/shop");
+          render();
+          refreshMe();
+        } catch (e) {
+          toast(e.message, "error");
+          btn.disabled = false;
+        }
+      });
+    });
+  };
+  render();
+}
+
 // ── Views: Admin (live-game ops) ───────────────────────────────────────────────
 
 async function viewAdmin(view) {
@@ -1110,6 +1173,53 @@ async function adminPromos(body) {
           <button class="btn btn-sm btn-danger" data-act="dm-del" data-id="${p.id}">Delete</button>
         </span>
       </div>`).join("") : `<div class="dim">No promos.</div>`}
+    </div>
+
+    <div class="section-title">Bonus Bet Rebate</div>
+    <div class="card admin-form">
+      <div class="card-label">BONUS BETS BACK ON SETTLED WAGERS</div>
+      <div class="dim" style="width:100%">Give members a % of their real-chip stake (or a flat amount) back as bonus bets when a bet or parlay settles — separate rates for wins and losses.</div>
+      <select id="rb-mode" class="input">
+        <option value="OFF">Off</option>
+        <option value="PCT">% of wager placed</option>
+        <option value="FLAT">Flat bonus bets per settled wager</option>
+      </select>
+      <div id="rb-pct" style="display:flex;gap:.5rem;width:100%">
+        <input id="rb-winpct" class="input" type="number" min="0" max="100" step="0.5" placeholder="Win %">
+        <input id="rb-losspct" class="input" type="number" min="0" max="100" step="0.5" placeholder="Loss %">
+      </div>
+      <div id="rb-flat" style="display:none;gap:.5rem;width:100%">
+        <input id="rb-winflat" class="input" type="number" min="0" placeholder="Win — bonus bets">
+        <input id="rb-lossflat" class="input" type="number" min="0" placeholder="Loss — bonus bets">
+      </div>
+      <input id="rb-exp" class="input" type="number" min="1" placeholder="Rebate bonus bets expire after N days (blank = permanent)">
+      <button class="btn btn-primary" id="rb-go">Save Rebate</button>
+    </div>
+
+    <div class="section-title">Profit Boost Shop</div>
+    <div class="card admin-form">
+      <div class="card-label">ADD SHOP ITEM</div>
+      <div class="dim" style="width:100%">List a boost template for members to buy with bonus bets in the Shop tab.</div>
+      <select id="si-tpl" class="input">
+        ${data.templates.map((t) => `<option value="${t.id}">${esc(t.name)} (+${t.boost_pct}%, ${t.scope_type})</option>`).join("")}
+      </select>
+      <input id="si-price" class="input" type="number" min="1" placeholder="Price (bonus bets)">
+      <input id="si-exp" class="input" type="number" min="1" placeholder="Token expires after N days (blank = permanent)">
+      <input id="si-limit" class="input" type="number" min="1" placeholder="Per-member purchase limit (blank = unlimited)">
+      <button class="btn btn-primary" id="si-go">Add Item</button>
+    </div>
+
+    <div class="card">
+      <div class="card-label">SHOP ITEMS</div>
+      ${data.shop_items.length ? data.shop_items.map((it) => `<div class="list-row" style="flex-wrap:wrap">
+        <span>${esc(it.name)} — <span class="odds-pos">+${it.boost_pct != null ? it.boost_pct : "?"}%</span> ${it.scope_label || ""} · <span class="dim">${it.expiry_days ? `${it.expiry_days}d token · ` : ""}${it.per_user_limit ? `limit ${it.per_user_limit} · ` : ""}${it.active ? "active" : "disabled"}</span></span>
+        <span style="display:flex;gap:.35rem;align-items:center">
+          <input class="input" style="width:6rem" type="number" min="1" value="${it.price_bonus_bets}" data-si-price="${it.id}">
+          <button class="btn btn-sm" data-act="si-setprice" data-id="${it.id}">Set</button>
+          <button class="btn btn-sm" data-act="si-toggle" data-id="${it.id}">${it.active ? "Disable" : "Enable"}</button>
+          <button class="btn btn-sm btn-danger" data-act="si-del" data-id="${it.id}">Remove</button>
+        </span>
+      </div>`).join("") : `<div class="dim">No shop items.</div>`}
     </div>`;
 
   const val = (id) => $("#" + id, body).value.trim();
@@ -1235,6 +1345,46 @@ async function adminPromos(body) {
       match_bonus_expiry_days: num("dm-bexp"),
       starts_at: isoUtc("dm-start"), ends_at: isoUtc("dm-end"), role_id: val("dm-role") },
   }));
+
+  // Bonus-bet rebate config
+  const rb = data.rebate || {};
+  $("#rb-mode", body).value = rb.bonus_rebate_mode || "OFF";
+  const setRbVal = (id, v) => { if (v != null) $("#" + id, body).value = v; };
+  setRbVal("rb-winpct", rb.bonus_rebate_win_pct);
+  setRbVal("rb-losspct", rb.bonus_rebate_loss_pct);
+  setRbVal("rb-winflat", rb.bonus_rebate_win_flat);
+  setRbVal("rb-lossflat", rb.bonus_rebate_loss_flat);
+  setRbVal("rb-exp", rb.bonus_rebate_expiry_days);
+  const syncRb = () => {
+    const m = $("#rb-mode", body).value;
+    $("#rb-pct", body).style.display = m === "PCT" ? "flex" : "none";
+    $("#rb-flat", body).style.display = m === "FLAT" ? "flex" : "none";
+  };
+  $("#rb-mode", body).addEventListener("change", syncRb);
+  syncRb();
+  $("#rb-go", body).addEventListener("click", () => call("/admin/promos/rebate", {
+    method: "POST",
+    body: {
+      mode: $("#rb-mode", body).value,
+      win_pct: num("rb-winpct"), loss_pct: num("rb-losspct"),
+      win_flat: num("rb-winflat"), loss_flat: num("rb-lossflat"),
+      expiry_days: num("rb-exp"),
+    },
+  }));
+
+  // Shop item add
+  $("#si-go", body).addEventListener("click", () => {
+    if (num("si-price") <= 0) { toast("Set a price.", "error"); return; }
+    call("/admin/promos/shop-item", {
+      method: "POST",
+      body: {
+        boost_template_id: Number($("#si-tpl", body).value) || 0,
+        price_bonus_bets: num("si-price"),
+        expiry_days: num("si-exp"), per_user_limit: num("si-limit"),
+      },
+    });
+  });
+
   body.querySelectorAll("[data-act]").forEach((btn) => {
     const id = btn.dataset.id;
     const map = {
@@ -1245,8 +1395,17 @@ async function adminPromos(body) {
       "tok-revoke": ["/admin/promos/boost/token/" + id + "/revoke", "POST"],
       "dm-end": ["/admin/promos/deposit-match/" + id + "/end", "POST"],
       "dm-del": ["/admin/promos/deposit-match/" + id, "DELETE"],
+      "si-toggle": ["/admin/promos/shop-item/" + id + "/toggle", "POST"],
+      "si-del": ["/admin/promos/shop-item/" + id, "DELETE"],
     };
     btn.addEventListener("click", () => {
+      if (btn.dataset.act === "si-setprice") {
+        const inp = body.querySelector(`[data-si-price="${id}"]`);
+        const n = Number(inp && inp.value);
+        if (!Number.isFinite(n) || n <= 0) { toast("Enter a positive price.", "error"); return; }
+        call("/admin/promos/shop-item/" + id, { method: "POST", body: { price_bonus_bets: n } });
+        return;
+      }
       const m = map[btn.dataset.act];
       if (!m) return;
       if (btn.dataset.act.endsWith("-del") || btn.dataset.act === "bu-revoke") {

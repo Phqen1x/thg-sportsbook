@@ -1769,6 +1769,11 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                 user.total_won += real_won
                 user.bonus_won += bonus_won
             credits_issued += credited
+            await promos.award_settle_rebate(
+                session, bet.guild_id, bet.user_id,
+                wager_placed=max(0, bet.wager - bet.bonus_bet_amount),
+                won=True, bet_id=bet.id,
+            )
             if buf is not None:
                 buf.append(
                     {
@@ -1784,6 +1789,11 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                 )
         elif result is False and bet.parlay_id is None:
             bet.status = "LOST"
+            await promos.award_settle_rebate(
+                session, bet.guild_id, bet.user_id,
+                wager_placed=max(0, bet.wager - bet.bonus_bet_amount),
+                won=False, bet_id=bet.id,
+            )
             if buf is not None:
                 buf.append(
                     {
@@ -3692,6 +3702,11 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
     statuses = [leg.status for leg in legs]
     if "LOST" in statuses:
         parlay.status = "LOST"
+        await promos.award_settle_rebate(
+            session, parlay.guild_id, parlay.user_id,
+            wager_placed=max(0, parlay.total_wager - parlay.bonus_bet_amount),
+            won=False, parlay_id=parlay.id,
+        )
         leg_data = []
         for leg in legs:
             mkt = await session.get(Market, leg.market_id)
@@ -3748,6 +3763,11 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
             user.total_won += real_won
             user.bonus_won += bonus_won
         paid = credited
+        await promos.award_settle_rebate(
+            session, parlay.guild_id, parlay.user_id,
+            wager_placed=max(0, parlay.total_wager - parlay.bonus_bet_amount),
+            won=True, parlay_id=parlay.id,
+        )
         leg_data = []
         for leg in legs:
             mkt = await session.get(Market, leg.market_id)
@@ -3875,6 +3895,9 @@ async def _unresolve_market(
                             cut_reversed += parlay.house_cut
                     parlay.house_cut = 0
                     parlay.status = "PENDING"
+                    await promos.revoke_settle_rebate(
+                        session, parlay.guild_id, parlay_id=parlay.id
+                    )
             bet.status = "PENDING"
         elif bet.status == "WON":
             _ur = await session.execute(
@@ -3897,8 +3920,10 @@ async def _unresolve_market(
             cut_reversed += bet.house_cut
             bet.house_cut = 0
             bet.status = "PENDING"
+            await promos.revoke_settle_rebate(session, bet.guild_id, bet_id=bet.id)
         elif bet.status == "LOST":
             bet.status = "PENDING"
+            await promos.revoke_settle_rebate(session, bet.guild_id, bet_id=bet.id)
         elif bet.status == "VOIDED":
             _ur = await session.execute(
                 select(User).where(

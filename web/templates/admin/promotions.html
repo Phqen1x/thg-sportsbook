@@ -232,6 +232,60 @@
   </table>
 </div>
 
+<!-- ── Bonus bet rebate ─────────────────────────────────────────────────── -->
+<div class="section-header mt-3"><h2>Bonus Bet Rebate</h2></div>
+<p class="text-dim">
+  Give members a slice of their real-chip stake back as bonus bets when a bet or
+  parlay settles. Separate rates for wins and losses; set the mode to <em>Off</em>
+  to disable. Reversed automatically if a resolution is undone.
+</p>
+<div class="card">
+  <div class="card-label">REBATE SETTINGS</div>
+  <form method="post" action="/admin/promotions/rebate" id="rebate-form">
+    <div class="form-group">
+      <label class="form-label">Mode</label>
+      <select name="mode" class="form-control" id="rb-mode">
+        <option value="OFF" {{ "selected" if rebate.mode == "OFF" }}>Off</option>
+        <option value="PCT" {{ "selected" if rebate.mode == "PCT" }}>% of wager placed</option>
+        <option value="FLAT" {{ "selected" if rebate.mode == "FLAT" }}>Flat bonus bets per settled wager</option>
+      </select>
+    </div>
+    <div class="form-group rb-pct">
+      <label class="form-label">Win % / Loss %</label>
+      <div style="display:flex;gap:8px">
+        <input type="number" name="win_pct" class="form-control" min="0" max="100" step="0.5" value="{{ rebate.win_pct }}" placeholder="win %">
+        <input type="number" name="loss_pct" class="form-control" min="0" max="100" step="0.5" value="{{ rebate.loss_pct }}" placeholder="loss %">
+      </div>
+    </div>
+    <div class="form-group rb-flat">
+      <label class="form-label">Win / Loss (bonus bets)</label>
+      <div style="display:flex;gap:8px">
+        <input type="number" name="win_flat" class="form-control" min="0" value="{{ rebate.win_flat }}" placeholder="win amount">
+        <input type="number" name="loss_flat" class="form-control" min="0" value="{{ rebate.loss_flat }}" placeholder="loss amount">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Rebate bonus bets expire after <span class="text-dim">(days — blank = permanent)</span></label>
+      <input type="number" name="expiry_days" class="form-control" min="1" value="{{ rebate.expiry_days }}">
+    </div>
+    <button type="submit" class="btn btn-primary">Save Rebate</button>
+  </form>
+</div>
+<script>
+  (function () {
+    var m = document.getElementById("rb-mode");
+    if (!m) return;
+    function sync() {
+      var pct = document.querySelector("#rebate-form .rb-pct");
+      var flat = document.querySelector("#rebate-form .rb-flat");
+      if (pct) pct.style.display = m.value === "PCT" ? "" : "none";
+      if (flat) flat.style.display = m.value === "FLAT" ? "" : "none";
+    }
+    m.addEventListener("change", sync);
+    sync();
+  })();
+</script>
+
 <!-- ── Deposit match ────────────────────────────────────────────────────── -->
 <div class="section-header mt-3"><h2>Deposit Match</h2></div>
 <p class="text-dim">

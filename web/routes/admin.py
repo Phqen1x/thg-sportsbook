@@ -1287,13 +1287,67 @@ async def promotions(request: Request, user: SessionUser = Depends(require_admin
             )).scalars().all():
                 claims_by_promo.setdefault(c.promo_id, []).append(c)
 
+        rb_rows = (await db.execute(text(
+            "SELECT key, value FROM game_settings WHERE key LIKE 'bonus_rebate_%'"
+        ))).all()
+        rb_map = {}
+        for k, v in rb_rows:
+            try:
+                rb_map[k] = json.loads(v) if v not in (None, "") else None
+            except ValueError:
+                rb_map[k] = v
+        rebate = {
+            "mode": rb_map.get("bonus_rebate_mode") or "OFF",
+            "win_pct": rb_map.get("bonus_rebate_win_pct") or 0,
+            "loss_pct": rb_map.get("bonus_rebate_loss_pct") or 0,
+            "win_flat": rb_map.get("bonus_rebate_win_flat") or 0,
+            "loss_flat": rb_map.get("bonus_rebate_loss_flat") or 0,
+            "expiry_days": rb_map.get("bonus_rebate_expiry_days") or "",
+        }
+
     return request.app.state.templates.TemplateResponse("admin/promotions.html", {
         "request": request, "user": user, "success": success, "error": error,
         "bonus_users": bonus_users, "ft_bonus": ft_bonus,
         "templates": templates, "tokens": tokens,
         "deposit_promos": promos_rows, "claims_by_promo": claims_by_promo,
+        "rebate": rebate,
         "now": datetime.utcnow(),
     })
+
+
+@router.post("/promotions/rebate")
+async def promotions_rebate_save(
+    user: SessionUser = Depends(require_admin),
+    mode: Annotated[str, Form()] = "OFF",
+    win_pct: Annotated[float, Form()] = 0.0,
+    loss_pct: Annotated[float, Form()] = 0.0,
+    win_flat: Annotated[int, Form()] = 0,
+    loss_flat: Annotated[int, Form()] = 0,
+    expiry_days: Annotated[str, Form()] = "",
+):
+    mode = (mode or "OFF").upper()
+    if mode not in ("OFF", "PCT", "FLAT"):
+        return _redirect("/admin/promotions", error="Invalid+rebate+mode.")
+    if not (0.0 <= win_pct <= 100.0 and 0.0 <= loss_pct <= 100.0):
+        return _redirect("/admin/promotions", error="Rebate+percents+must+be+0-100.")
+    exp = None
+    if str(expiry_days).strip().isdigit() and int(expiry_days) > 0:
+        exp = int(expiry_days)
+    async with get_db() as db:
+        async def upsert(key: str, value) -> None:
+            await db.execute(
+                text("INSERT OR REPLACE INTO game_settings (key, value) VALUES (:k, :v)"),
+                {"k": key, "v": json.dumps(value)},
+            )
+        await upsert("bonus_rebate_mode", mode)
+        await upsert("bonus_rebate_win_pct", float(win_pct))
+        await upsert("bonus_rebate_loss_pct", float(loss_pct))
+        await upsert("bonus_rebate_win_flat", max(0, int(win_flat)))
+        await upsert("bonus_rebate_loss_flat", max(0, int(loss_flat)))
+        await upsert("bonus_rebate_expiry_days", exp)
+        await db.commit()
+    asyncio.create_task(post_admin_action(user, "Bonus-bet rebate updated", {"mode": mode}))
+    return _redirect("/admin/promotions", msg="Rebate+settings+saved.")
 
 
 @router.post("/promotions/bonus/grant")

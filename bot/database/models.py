@@ -501,6 +501,7 @@ class BonusBetLot(Base):
     amount_remaining: Mapped[int] = mapped_column(Integer, nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # SIGNUP | GRANT_USER | ADMIN | REFUND | CLAIM | DEPOSIT_MATCH
+    # | REBATE_BET | REBATE_PARLAY | SHOP_REFUND
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="ADMIN")
     grant_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # ACTIVE | EXHAUSTED | EXPIRED | REVOKED
@@ -671,3 +672,37 @@ class PromoClaimRedemption(Base):
     reward_kind: Mapped[str] = mapped_column(String(10), nullable=False)
     amount_or_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     claimed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class BoostShopItem(Base):
+    """A profit-boost template listed for sale in the Activity shop. Members
+    spend bonus bets to buy the boost token instead of wagering bonus credit
+    directly. Admins add/remove listings and set the bonus-bet price."""
+    __tablename__ = "boost_shop_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    boost_template_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    price_bonus_bets: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Expiry applied to the purchased token (days). Null = permanent.
+    expiry_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Per-member purchase cap for this listing. Null = unlimited.
+    per_user_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class BoostShopPurchase(Base):
+    """Audit row for one shop purchase — also enforces ``per_user_limit``."""
+    __tablename__ = "boost_shop_purchases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    item_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    template_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    price_paid: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    token_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)

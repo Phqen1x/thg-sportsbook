@@ -23,7 +23,8 @@ from bot.cogs.betting import (
 )
 from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
 from bot.database.models import (
-    Alliance, Bet, BettingPhase, BonusBetLot, BonusGrant, DepositMatchClaim,
+    Alliance, Bet, BettingPhase, BonusBetLot, BonusGrant, BoostShopItem,
+    BoostShopPurchase, DepositMatchClaim,
     DepositMatchPromo, DistrictRecord, ExchangeRateOverride, Market, MarketTemplate,
     Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg,
     ProfitBoostGrant, ProfitBoostTemplate, ProfitBoostToken, PromoClaimDrop,
@@ -1270,6 +1271,11 @@ async def _settle_parlay(db, parlay_id: int) -> None:
     statuses = [leg.status for leg in legs]
     if "LOST" in statuses:
         parlay.status = "LOST"
+        await promos.award_settle_rebate(
+            db, parlay.guild_id, parlay.user_id,
+            wager_placed=max(0, parlay.total_wager - parlay.bonus_bet_amount),
+            won=False, parlay_id=parlay.id,
+        )
     elif "PENDING" not in statuses:
         active = [l for l in legs if l.status != "VOIDED"]
         if all(l.status == "WON" for l in active) and active:
@@ -1290,6 +1296,11 @@ async def _settle_parlay(db, parlay_id: int) -> None:
                 db_user.chips += credited
                 db_user.total_won += real_won
                 db_user.bonus_won += bonus_won
+            await promos.award_settle_rebate(
+                db, parlay.guild_id, parlay.user_id,
+                wager_placed=max(0, parlay.total_wager - parlay.bonus_bet_amount),
+                won=True, parlay_id=parlay.id,
+            )
         elif all(l.status == "VOIDED" for l in legs):
             parlay.status = "WON"
             db_user = await _fetch_user(db, parlay.user_id)
@@ -1862,8 +1873,18 @@ async def admin_market_resolve(
                     db_user.chips += credited
                     db_user.total_won += real_won
                     db_user.bonus_won += bonus_won
+                await promos.award_settle_rebate(
+                    db, bet.guild_id, bet.user_id,
+                    wager_placed=max(0, bet.wager - bet.bonus_bet_amount),
+                    won=True, bet_id=bet.id,
+                )
             elif not bool_result and bet.parlay_id is None:
                 bet.status = "LOST"
+                await promos.award_settle_rebate(
+                    db, bet.guild_id, bet.user_id,
+                    wager_placed=max(0, bet.wager - bet.bonus_bet_amount),
+                    won=False, bet_id=bet.id,
+                )
             elif bet.parlay_id is not None:
                 bet.status = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
                 await _settle_parlay(db, bet.parlay_id)
@@ -2246,7 +2267,9 @@ async def admin_promos(admin: SessionUser = Depends(bearer_admin)):
                 d = claims.setdefault(c.promo_id, {"members": 0, "matched": 0})
                 d["members"] += 1
                 d["matched"] += c.total_matched
+        shop_rows = await promos.shop_listings(db, gid, active_only=False)
     now = datetime.utcnow()
+    rebate = await _rebate_config_payload()
     channels = await discord_api.list_guild_text_channels(gid)
     roles = await discord_api.list_guild_roles(gid)
     return {
@@ -2278,6 +2301,8 @@ async def admin_promos(admin: SessionUser = Depends(bearer_admin)):
              "claims": claims.get(p.id, {"members": 0, "matched": 0})}
             for p in dpromos
         ],
+        "rebate": rebate,
+        "shop_items": [_shop_item_json(it, tpl) for it, tpl in shop_rows],
     }
 
 
@@ -2614,3 +2639,193 @@ async def admin_promos_deposit_match_delete(promo_id: int, admin: SessionUser = 
             await db.delete(p)
             await db.commit()
     return {"ok": True, "message": "Promo deleted."}
+
+
+# ── Bonus-bet rebate (admin config) ─────────────────────────────────────────
+
+_REBATE_KEYS = (
+    "bonus_rebate_mode", "bonus_rebate_win_pct", "bonus_rebate_loss_pct",
+    "bonus_rebate_win_flat", "bonus_rebate_loss_flat", "bonus_rebate_expiry_days",
+)
+
+
+async def _rebate_config_payload() -> dict:
+    from bot.database.engine import get_setting
+    out = {}
+    for k in _REBATE_KEYS:
+        raw = await get_setting(k)
+        try:
+            out[k] = json.loads(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            out[k] = raw
+    if out.get("bonus_rebate_mode") not in ("OFF", "PCT", "FLAT"):
+        out["bonus_rebate_mode"] = "OFF"
+    return out
+
+
+@router.post("/admin/promos/rebate")
+async def admin_promos_rebate_save(
+    admin: SessionUser = Depends(bearer_admin),
+    mode: Annotated[str, Body()] = "OFF",
+    win_pct: Annotated[float, Body()] = 0.0,
+    loss_pct: Annotated[float, Body()] = 0.0,
+    win_flat: Annotated[int, Body()] = 0,
+    loss_flat: Annotated[int, Body()] = 0,
+    expiry_days: Annotated[int, Body()] = 0,
+):
+    from bot.database.engine import set_setting
+    mode = (mode or "OFF").upper()
+    if mode not in ("OFF", "PCT", "FLAT"):
+        raise HTTPException(status_code=400, detail="Invalid mode.")
+    if not (0 <= win_pct <= 100 and 0 <= loss_pct <= 100):
+        raise HTTPException(status_code=400, detail="Percentages must be 0–100.")
+    await set_setting("bonus_rebate_mode", mode)
+    await set_setting("bonus_rebate_win_pct", float(win_pct))
+    await set_setting("bonus_rebate_loss_pct", float(loss_pct))
+    await set_setting("bonus_rebate_win_flat", max(0, int(win_flat)))
+    await set_setting("bonus_rebate_loss_flat", max(0, int(loss_flat)))
+    await set_setting("bonus_rebate_expiry_days", int(expiry_days) or None)
+    asyncio.create_task(post_admin_action(
+        admin, "Bonus-bet rebate updated", {"mode": mode}, source="Discord Activity"
+    ))
+    return {"ok": True, "message": "Rebate settings saved."}
+
+
+# ── Profit-boost shop ───────────────────────────────────────────────────────
+
+
+def _shop_item_json(item: BoostShopItem, tpl: ProfitBoostTemplate | None) -> dict:
+    return {
+        "id": item.id, "template_id": item.boost_template_id,
+        "price_bonus_bets": item.price_bonus_bets,
+        "expiry_days": item.expiry_days, "per_user_limit": item.per_user_limit,
+        "sort_order": item.sort_order, "active": item.active,
+        "boost_pct": tpl.boost_pct if tpl else None,
+        "scope_type": tpl.scope_type if tpl else None,
+        "scope_id": tpl.scope_id if tpl else None,
+        "max_wager": tpl.max_wager if tpl else None,
+        "name": tpl.name if tpl else "(deleted boost)",
+        "scope_label": promos.boost_scope_text(tpl.scope_type, tpl.scope_id) if tpl else "",
+    }
+
+
+@router.get("/shop")
+async def shop(user: SessionUser = Depends(bearer_user)):
+    async with get_db() as db:
+        gid = _GUILD_ID()
+        db_user = await _fetch_user(db, user.discord_id)
+        await promos.expire_stale(db, gid, user.discord_id)
+        await db.commit()
+        bonus_bal = await promos.bonus_balance(db, gid, user.discord_id)
+        listings = await promos.shop_listings(db, gid, active_only=True)
+        bought = {}
+        if listings:
+            for pid, cnt in (await db.execute(
+                select(BoostShopPurchase.item_id, func.count())
+                .where(
+                    BoostShopPurchase.guild_id == gid,
+                    BoostShopPurchase.discord_user_id == user.discord_id,
+                    BoostShopPurchase.item_id.in_([i.id for i, _ in listings]),
+                ).group_by(BoostShopPurchase.item_id)
+            )).all():
+                bought[pid] = cnt
+    items = []
+    for item, tpl in listings:
+        d = _shop_item_json(item, tpl)
+        d["owned"] = bought.get(item.id, 0)
+        d["sold_out"] = (
+            item.per_user_limit is not None and bought.get(item.id, 0) >= item.per_user_limit
+        )
+        d["affordable"] = bonus_bal >= item.price_bonus_bets
+        items.append(d)
+    return {"bonus_balance": bonus_bal, "items": items}
+
+
+@router.post("/shop/buy")
+async def shop_buy(
+    user: SessionUser = Depends(bearer_user),
+    item_id: Annotated[int, Body(embed=True)] = 0,
+):
+    async with get_db() as db:
+        gid = _GUILD_ID()
+        if await is_fully_restricted(db, gid, user.discord_id):
+            raise HTTPException(status_code=403, detail="You're blocked from betting in this server.")
+        info, err = await promos.purchase_boost(db, gid, user.discord_id, int(item_id))
+        if err is not None:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=err)
+        await db.commit()
+    asyncio.create_task(post_admin_action(
+        user, "Profit boost purchased",
+        {"item": str(item_id), "price": str(info["price"])}, source="Discord Activity",
+    ))
+    return {"ok": True, "message": info["message"]}
+
+
+@router.post("/admin/promos/shop-item")
+async def admin_shop_item_new(
+    admin: SessionUser = Depends(bearer_admin),
+    boost_template_id: Annotated[int, Body()] = 0,
+    price_bonus_bets: Annotated[int, Body()] = 0,
+    expiry_days: Annotated[int, Body()] = 0,
+    per_user_limit: Annotated[int, Body()] = 0,
+):
+    if price_bonus_bets <= 0:
+        raise HTTPException(status_code=400, detail="Set a positive bonus-bet price.")
+    async with get_db() as db:
+        gid = _GUILD_ID()
+        tpl = await db.get(ProfitBoostTemplate, int(boost_template_id or 0))
+        if tpl is None or tpl.guild_id != gid:
+            raise HTTPException(status_code=400, detail="Pick a boost template.")
+        nxt = ((await db.execute(
+            select(func.coalesce(func.max(BoostShopItem.sort_order), 0)).where(
+                BoostShopItem.guild_id == gid
+            )
+        )).scalar_one() or 0) + 1
+        db.add(BoostShopItem(
+            guild_id=gid, boost_template_id=tpl.id,
+            price_bonus_bets=int(price_bonus_bets),
+            expiry_days=int(expiry_days) or None,
+            per_user_limit=int(per_user_limit) or None,
+            sort_order=nxt, created_by=admin.discord_id,
+        ))
+        await db.commit()
+    return {"ok": True, "message": "Shop item added."}
+
+
+@router.post("/admin/promos/shop-item/{item_id}")
+async def admin_shop_item_update(
+    item_id: int,
+    admin: SessionUser = Depends(bearer_admin),
+    price_bonus_bets: Annotated[int, Body(embed=True)] = 0,
+):
+    if price_bonus_bets <= 0:
+        raise HTTPException(status_code=400, detail="Set a positive price.")
+    async with get_db() as db:
+        it = await db.get(BoostShopItem, item_id)
+        if it is None or it.guild_id != _GUILD_ID():
+            raise HTTPException(status_code=404, detail="Item not found.")
+        it.price_bonus_bets = int(price_bonus_bets)
+        await db.commit()
+    return {"ok": True, "message": "Price updated."}
+
+
+@router.post("/admin/promos/shop-item/{item_id}/toggle")
+async def admin_shop_item_toggle(item_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        it = await db.get(BoostShopItem, item_id)
+        if it is None or it.guild_id != _GUILD_ID():
+            raise HTTPException(status_code=404, detail="Item not found.")
+        it.active = not it.active
+        await db.commit()
+    return {"ok": True, "message": "Shop item " + ("enabled." if it.active else "disabled.")}
+
+
+@router.delete("/admin/promos/shop-item/{item_id}")
+async def admin_shop_item_delete(item_id: int, admin: SessionUser = Depends(bearer_admin)):
+    async with get_db() as db:
+        it = await db.get(BoostShopItem, item_id)
+        if it is not None and it.guild_id == _GUILD_ID():
+            await db.delete(it)
+            await db.commit()
+    return {"ok": True, "message": "Shop item removed."}
