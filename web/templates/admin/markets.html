@@ -6,10 +6,12 @@
   <h1>Manage Markets</h1>
   <div class="btn-group">
     <a href="/admin/markets/new" class="btn btn-primary">+ Create Market</a>
-    <form method="post" action="/admin/markets/recalc" style="display:inline">
+    <form method="post" action="/admin/markets/recalc" style="display:inline" class="admin-market-form">
+      <input type="hidden" name="status" value="{{ status }}">
       <button class="btn btn-outline" title="Recalculate odds on all non-overridden markets">Recalculate All</button>
     </form>
-    <form method="post" action="/admin/markets/bulk-close" style="display:inline" onsubmit="return confirm('Close all open markets?')">
+    <form method="post" action="/admin/markets/bulk-close" style="display:inline" class="admin-market-form" onsubmit="return confirm('Close all open markets?')">
+      <input type="hidden" name="status" value="{{ status }}">
       <button class="btn btn-outline">Bulk Close All</button>
     </form>
   </div>
@@ -20,6 +22,17 @@
   <a href="/admin/markets?status=open" class="btn btn-sm {% if status == 'open' %}btn-primary{% else %}btn-outline{% endif %}">Open</a>
   <a href="/admin/markets?status=closed" class="btn btn-sm {% if status == 'closed' %}btn-primary{% else %}btn-outline{% endif %}">Closed</a>
   <a href="/admin/markets?status=resolved" class="btn btn-sm {% if status == 'resolved' %}btn-primary{% else %}btn-outline{% endif %}">Resolved</a>
+
+  <div class="sort-row">
+    <label class="sort-label" for="mkt-sort">Sort</label>
+    <select class="form-control form-control-sm sort-select" id="mkt-sort">
+      <option value="default">Default</option>
+      <option value="name">Name (A–Z)</option>
+      <option value="odds-fav">Odds: Favorites First</option>
+      <option value="odds-long">Odds: Longshots First</option>
+      <option value="popular">Most Bets</option>
+    </select>
+  </div>
 </div>
 
 <div class="card">
@@ -27,11 +40,13 @@
     <thead>
       <tr><th>ID</th><th>Market</th><th>Odds</th><th>Bets</th><th>Status</th><th>Actions</th></tr>
     </thead>
-    <tbody>
+    <tbody id="markets-body">
       {% for mkt in markets %}
       {% set ta = tributes_map.get(mkt.tribute_a_id) %}
       {% set tb = tributes_map.get(mkt.tribute_b_id) %}
-      <tr>
+      <tr data-label="{{ mkt.label | lower }}"
+          data-odds="{{ mkt.odds if mkt.odds is not none else '' }}"
+          data-bets="{{ bet_counts.get(mkt.id, 0) }}">
         <td class="text-dim">{{ mkt.id }}</td>
         <td>
           <div class="font-bold">{{ mkt.label }}</div>
@@ -61,17 +76,20 @@
         <td>
           <div class="btn-group">
             {% if mkt.status == 'CLOSED' %}
-            <form method="post" action="/admin/markets/{{ mkt.id }}/open">
+            <form method="post" action="/admin/markets/{{ mkt.id }}/open" class="admin-market-form">
+              <input type="hidden" name="status" value="{{ status }}">
               <button class="btn btn-sm btn-primary">Open</button>
             </form>
             {% endif %}
             {% if mkt.status == 'OPEN' %}
-            <form method="post" action="/admin/markets/{{ mkt.id }}/close">
+            <form method="post" action="/admin/markets/{{ mkt.id }}/close" class="admin-market-form">
+              <input type="hidden" name="status" value="{{ status }}">
               <button class="btn btn-sm btn-outline">Close</button>
             </form>
             {% endif %}
             {% if mkt.status == 'RESOLVED' %}
-            <form method="post" action="/admin/markets/{{ mkt.id }}/reopen" onsubmit="return confirm('Reopen this resolved market?')">
+            <form method="post" action="/admin/markets/{{ mkt.id }}/reopen" class="admin-market-form" onsubmit="return confirm('Reopen this resolved market?')">
+              <input type="hidden" name="status" value="{{ status }}">
               <button class="btn btn-sm btn-outline">Reopen</button>
             </form>
             {% endif %}
@@ -80,7 +98,8 @@
             <button class="btn btn-sm btn-outline" onclick="openSetOddsModal({{ mkt.id }}, {{ mkt.odds }})">Set Odds</button>
             {% endif %}
             {% if mkt.odds_override %}
-            <form method="post" action="/admin/markets/{{ mkt.id }}/clear-override">
+            <form method="post" action="/admin/markets/{{ mkt.id }}/clear-override" class="admin-market-form">
+              <input type="hidden" name="status" value="{{ status }}">
               <button class="btn btn-sm btn-outline">Clear Override</button>
             </form>
             {% endif %}
@@ -98,7 +117,8 @@
 <div id="set-odds-modal" class="modal hidden">
   <div class="modal-box">
     <div class="modal-title">Set Manual Odds</div>
-    <form method="post" id="set-odds-form">
+    <form method="post" id="set-odds-form" class="admin-market-form">
+      <input type="hidden" name="status" value="{{ status }}">
       <div class="form-group">
         <label class="form-label">Odds (American, e.g. -110, +200)</label>
         <input type="number" name="odds" id="set-odds-value" class="form-control" required>
@@ -117,7 +137,8 @@
   <div class="modal-box">
     <div class="modal-title">Resolve Market</div>
     <div id="resolve-market-label" class="text-dim mb-2"></div>
-    <form method="post" id="resolve-form">
+    <form method="post" id="resolve-form" class="admin-market-form">
+      <input type="hidden" name="status" value="{{ status }}">
       <div class="form-group">
         <label class="form-label">Result</label>
         <div class="radio-group">
@@ -159,5 +180,102 @@ function openResolveModal(id, label) {
 function closeResolveModal() {
   document.getElementById('resolve-modal').classList.add('hidden');
 }
+
+// Market action forms (open/close/reopen/resolve/set-odds/clear-override/
+// recalc/bulk-close) are intercepted here so they never navigate the page —
+// a real POST navigation would reload /admin/markets from scratch, dropping
+// the client-only sort order and jumping the scroll position back to the
+// top. Instead we fetch the same endpoint (which still 303-redirects back
+// to /admin/markets?status=..., preserving the status filter server-side),
+// swap in the refreshed table body, and reapply whatever sort was active —
+// all without moving the viewport.
+(function () {
+  const tbody = document.getElementById("markets-body");
+  const sortEl = document.getElementById("mkt-sort");
+  if (!tbody || !sortEl) return;
+
+  function sortRows(sortBy) {
+    const odds = (r) => r.dataset.odds === "" ? null : Number(r.dataset.odds);
+    const arr = Array.from(tbody.querySelectorAll("tr[data-label]"));
+    if (sortBy === "name" || sortBy === "default") arr.sort((a, b) => a.dataset.label.localeCompare(b.dataset.label, undefined, { numeric: true }));
+    else if (sortBy === "odds-fav") arr.sort((a, b) => (odds(a) ?? Infinity) - (odds(b) ?? Infinity));
+    else if (sortBy === "odds-long") arr.sort((a, b) => (odds(b) ?? -Infinity) - (odds(a) ?? -Infinity));
+    else if (sortBy === "popular") arr.sort((a, b) => Number(b.dataset.bets) - Number(a.dataset.bets));
+    arr.forEach(r => tbody.appendChild(r));
+  }
+
+  sortEl.addEventListener("change", () => sortRows(sortEl.value));
+
+  function showFlash(message, isError) {
+    document.querySelectorAll(".flash").forEach(el => el.remove());
+    if (!message) return;
+    const flash = document.createElement("div");
+    flash.className = "flash " + (isError ? "flash-error" : "flash-success");
+    flash.textContent = message;
+    const main = document.querySelector("main.container");
+    if (!main) return;
+    main.insertAdjacentElement("beforebegin", flash);
+    setTimeout(() => {
+      flash.style.transition = "opacity 0.5s";
+      flash.style.opacity = "0";
+      setTimeout(() => flash.remove(), 500);
+    }, 5000);
+  }
+
+  const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+
+  async function applyMarketAction(form) {
+    const action = form.getAttribute("action");
+    // The rows swapped in below came from parsed response HTML, whose
+    // scripts never ran — so they never got the base.html "append a _csrf
+    // hidden input to every form" treatment. Set it explicitly here instead
+    // of depending on that one-time DOM injection, or every action after
+    // the first would 403 with no visible feedback.
+    const params = new URLSearchParams(new FormData(form));
+    if (csrfMeta) params.set("_csrf", csrfMeta.content);
+    let res, html;
+    try {
+      res = await fetch(action, { method: "POST", body: params });
+      html = await res.text();
+    } catch (_) {
+      form.submit(); // network error — fall back to a real navigation
+      return;
+    }
+    if (!res.url.includes("/admin/markets")) {
+      // Landed somewhere unexpected (e.g. session expired -> login) — a
+      // partial DOM swap would be misleading, so do a real navigation.
+      window.location.href = res.url;
+      return;
+    }
+    if (!res.ok) {
+      // Something other than the usual redirect-back-with-?error= flow (the
+      // CSRF check rejecting the request, an unhandled 500, etc). Pull the
+      // human-readable message out of error.html's .error-message rather
+      // than dumping raw response markup into the flash banner.
+      const errDoc = new DOMParser().parseFromString(html, "text/html");
+      const errMsg = errDoc.querySelector(".error-message")?.textContent?.trim();
+      showFlash(errMsg || `Action failed (${res.status}).`, true);
+      return;
+    }
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const newBody = doc.getElementById("markets-body");
+    if (newBody) {
+      tbody.innerHTML = newBody.innerHTML;
+      sortRows(sortEl.value);
+    }
+    const flashEl = doc.querySelector(".flash");
+    showFlash(flashEl?.textContent?.trim(), flashEl?.classList.contains("flash-error"));
+    closeSetOddsModal();
+    closeResolveModal();
+  }
+
+  document.addEventListener("submit", (e) => {
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement) || !form.classList.contains("admin-market-form")) return;
+    if (e.defaultPrevented) return; // a confirm() dialog on the form was declined
+    e.preventDefault();
+    applyMarketAction(form);
+  });
+})();
 </script>
 {% endblock %}

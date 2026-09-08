@@ -22,14 +22,21 @@ from bot.cogs.betting import (
 )
 from bot.cogs.display import LEADERBOARD_CATEGORIES, _leaderboard_rows
 from bot.database.models import (
-    Alliance, Bet, BettingPhase, DistrictRecord, ExchangeRateOverride, Market, Parlay,
-    PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, PublicBetRestriction, Tribute, User,
+    Alliance, Bet, BettingPhase, DistrictRecord, ExchangeRateOverride, Market, MarketTemplate,
+    Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, PublicBetRestriction, Tribute, User,
 )
 from bot.odds.calculator import (
     combined_american, parlay_payout, resolve_cashout, straight_payout,
 )
 from bot.utils.economy import economy_totals
-from bot.utils.exchange_rates import get_global_rate, list_overrides, set_global_rate, set_override
+from bot.utils.exchange_rates import (
+    effective_rate, get_global_rate, list_overrides, set_global_rate, set_override,
+)
+from bot.utils.house_cut import (
+    get_house_cut_total_taken, load_house_cut_config, net_payout, parlay_effective_odds,
+    record_house_cut_taken, set_house_cut_for_type, set_house_cut_global,
+    set_house_cut_high_odds_rule,
+)
 from bot.utils.payout_caps import get_payout_cap, set_payout_cap
 from bot.utils.restrictions import (
     is_fully_restricted, is_public_bet_blocked, list_public_blocks, set_public_block,
@@ -163,6 +170,17 @@ async def _parlay_cap_error_activity(wager: int, odds_list: list[int]) -> str | 
     set_guild_context(_GUILD_ID())
     err = await _parlay_cap_error(wager, odds_list)
     return err.replace("**", "") if err else None
+
+
+async def _payout_rate_activity(db, user: SessionUser, role_ids=None) -> float:
+    """The bettor's frozen PAYOUT multiplier for a wager placed via the Activity.
+    Guild-context-bound (see _paused) so the global-rate fallback can read
+    settings through bot.database.engine."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    if role_ids is None:
+        role_ids = await live_role_ids(user.discord_id, user.guild_id)
+    return await effective_rate(db, _GUILD_ID(), user_id=user.discord_id, role_ids=role_ids)
 
 
 async def _fetch_user(db, discord_id: int) -> User | None:
@@ -540,6 +558,7 @@ async def place_bet(
             wager=wager,
             odds_at_placement=market.odds,
             payout_if_win=payout,
+            payout_rate_at_placement=await _payout_rate_activity(db, user),
             status="PENDING",
         )
         db_user.chips -= wager
@@ -754,6 +773,7 @@ async def parlay_submit(
             user_id=user.discord_id,
             total_wager=wager,
             total_payout=total_payout,
+            payout_rate_at_placement=await _payout_rate_activity(db, user, role_ids),
             status="PENDING",
             is_public=is_public,
         )
@@ -991,6 +1011,7 @@ async def tail_parlay(
 
         p = Parlay(
             guild_id=_GUILD_ID(), user_id=user.discord_id, total_wager=wager, total_payout=total_payout,
+            payout_rate_at_placement=await _payout_rate_activity(db, user),
             status="PENDING", is_public=False,
         )
         db.add(p)
@@ -1105,6 +1126,7 @@ async def tail_member_parlay(
 
         p = Parlay(
             guild_id=_GUILD_ID(), user_id=user.discord_id, total_wager=wager, total_payout=total_payout,
+            payout_rate_at_placement=await _payout_rate_activity(db, user),
             status="PENDING", is_public=False,
             tailed_from_user_id=tailed_from_user_id, tailed_from_parlay_id=tailed_from_parlay_id,
         )
@@ -1180,10 +1202,18 @@ async def _settle_parlay(db, parlay_id: int) -> None:
         active = [l for l in legs if l.status != "VOIDED"]
         if all(l.status == "WON" for l in active) and active:
             parlay.status = "WON"
+            hc_config = await load_house_cut_config()
+            paid, cut = net_payout(
+                hc_config, wager=parlay.total_wager, payout_if_win=parlay.total_payout,
+                market_type=None, odds=parlay_effective_odds(parlay.total_wager, parlay.total_payout),
+                payout_rate=parlay.payout_rate_at_placement, cap=await get_payout_cap("PARLAY"),
+            )
+            parlay.house_cut = cut
+            await record_house_cut_taken(cut)
             db_user = await _fetch_user(db, parlay.user_id)
             if db_user:
-                db_user.chips += parlay.total_payout
-                db_user.total_won += parlay.total_payout
+                db_user.chips += paid
+                db_user.total_won += paid
         elif all(l.status == "VOIDED" for l in legs):
             parlay.status = "WON"
             db_user = await _fetch_user(db, parlay.user_id)
@@ -1433,15 +1463,86 @@ async def admin_payout_caps_set(
     return {"ok": True, "message": "Payout caps updated."}
 
 
+@router.get("/admin/house-cut")
+async def admin_house_cut(admin: SessionUser = Depends(bearer_admin)):
+    cfg = await load_house_cut_config()
+    async with get_db() as db:
+        tpls = (await db.execute(
+            select(MarketTemplate).where(MarketTemplate.active == True)
+            .order_by(MarketTemplate.is_builtin.desc(), MarketTemplate.name)
+        )).scalars().all()
+    market_types = [
+        {"value": t.type_key or f"CUSTOM_{t.id}",
+         "label": t.name if t.is_builtin else f"[Custom] {t.name}"}
+        for t in tpls
+    ]
+    labels = {mt["value"]: mt["label"] for mt in market_types}
+    return {
+        "global_pct": cfg.global_pct,
+        "high_odds_threshold": cfg.high_odds_threshold,
+        "high_odds_pct": cfg.high_odds_pct,
+        "by_type": [
+            {"type": k, "label": labels.get(k, k), "pct": v}
+            for k, v in sorted(cfg.by_type.items())
+        ],
+        "market_types": market_types,
+        "total_taken": await get_house_cut_total_taken(),
+    }
+
+
+@router.post("/admin/house-cut")
+async def admin_house_cut_set(
+    admin: SessionUser = Depends(bearer_admin),
+    global_pct: Annotated[float, Body()] = 0.0,
+    high_odds_threshold: Annotated[int | None, Body()] = None,
+    high_odds_pct: Annotated[float, Body()] = 0.0,
+):
+    if not 0.0 <= global_pct <= 100.0 or not 0.0 <= high_odds_pct <= 100.0:
+        raise HTTPException(status_code=400, detail="House-cut percentages must be between 0 and 100.")
+    if high_odds_threshold is not None and high_odds_threshold < 1:
+        raise HTTPException(status_code=400, detail="High-odds threshold must be a positive number, or omitted to disable.")
+    await set_house_cut_global(global_pct)
+    await set_house_cut_high_odds_rule(high_odds_threshold, high_odds_pct)
+    asyncio.create_task(post_admin_action(
+        admin, "House cut updated",
+        {"global_pct": str(global_pct), "high_odds_threshold": str(high_odds_threshold),
+         "high_odds_pct": str(high_odds_pct)},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": "House cut updated."}
+
+
+@router.post("/admin/house-cut/type")
+async def admin_house_cut_type_set(
+    admin: SessionUser = Depends(bearer_admin),
+    market_type: Annotated[str, Body()] = "",
+    pct: Annotated[float | None, Body()] = None,
+):
+    market_type = market_type.strip()
+    if not market_type:
+        raise HTTPException(status_code=400, detail="market_type is required.")
+    if pct is not None and not 0.0 <= pct <= 100.0:
+        raise HTTPException(status_code=400, detail="Per-type house cut must be between 0 and 100.")
+    await set_house_cut_for_type(market_type, pct)
+    asyncio.create_task(post_admin_action(
+        admin, "House cut type override cleared" if pct is None else "House cut type override set",
+        {"market_type": market_type, "pct": "—" if pct is None else str(pct)},
+        source="Discord Activity",
+    ))
+    return {"ok": True, "message": "Per-type house cut cleared." if pct is None else "Per-type house cut updated."}
+
+
 @router.get("/admin/exchange-rates")
 async def admin_exchange_rates(admin: SessionUser = Depends(bearer_admin)):
     deposit_rate = await get_global_rate("DEPOSIT")
     withdraw_rate = await get_global_rate("WITHDRAW")
+    payout_rate = await get_global_rate("PAYOUT")
     async with get_db() as db:
         overrides = await list_overrides(db, _GUILD_ID())
     return {
         "global_deposit_rate": deposit_rate,
         "global_withdraw_rate": withdraw_rate,
+        "global_payout_rate": payout_rate,
         "overrides": [_override_dict(o) for o in overrides],
     }
 
@@ -1451,14 +1552,17 @@ async def admin_exchange_rates_global(
     admin: SessionUser = Depends(bearer_admin),
     deposit_rate: Annotated[float, Body()] = 1.0,
     withdraw_rate: Annotated[float, Body()] = 1.0,
+    payout_rate: Annotated[float, Body()] = 1.0,
 ):
-    if deposit_rate <= 0 or withdraw_rate <= 0:
+    if deposit_rate <= 0 or withdraw_rate <= 0 or payout_rate <= 0:
         raise HTTPException(status_code=400, detail="Rates must be positive.")
     await set_global_rate("DEPOSIT", deposit_rate)
     await set_global_rate("WITHDRAW", withdraw_rate)
+    await set_global_rate("PAYOUT", payout_rate)
     asyncio.create_task(post_admin_action(
         admin, "Global exchange rates updated",
-        {"deposit_rate": str(deposit_rate), "withdraw_rate": str(withdraw_rate)},
+        {"deposit_rate": str(deposit_rate), "withdraw_rate": str(withdraw_rate),
+         "payout_rate": str(payout_rate)},
         source="Discord Activity",
     ))
     return {"ok": True, "message": "Global rates updated."}
@@ -1469,10 +1573,10 @@ async def admin_exchange_rates_set(
     admin: SessionUser = Depends(bearer_admin),
     scope: Annotated[str, Body()] = "USER",
     target_id: Annotated[str, Body()] = "",
-    direction: Annotated[str, Body()] = "DEPOSIT",
+    direction: Annotated[str, Body()] = "PAYOUT",
     rate: Annotated[float, Body()] = 1.0,
 ):
-    if scope not in ("ROLE", "USER") or direction not in ("DEPOSIT", "WITHDRAW"):
+    if scope not in ("ROLE", "USER") or direction != "PAYOUT":
         raise HTTPException(status_code=400, detail="Invalid scope or direction.")
     if rate <= 0:
         raise HTTPException(status_code=400, detail="Rate must be positive.")
@@ -1644,6 +1748,9 @@ async def admin_market_resolve(
             select(Bet).where(Bet.market_id == market_id, Bet.status == "PENDING")
         )).scalars().all()
 
+        hc_config = await load_house_cut_config()
+        single_cap = await get_payout_cap("SINGLE")
+        cut_taken = 0
         for bet in bets:
             if bool_result is None:
                 bet.status = "VOIDED"
@@ -1652,16 +1759,24 @@ async def admin_market_resolve(
                     db_user.chips += bet.wager
             elif bool_result and bet.parlay_id is None:
                 bet.status = "WON"
+                paid, cut = net_payout(
+                    hc_config, wager=bet.wager, payout_if_win=bet.payout_if_win,
+                    market_type=m.type, odds=bet.odds_at_placement,
+                    payout_rate=bet.payout_rate_at_placement, cap=single_cap,
+                )
+                bet.house_cut = cut
+                cut_taken += cut
                 db_user = await _fetch_user(db, bet.user_id)
                 if db_user:
-                    db_user.chips += bet.payout_if_win
-                    db_user.total_won += bet.payout_if_win
+                    db_user.chips += paid
+                    db_user.total_won += paid
             elif not bool_result and bet.parlay_id is None:
                 bet.status = "LOST"
             elif bet.parlay_id is not None:
                 bet.status = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
                 await _settle_parlay(db, bet.parlay_id)
 
+        await record_house_cut_taken(cut_taken)
         await db.commit()
         settled = len(bets)
 

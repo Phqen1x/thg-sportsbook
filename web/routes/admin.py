@@ -9,12 +9,18 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import func, select, text
 
 from bot.database.models import (
-    Alliance, Bet, BettingPhase, ExchangeRateOverride, Market, Modifier, ModifierAssignment,
-    Parlay, ParlayTemplate, ParlayTemplateLeg, PublicBetRestriction, Tribute, User,
+    Alliance, Bet, BettingPhase, ExchangeRateOverride, Market, MarketTemplate, Modifier,
+    ModifierAssignment, Parlay, ParlayTemplate, ParlayTemplateLeg, PublicBetRestriction,
+    Tribute, User,
 )
 from bot.odds.calculator import parlay_payout
 from bot.utils.economy import economy_totals
 from bot.utils.exchange_rates import clear_override, list_overrides, set_override
+from bot.utils.house_cut import (
+    load_house_cut_config, net_payout, parlay_effective_odds, record_house_cut_taken,
+    set_house_cut_for_type,
+)
+from bot.utils.payout_caps import get_payout_cap
 from bot.utils.restrictions import list_public_blocks, set_public_block
 from web import config as _web_config
 from web.audit import post_admin_action
@@ -36,6 +42,17 @@ def _redirect(url: str, msg: str = "", error: str = "") -> RedirectResponse:
     if msg:
         return RedirectResponse(f"{url}{sep}success={msg}", status_code=303)
     return RedirectResponse(url, status_code=303)
+
+
+_MARKET_STATUS_FILTERS = {"all", "open", "closed", "resolved"}
+
+
+def _markets_redirect_url(status: str) -> str:
+    """Round-trips the caller's current status filter back into the
+    /admin/markets redirect so closing/resolving/etc a market doesn't bounce
+    the admin back to the unfiltered list. Whitelisted since it's spliced
+    into a Location header."""
+    return f"/admin/markets?status={status if status in _MARKET_STATUS_FILTERS else 'all'}"
 
 
 MARKET_TYPES = [
@@ -296,6 +313,13 @@ async def tribute_edit(
         t.non_binary = non_binary == "on"
         t.sade_participant = sade_participant == "on"
         t.sade_champion = sade_champion == "on"
+        # Market.label bakes in the tribute's name/district/gender as static
+        # text at creation time — rebuild it unconditionally on every save
+        # (not just when a field appears to have changed) so re-submitting
+        # this form is always a reliable way to resync stale market labels,
+        # including ones that went stale before this relabeling existed.
+        from bot.cogs.admin import _relabel_tribute_markets
+        await _relabel_tribute_markets(db, t.id)
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Tribute updated", {"tribute": t.name, "district": str(t.district)}))
     return _redirect("/admin/tributes", msg="Tribute+updated.")
@@ -456,17 +480,23 @@ async def market_create(
 
 
 @router.post("/markets/recalc")
-async def market_recalc(user: SessionUser = Depends(require_admin)):
+async def market_recalc(
+    user: SessionUser = Depends(require_admin),
+    status: Annotated[str, Form()] = "all",
+):
     from bot.cogs.admin import _recalculate_markets
     async with get_db() as db:
         await _recalculate_markets(db)
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Odds recalculated"))
-    return _redirect("/admin/markets", msg="Odds+recalculated.")
+    return _redirect(_markets_redirect_url(status), msg="Odds+recalculated.")
 
 
 @router.post("/markets/bulk-close")
-async def market_bulk_close(user: SessionUser = Depends(require_admin)):
+async def market_bulk_close(
+    user: SessionUser = Depends(require_admin),
+    status: Annotated[str, Form()] = "all",
+):
     async with get_db() as db:
         markets = (await db.execute(select(Market).where(Market.status == "OPEN"))).scalars().all()
         for m in markets:
@@ -474,44 +504,56 @@ async def market_bulk_close(user: SessionUser = Depends(require_admin)):
         await db.commit()
         count = len(markets)
     asyncio.create_task(post_admin_action(user, "Bulk market close", {"markets closed": str(count)}))
-    return _redirect("/admin/markets", msg=f"Closed+{count}+open+markets.")
+    return _redirect(_markets_redirect_url(status), msg=f"Closed+{count}+open+markets.")
 
 
 @router.post("/markets/{market_id}/open")
-async def market_open(market_id: int, user: SessionUser = Depends(require_admin)):
+async def market_open(
+    market_id: int,
+    user: SessionUser = Depends(require_admin),
+    status: Annotated[str, Form()] = "all",
+):
     async with get_db() as db:
         m = await db.get(Market, market_id)
         if not m:
-            return _redirect("/admin/markets", error="Market+not+found.")
+            return _redirect(_markets_redirect_url(status), error="Market+not+found.")
         m.status = "OPEN"
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Market opened", {"market": m.label}))
-    return _redirect("/admin/markets", msg="Market+opened.")
+    return _redirect(_markets_redirect_url(status), msg="Market+opened.")
 
 
 @router.post("/markets/{market_id}/close")
-async def market_close(market_id: int, user: SessionUser = Depends(require_admin)):
+async def market_close(
+    market_id: int,
+    user: SessionUser = Depends(require_admin),
+    status: Annotated[str, Form()] = "all",
+):
     async with get_db() as db:
         m = await db.get(Market, market_id)
         if not m:
-            return _redirect("/admin/markets", error="Market+not+found.")
+            return _redirect(_markets_redirect_url(status), error="Market+not+found.")
         m.status = "CLOSED"
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Market closed", {"market": m.label}))
-    return _redirect("/admin/markets", msg="Market+closed.")
+    return _redirect(_markets_redirect_url(status), msg="Market+closed.")
 
 
 @router.post("/markets/{market_id}/reopen")
-async def market_reopen(market_id: int, user: SessionUser = Depends(require_admin)):
+async def market_reopen(
+    market_id: int,
+    user: SessionUser = Depends(require_admin),
+    status: Annotated[str, Form()] = "all",
+):
     async with get_db() as db:
         m = await db.get(Market, market_id)
         if not m:
-            return _redirect("/admin/markets", error="Market+not+found.")
+            return _redirect(_markets_redirect_url(status), error="Market+not+found.")
         m.status = "CLOSED"
         m.result = None
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Market reopened", {"market": m.label}))
-    return _redirect("/admin/markets", msg="Market+reopened+as+Closed.")
+    return _redirect(_markets_redirect_url(status), msg="Market+reopened+as+Closed.")
 
 
 @router.post("/markets/{market_id}/set-odds")
@@ -519,30 +561,35 @@ async def market_set_odds(
     market_id: int,
     user: SessionUser = Depends(require_admin),
     odds: Annotated[int, Form()] = -110,
+    status: Annotated[str, Form()] = "all",
 ):
     async with get_db() as db:
         m = await db.get(Market, market_id)
         if not m:
-            return _redirect("/admin/markets", error="Market+not+found.")
+            return _redirect(_markets_redirect_url(status), error="Market+not+found.")
         m.odds = odds
         m.odds_override = True
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Market odds set", {"market": m.label, "odds": f"{odds:+d}"}))
-    return _redirect("/admin/markets", msg=f"Odds+set+to+{odds:+d}.")
+    return _redirect(_markets_redirect_url(status), msg=f"Odds+set+to+{odds:+d}.")
 
 
 @router.post("/markets/{market_id}/clear-override")
-async def market_clear_override(market_id: int, user: SessionUser = Depends(require_admin)):
+async def market_clear_override(
+    market_id: int,
+    user: SessionUser = Depends(require_admin),
+    status: Annotated[str, Form()] = "all",
+):
     from bot.cogs.admin import _recalculate_markets
     async with get_db() as db:
         m = await db.get(Market, market_id)
         if not m:
-            return _redirect("/admin/markets", error="Market+not+found.")
+            return _redirect(_markets_redirect_url(status), error="Market+not+found.")
         m.odds_override = False
         await _recalculate_markets(db)
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Market override cleared", {"market": m.label}))
-    return _redirect("/admin/markets", msg="Override+cleared+and+odds+recalculated.")
+    return _redirect(_markets_redirect_url(status), msg="Override+cleared+and+odds+recalculated.")
 
 
 @router.post("/markets/{market_id}/resolve")
@@ -550,6 +597,7 @@ async def market_resolve(
     market_id: int,
     user: SessionUser = Depends(require_admin),
     result: Annotated[str, Form()] = "",
+    status: Annotated[str, Form()] = "all",
 ):
     # result: "true" | "false" | "void"
     bool_result: bool | None = None if result == "void" else (result == "true")
@@ -557,7 +605,7 @@ async def market_resolve(
     async with get_db() as db:
         m = await db.get(Market, market_id)
         if not m:
-            return _redirect("/admin/markets", error="Market+not+found.")
+            return _redirect(_markets_redirect_url(status), error="Market+not+found.")
 
         m.status = "RESOLVED"
         m.result = bool_result
@@ -566,6 +614,9 @@ async def market_resolve(
             select(Bet).where(Bet.market_id == market_id, Bet.status == "PENDING")
         )).scalars().all()
 
+        hc_config = await load_house_cut_config()
+        single_cap = await get_payout_cap("SINGLE")
+        cut_taken = 0
         for bet in bets:
             if bool_result is None:
                 bet.status = "VOIDED"
@@ -574,21 +625,29 @@ async def market_resolve(
                     db_user.chips += bet.wager
             elif bool_result and bet.parlay_id is None:
                 bet.status = "WON"
+                paid, cut = net_payout(
+                    hc_config, wager=bet.wager, payout_if_win=bet.payout_if_win,
+                    market_type=m.type, odds=bet.odds_at_placement,
+                    payout_rate=bet.payout_rate_at_placement, cap=single_cap,
+                )
+                bet.house_cut = cut
+                cut_taken += cut
                 db_user = (await db.execute(select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id))).scalar_one_or_none()
                 if db_user:
-                    db_user.chips += bet.payout_if_win
-                    db_user.total_won += bet.payout_if_win
+                    db_user.chips += paid
+                    db_user.total_won += paid
             elif not bool_result and bet.parlay_id is None:
                 bet.status = "LOST"
             elif bet.parlay_id is not None:
                 bet.status = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
                 await _settle_parlay(db, bet.parlay_id)
 
+        await record_house_cut_taken(cut_taken)
         await db.commit()
 
     label = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
     asyncio.create_task(post_admin_action(user, "Market resolved", {"market": m.label, "result": label, "bets settled": str(len(bets))}))
-    return _redirect("/admin/markets", msg=f"Market+resolved+as+{label}.+{len(bets)}+bets+settled.")
+    return _redirect(_markets_redirect_url(status), msg=f"Market+resolved+as+{label}.+{len(bets)}+bets+settled.")
 
 
 async def _settle_parlay(db, parlay_id: int) -> None:
@@ -603,10 +662,18 @@ async def _settle_parlay(db, parlay_id: int) -> None:
         active = [l for l in legs if l.status != "VOIDED"]
         if all(l.status == "WON" for l in active) and active:
             parlay.status = "WON"
+            hc_config = await load_house_cut_config()
+            paid, cut = net_payout(
+                hc_config, wager=parlay.total_wager, payout_if_win=parlay.total_payout,
+                market_type=None, odds=parlay_effective_odds(parlay.total_wager, parlay.total_payout),
+                payout_rate=parlay.payout_rate_at_placement, cap=await get_payout_cap("PARLAY"),
+            )
+            parlay.house_cut = cut
+            await record_house_cut_taken(cut)
             db_user = (await db.execute(select(User).where(User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id))).scalar_one_or_none()
             if db_user:
-                db_user.chips += parlay.total_payout
-                db_user.total_won += parlay.total_payout
+                db_user.chips += paid
+                db_user.total_won += paid
         elif all(l.status == "VOIDED" for l in legs):
             parlay.status = "WON"
             db_user = (await db.execute(select(User).where(User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id))).scalar_one_or_none()
@@ -801,8 +868,34 @@ async def settings(request: Request, user: SessionUser = Depends(require_admin),
         default_chips_setting = settings_map.get("default_chips", str(1000))
         deposit_rate = settings_map.get("deposit_rate", "1.0")
         withdraw_rate = settings_map.get("withdraw_rate", "1.0")
+        payout_rate = settings_map.get("payout_rate", "1.0")
         single_payout_cap = settings_map.get("single_payout_cap", str(_web_config.SINGLE_PAYOUT_CAP))
         parlay_payout_cap = settings_map.get("parlay_payout_cap", str(_web_config.PARLAY_PAYOUT_CAP))
+        house_cut_pct = settings_map.get("house_cut_pct", "0")
+        hc_high_odds_threshold = settings_map.get("house_cut_high_odds_threshold", "") or ""
+        if hc_high_odds_threshold in ("null", "None"):
+            hc_high_odds_threshold = ""
+        hc_high_odds_pct = settings_map.get("house_cut_high_odds_pct", "0")
+
+        try:
+            house_cut_by_type = json.loads(settings_map.get("house_cut_by_type") or "{}")
+        except ValueError:
+            house_cut_by_type = {}
+
+        tpl_rows = (await db.execute(
+            select(MarketTemplate).where(MarketTemplate.active == True)
+            .order_by(MarketTemplate.is_builtin.desc(), MarketTemplate.name)
+        )).scalars().all()
+        market_types = [
+            {"value": t.type_key or f"CUSTOM_{t.id}",
+             "label": t.name if t.is_builtin else f"[Custom] {t.name}"}
+            for t in tpl_rows
+        ]
+        _type_label = {mt["value"]: mt["label"] for mt in market_types}
+        house_cut_type_rows = [
+            {"type": k, "label": _type_label.get(k, k), "pct": v}
+            for k, v in sorted(house_cut_by_type.items())
+        ]
 
     return request.app.state.templates.TemplateResponse("admin/settings.html", {
         "request": request, "user": user,
@@ -813,8 +906,14 @@ async def settings(request: Request, user: SessionUser = Depends(require_admin),
         "default_chips": default_chips_setting,
         "deposit_rate": deposit_rate,
         "withdraw_rate": withdraw_rate,
+        "payout_rate": payout_rate,
         "single_payout_cap": single_payout_cap,
         "parlay_payout_cap": parlay_payout_cap,
+        "house_cut_pct": house_cut_pct,
+        "hc_high_odds_threshold": hc_high_odds_threshold,
+        "hc_high_odds_pct": hc_high_odds_pct,
+        "market_types": market_types,
+        "house_cut_type_rows": house_cut_type_rows,
         "success": success, "error": error,
     })
 
@@ -828,8 +927,12 @@ async def settings_save(
     default_chips: Annotated[str, Form()] = "1000",
     deposit_rate: Annotated[str, Form()] = "1.0",
     withdraw_rate: Annotated[str, Form()] = "1.0",
+    payout_rate: Annotated[str, Form()] = "1.0",
     single_payout_cap: Annotated[str, Form()] = "10000000",
     parlay_payout_cap: Annotated[str, Form()] = "10000000",
+    house_cut_pct: Annotated[str, Form()] = "0",
+    hc_high_odds_threshold: Annotated[str, Form()] = "",
+    hc_high_odds_pct: Annotated[str, Form()] = "0",
     capitol_announcement: Annotated[str, Form()] = "",
 ):
     try:
@@ -837,6 +940,15 @@ async def settings_save(
             raise ValueError
     except ValueError:
         return _redirect("/admin/settings", error="Payout+caps+must+be+whole+numbers+of+at+least+1+chip.")
+
+    try:
+        if not 0.0 <= float(house_cut_pct) <= 100.0 or not 0.0 <= float(hc_high_odds_pct) <= 100.0:
+            raise ValueError
+        if float(payout_rate) <= 0:
+            raise ValueError
+        threshold_clean = str(int(hc_high_odds_threshold)) if hc_high_odds_threshold.strip() else ""
+    except ValueError:
+        return _redirect("/admin/settings", error="House-cut+percents+must+be+0-100,+payout+rate+positive,+threshold+a+whole+number.")
 
     async with get_db() as db:
         async def upsert(key: str, value: str) -> None:
@@ -848,14 +960,45 @@ async def settings_save(
         await upsert("default_chips", default_chips)
         await upsert("deposit_rate", deposit_rate)
         await upsert("withdraw_rate", withdraw_rate)
+        await upsert("payout_rate", str(float(payout_rate)))
         await upsert("single_payout_cap", single_payout_cap)
         await upsert("parlay_payout_cap", parlay_payout_cap)
+        # house-cut keys are JSON-encoded scalars (see bot/utils/house_cut.py);
+        # an empty threshold clears the high-odds surcharge.
+        await upsert("house_cut_pct", str(float(house_cut_pct)))
+        await upsert("house_cut_high_odds_threshold", threshold_clean)
+        await upsert("house_cut_high_odds_pct", str(float(hc_high_odds_pct)))
         if capitol_announcement:
             import json
             await upsert("capitol_announcement", json.dumps(capitol_announcement))
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Settings saved", {"theme": active_theme, "cashout": "on" if cashout_allowed == "on" else "off"}))
     return _redirect("/admin/settings", msg="Settings+saved.")
+
+
+@router.post("/settings/house-cut-type")
+async def settings_house_cut_type(
+    user: SessionUser = Depends(require_admin),
+    market_type: Annotated[str, Form()] = "",
+    pct: Annotated[str, Form()] = "0",
+    clear: Annotated[str, Form()] = "",
+):
+    market_type = market_type.strip()
+    if not market_type:
+        return _redirect("/admin/settings", error="Pick+a+market+type.")
+    if clear == "on":
+        await set_house_cut_for_type(market_type, None)
+        asyncio.create_task(post_admin_action(user, "House cut type override cleared", {"market_type": market_type}))
+        return _redirect("/admin/settings", msg=f"House-cut+override+cleared+for+{market_type}.")
+    try:
+        pct_val = float(pct)
+        if not 0.0 <= pct_val <= 100.0:
+            raise ValueError
+    except ValueError:
+        return _redirect("/admin/settings", error="Per-type+house+cut+must+be+0-100.")
+    await set_house_cut_for_type(market_type, pct_val)
+    asyncio.create_task(post_admin_action(user, "House cut type override set", {"market_type": market_type, "pct": str(pct_val)}))
+    return _redirect("/admin/settings", msg=f"House-cut+for+{market_type}+set+to+{pct_val:g}%.")
 
 
 # ── Restrictions (rate overrides + public-parlay blocks) ───────────────────────
@@ -878,10 +1021,10 @@ async def restrictions_rate_set(
     user: SessionUser = Depends(require_admin),
     scope: Annotated[str, Form()] = "USER",
     target_id: Annotated[str, Form()] = "",
-    direction: Annotated[str, Form()] = "DEPOSIT",
+    direction: Annotated[str, Form()] = "PAYOUT",
     rate: Annotated[float, Form()] = 1.0,
 ):
-    if scope not in ("ROLE", "USER") or direction not in ("DEPOSIT", "WITHDRAW"):
+    if scope not in ("ROLE", "USER") or direction != "PAYOUT":
         return _redirect("/admin/restrictions", error="Invalid+scope+or+direction.")
     try:
         tid = int(target_id)
