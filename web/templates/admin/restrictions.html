@@ -3,12 +3,13 @@
 
 {% block admin_content %}
 <div class="page-header">
-  <h1>Rate Overrides &amp; Public-Bet Restrictions</h1>
+  <h1>Payout Multipliers &amp; Public-Bet Restrictions</h1>
 </div>
 
 <div class="card">
-  <div class="card-label">SET EXCHANGE RATE OVERRIDE</div>
+  <div class="card-label">SET PAYOUT MULTIPLIER OVERRIDE</div>
   <form method="post" action="/admin/restrictions/rates/set">
+    <input type="hidden" name="direction" value="PAYOUT">
     <div class="form-group">
       <label class="form-label">Scope</label>
       <select name="scope" class="form-control">
@@ -21,15 +22,9 @@
       <input type="text" name="target_id" class="form-control" placeholder="123456789012345678" required>
     </div>
     <div class="form-group">
-      <label class="form-label">Direction</label>
-      <select name="direction" class="form-control">
-        <option value="DEPOSIT">Deposit (Panars → chips)</option>
-        <option value="WITHDRAW">Withdraw (chips → Panars)</option>
-      </select>
-    </div>
-    <div class="form-group">
-      <label class="form-label">Rate (multiplier)</label>
+      <label class="form-label">Multiplier</label>
       <input type="number" name="rate" class="form-control" step="0.01" min="0.01" value="1.0" required>
+      <div class="form-help">Applied to a won bet/parlay's payout for this role/user (1.0 = no boost, 1.1 = +10%). Resolved user &gt; highest role &gt; the global payout rate in Settings. Does not affect /deposit or /withdraw.</div>
     </div>
     <button type="submit" class="btn btn-primary">Save Override</button>
   </form>

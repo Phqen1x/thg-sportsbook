@@ -141,6 +141,15 @@ class Parlay(Base):
     # NULL defers to the global cashout_allowed/cashout_rate GameSetting.
     cashout_allowed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     cashout_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Chips skimmed from total_payout by the house cut when this parlay WON,
+    # frozen at settlement time — see bot/utils/house_cut.py.
+    house_cut: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # PAYOUT-direction exchange-rate multiplier (user > role > global) resolved
+    # for the bettor at submit time and frozen here — like odds_at_placement, it
+    # must not drift if an admin changes the rate before this parlay settles. A
+    # WON parlay's gross payout is total_payout * this value (then capped, then
+    # house cut). 1.0 = no boost. Only applied on a win; refunds are untouched.
+    payout_rate_at_placement: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     # When True the parlay is listed on the public tailing board so other members
     # can copy it. Members can opt out at submit time; tailed copies default off.
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -168,6 +177,13 @@ class Bet(Base):
     payout_if_win: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(10), default="PENDING", nullable=False)
     cashout_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Chips skimmed from payout_if_win by the house cut when this bet WON,
+    # frozen at settlement time — see bot/utils/house_cut.py.
+    house_cut: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # PAYOUT-direction exchange-rate multiplier frozen for the bettor at submit
+    # time (see Parlay.payout_rate_at_placement). Used for straight bets only;
+    # parlay-leg rows keep the default and the Parlay row's value is used instead.
+    payout_rate_at_placement: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     placed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     parlay: Mapped["Parlay | None"] = relationship("Parlay", back_populates="legs")
@@ -404,14 +420,18 @@ class TributeLock(Base):
 
 
 class ExchangeRateOverride(Base):
-    """Per-role or per-user override of the global chip<->Panar conversion rate.
+    """Per-role or per-user multiplier override, resolved user > highest-Discord-
+    role override (mirrors how Discord's own permission overwrites resolve
+    conflicts) > global GameSetting default (1.0 if unset).
 
-    ``direction`` is "DEPOSIT" (panars -> chips, used by /deposit) or "WITHDRAW"
-    (chips -> panars, used by /withdraw). ``rate`` is a multiplier applied to the
-    amount the member enters, e.g. a WITHDRAW rate of 1.1 means 1 chip pays out
-    1.1 Panars. Resolution order at use time: user override > highest-Discord-role
-    override (mirrors how Discord's own permission overwrites resolve conflicts)
-    > global GameSetting default ("deposit_rate" / "withdraw_rate", 1.0 if unset).
+    ``direction`` is "PAYOUT" — a multiplier applied to a WON bet/parlay's gross
+    payout at settlement (e.g. 1.1 pays out 10% more), giving a role/user a
+    better return on winning wagers. The global default key is "payout_rate".
+
+    "DEPOSIT"/"WITHDRAW" rows may still exist from before overrides were
+    payout-only; nothing reads them now (/deposit and /withdraw use only the
+    global deposit_rate/withdraw_rate), so they are inert until an admin deletes
+    them.
     """
     __tablename__ = "exchange_rate_overrides"
     __table_args__ = (
@@ -422,7 +442,7 @@ class ExchangeRateOverride(Base):
     guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     scope: Mapped[str] = mapped_column(String(5), nullable=False)  # ROLE | USER
     target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)  # role id or discord user id
-    direction: Mapped[str] = mapped_column(String(10), nullable=False)  # DEPOSIT | WITHDRAW
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)  # PAYOUT (legacy: DEPOSIT | WITHDRAW)
     rate: Mapped[float] = mapped_column(Float, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 

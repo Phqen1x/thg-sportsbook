@@ -12,6 +12,12 @@ let TOKEN = null;   // signed activity token (Authorization: Bearer)
 let ME = null;      // { discord_id, username, avatar_url, is_admin, chips, roi }
 let SDK = null;
 
+// Sort choice for the admin Markets tab, kept outside adminMarkets() so it
+// survives the full re-render that doAction() triggers after every action
+// (open/close/resolve/etc) — otherwise closing a market would silently
+// snap the list back to "Default" order.
+let adminMarketsSort = "default";
+
 // ── Tiny utils ───────────────────────────────────────────────────────────────
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -268,6 +274,22 @@ const CATS = [
 
 const MARKETS_PAGE_SIZE = 24;
 
+function sortMarketList(list, sortBy) {
+  const arr = [...list];
+  if (sortBy === "name" || sortBy === "default") arr.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+  else if (sortBy === "odds-fav") arr.sort((a, b) => (a.odds ?? Infinity) - (b.odds ?? Infinity));
+  else if (sortBy === "odds-long") arr.sort((a, b) => (b.odds ?? -Infinity) - (a.odds ?? -Infinity));
+  else if (sortBy === "popular") arr.sort((a, b) => (b.bet_count ?? 0) - (a.bet_count ?? 0));
+  return arr;
+}
+
+const SORT_OPTIONS_HTML = `
+  <option value="default">Default</option>
+  <option value="name">Name (A–Z)</option>
+  <option value="odds-fav">Odds: Favorites First</option>
+  <option value="odds-long">Odds: Longshots First</option>
+  <option value="popular">Most Bets</option>`;
+
 async function viewMarkets(view) {
   const [marketsData, tailData, bannersData, tributesData] = await Promise.all([
     api("/markets?status=open"),
@@ -310,13 +332,7 @@ async function viewMarkets(view) {
       </div>
       <div class="sort-row">
         <label class="sort-label" for="mkt-sort">Sort</label>
-        <select class="input sort-select" id="mkt-sort">
-          <option value="default">Default</option>
-          <option value="name">Name (A–Z)</option>
-          <option value="odds-fav">Odds: Favorites First</option>
-          <option value="odds-long">Odds: Longshots First</option>
-          <option value="popular">Most Bets</option>
-        </select>
+        <select class="input sort-select" id="mkt-sort">${SORT_OPTIONS_HTML}</select>
       </div>
     </div>
 
@@ -367,15 +383,6 @@ async function viewMarkets(view) {
   let page       = 1;
   const selectedTributeIds = new Set();
 
-  function sortMarkets(list) {
-    const arr = [...list];
-    if (sortBy === "name" || sortBy === "default") arr.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
-    else if (sortBy === "odds-fav") arr.sort((a, b) => (a.odds ?? Infinity) - (b.odds ?? Infinity));
-    else if (sortBy === "odds-long") arr.sort((a, b) => (b.odds ?? -Infinity) - (a.odds ?? -Infinity));
-    else if (sortBy === "popular") arr.sort((a, b) => (b.bet_count ?? 0) - (a.bet_count ?? 0));
-    return arr;
-  }
-
   function matchesTributes(m) {
     if (!selectedTributeIds.size) return true;
     return selectedTributeIds.has(String(m.tribute_a_id)) || selectedTributeIds.has(String(m.tribute_b_id));
@@ -383,7 +390,7 @@ async function viewMarkets(view) {
 
   function computeFiltered() {
     const q = searchQ.toLowerCase();
-    return sortMarkets(allMarkets.filter((m) => {
+    return sortMarketList(allMarkets.filter((m) => {
       if (!matchesCat(m, activeCat)) return false;
       if (!matchesTributes(m)) return false;
       if (!q) return true;
@@ -392,7 +399,7 @@ async function viewMarkets(view) {
         (m.tribute_a && m.tribute_a.toLowerCase().includes(q)) ||
         (m.tribute_b && m.tribute_b.toLowerCase().includes(q))
       );
-    }));
+    }), sortBy);
   }
 
   // Re-renders the current page from the current filter/sort/search state.
@@ -868,10 +875,22 @@ async function adminMarkets(body) {
     <div class="admin-market-bar">
       <button class="btn btn-outline btn-sm" id="m-recalc">Recalculate All Odds</button>
       <button class="btn btn-outline btn-sm" id="m-bulk-close">Bulk Close All Open</button>
+      <div class="sort-row">
+        <label class="sort-label" for="m-sort">Sort</label>
+        <select class="input sort-select" id="m-sort">${SORT_OPTIONS_HTML}</select>
+      </div>
     </div>
-    <div class="list">
-      ${all.length ? all.map((m) => marketCard(m, { actions: "admin" })).join("") : `<div class="empty">No markets.</div>`}
-    </div>`;
+    <div class="list" id="admin-market-list"></div>`;
+
+  function renderList() {
+    const listEl = $("#admin-market-list", body);
+    const sorted = sortMarketList(all, adminMarketsSort);
+    listEl.innerHTML = sorted.length
+      ? sorted.map((m) => marketCard(m, { actions: "admin" })).join("")
+      : `<div class="empty">No markets.</div>`;
+    bindAdminMarketActions(body);
+  }
+
   $("#m-recalc", body).addEventListener("click", async () => {
     if (!confirm("Recalculate odds on all non-overridden markets?")) return;
     await doAction("/admin/markets/recalc", "POST");
@@ -880,6 +899,14 @@ async function adminMarkets(body) {
     if (!confirm("Close all open markets?")) return;
     await doAction("/admin/markets/bulk-close", "POST");
   });
+  const sortEl = $("#m-sort", body);
+  sortEl.value = adminMarketsSort;
+  sortEl.addEventListener("change", (e) => { adminMarketsSort = e.target.value; renderList(); });
+
+  renderList();
+}
+
+function bindAdminMarketActions(body) {
   body.querySelectorAll('[data-act="m-open"]').forEach((b) =>
     b.addEventListener("click", () => doAction(`/admin/market/${b.dataset.id}/open`, "POST")));
   body.querySelectorAll('[data-act="m-close"]').forEach((b) =>
@@ -1189,10 +1216,11 @@ async function adminParlays(body) {
 }
 
 async function adminRates(body) {
-  const [rates, { blocks }, payoutCaps] = await Promise.all([
+  const [rates, { blocks }, payoutCaps, houseCut] = await Promise.all([
     api("/admin/exchange-rates"),
     api("/admin/public-blocks"),
     api("/admin/payout-caps"),
+    api("/admin/house-cut"),
   ]);
 
   body.innerHTML = `
@@ -1205,25 +1233,56 @@ async function adminRates(body) {
     </div>
 
     <div class="card admin-form">
+      <div class="card-label">HOUSE CUT</div>
+      <input id="hc-global" class="input" type="number" step="0.1" min="0" max="100" value="${houseCut.global_pct}" placeholder="House cut % of winning profit">
+      <input id="hc-threshold" class="input" type="number" step="1" min="1" value="${houseCut.high_odds_threshold ?? ""}" placeholder="High-odds surcharge threshold (blank = off)">
+      <input id="hc-highpct" class="input" type="number" step="0.1" min="0" max="100" value="${houseCut.high_odds_pct}" placeholder="High-odds surcharge %">
+      <button class="btn btn-primary" id="hc-save">Save House Cut</button>
+      <div class="dim" style="width:100%">Skimmed from the profit (payout − stake) of every WON bet/parlay. Winners paying above +threshold get the surcharge % instead (higher cut wins). Taken to date: ${fmtChips(houseCut.total_taken)}.</div>
+    </div>
+
+    <div class="card admin-form">
+      <div class="card-label">PER-MARKET-TYPE HOUSE CUT</div>
+      <div class="dim" style="width:100%">Overrides the global cut for straight bets on one market type (parlays always use the global rate).</div>
+      <select id="hct-type" class="input">
+        <option value="">— market type —</option>
+        ${houseCut.market_types.map((mt) => `<option value="${esc(mt.value)}">${esc(mt.label)}</option>`).join("")}
+      </select>
+      <input id="hct-pct" class="input" type="number" step="0.1" min="0" max="100" value="0" placeholder="Cut %">
+      <button class="btn btn-primary" id="hct-add">Set Override</button>
+    </div>
+
+    <div class="list">
+      ${houseCut.by_type.length ? houseCut.by_type.map((o) => `
+        <div class="card tail-card">
+          <div class="tail-head">
+            <span class="tail-name">${esc(o.label)}</span>
+            <span class="badge">${o.pct}%</span>
+          </div>
+          <div class="row-buttons">
+            <button class="btn btn-outline btn-sm" data-act="hct-remove" data-type="${esc(o.type)}">Remove</button>
+          </div>
+        </div>`).join("") : `<div class="empty">No per-type house-cut overrides.</div>`}
+    </div>
+
+    <div class="card admin-form">
       <div class="card-label">GLOBAL RATES</div>
       <input id="r-deposit" class="input" type="number" step="0.01" min="0.01" value="${rates.global_deposit_rate}" placeholder="Deposit rate (chips per Panar)">
       <input id="r-withdraw" class="input" type="number" step="0.01" min="0.01" value="${rates.global_withdraw_rate}" placeholder="Withdraw rate (Panars per chip)">
+      <input id="r-payout" class="input" type="number" step="0.01" min="0.01" value="${rates.global_payout_rate}" placeholder="Payout multiplier (won bets & parlays)">
       <button class="btn btn-primary" id="r-save-global">Save Global Rates</button>
     </div>
 
     <div class="card admin-form">
-      <div class="card-label">ADD RATE OVERRIDE</div>
+      <div class="card-label">ADD PAYOUT MULTIPLIER OVERRIDE</div>
       <select id="r-scope" class="input">
         <option value="USER">User</option>
         <option value="ROLE">Role</option>
       </select>
       <input id="r-target" class="input" placeholder="Discord user ID or Role ID">
-      <select id="r-direction" class="input">
-        <option value="DEPOSIT">Deposit (Panars → chips)</option>
-        <option value="WITHDRAW">Withdraw (chips → Panars)</option>
-      </select>
-      <input id="r-rate" class="input" type="number" step="0.01" min="0.01" value="1.0" placeholder="Rate">
+      <input id="r-rate" class="input" type="number" step="0.01" min="0.01" value="1.0" placeholder="Multiplier (1.1 = +10% payout)">
       <button class="btn btn-primary" id="r-add-override">Add Override</button>
+      <div class="dim" style="width:100%">Multiplies a won bet/parlay's payout for this role/user. Resolved user &gt; highest role &gt; the global payout multiplier. Does not affect /deposit or /withdraw.</div>
     </div>
 
     <div class="list">
@@ -1231,13 +1290,13 @@ async function adminRates(body) {
         <div class="card tail-card">
           <div class="tail-head">
             <span class="tail-name">${o.scope} ${esc(o.target_id)}</span>
-            <span class="badge">${o.direction}</span>
+            <span class="badge">${o.direction === "PAYOUT" ? "PAYOUT ×" : o.direction + " (inert)"}</span>
           </div>
           <div class="row-buttons">
             <span style="flex:1;align-self:center;font-weight:700">${o.rate}</span>
             <button class="btn btn-outline btn-sm" data-act="r-remove" data-id="${o.id}">Remove</button>
           </div>
-        </div>`).join("") : `<div class="empty">No rate overrides set — everyone uses the global rates above.</div>`}
+        </div>`).join("") : `<div class="empty">No payout multiplier overrides — everyone uses the global payout multiplier above.</div>`}
     </div>
 
     <div class="card admin-form">
@@ -1272,12 +1331,45 @@ async function adminRates(body) {
     } catch (e) { toast(e.message, "error"); }
   });
 
+  $("#hc-save", body).addEventListener("click", async () => {
+    const global_pct = Number($("#hc-global", body).value);
+    const rawThreshold = $("#hc-threshold", body).value.trim();
+    const high_odds_threshold = rawThreshold === "" ? null : Number(rawThreshold);
+    const high_odds_pct = Number($("#hc-highpct", body).value);
+    try {
+      const r = await api("/admin/house-cut", { method: "POST", body: { global_pct, high_odds_threshold, high_odds_pct } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  $("#hct-add", body).addEventListener("click", async () => {
+    const market_type = $("#hct-type", body).value;
+    const pct = Number($("#hct-pct", body).value);
+    if (!market_type) return toast("Pick a market type.", "error");
+    try {
+      const r = await api("/admin/house-cut/type", { method: "POST", body: { market_type, pct } });
+      toast(r.message);
+      adminRates(body);
+    } catch (e) { toast(e.message, "error"); }
+  });
+
+  body.querySelectorAll('[data-act="hct-remove"]').forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await api("/admin/house-cut/type", { method: "POST", body: { market_type: btn.dataset.type, pct: null } });
+        toast(r.message);
+        adminRates(body);
+      } catch (e) { toast(e.message, "error"); }
+    }));
+
   $("#r-save-global", body).addEventListener("click", async () => {
     const deposit_rate = Number($("#r-deposit", body).value);
     const withdraw_rate = Number($("#r-withdraw", body).value);
-    if (!deposit_rate || !withdraw_rate) return toast("Enter both rates.", "error");
+    const payout_rate = Number($("#r-payout", body).value);
+    if (!deposit_rate || !withdraw_rate || !payout_rate) return toast("Enter all three rates.", "error");
     try {
-      const r = await api("/admin/exchange-rates/global", { method: "POST", body: { deposit_rate, withdraw_rate } });
+      const r = await api("/admin/exchange-rates/global", { method: "POST", body: { deposit_rate, withdraw_rate, payout_rate } });
       toast(r.message);
       adminRates(body);
     } catch (e) { toast(e.message, "error"); }
@@ -1286,11 +1378,10 @@ async function adminRates(body) {
   $("#r-add-override", body).addEventListener("click", async () => {
     const scope = $("#r-scope", body).value;
     const target_id = $("#r-target", body).value.trim();
-    const direction = $("#r-direction", body).value;
     const rate = Number($("#r-rate", body).value);
-    if (!target_id || !rate) return toast("Enter a target ID and rate.", "error");
+    if (!target_id || !rate) return toast("Enter a target ID and multiplier.", "error");
     try {
-      const r = await api("/admin/exchange-rates", { method: "POST", body: { scope, target_id, direction, rate } });
+      const r = await api("/admin/exchange-rates", { method: "POST", body: { scope, target_id, direction: "PAYOUT", rate } });
       toast(r.message);
       adminRates(body);
     } catch (e) { toast(e.message, "error"); }
@@ -1329,11 +1420,17 @@ async function adminRates(body) {
 // ── Generic helpers / modals ───────────────────────────────────────────────────
 
 async function doAction(path, method = "POST", body) {
+  // route() rebuilds #view from scratch, which wipes its scroll position —
+  // save/restore it so an admin action (e.g. closing a market) doesn't jump
+  // the list back to the top.
+  const view = $("#view");
+  const scrollTop = view ? view.scrollTop : 0;
   try {
     const r = await api(path, { method, body });
     if (r.message) toast(r.message);
     await refreshMe();
-    route();
+    await route();
+    if (view) view.scrollTop = scrollTop;
   } catch (e) { toast(e.message, "error"); }
 }
 

@@ -45,6 +45,29 @@
     </div>
 
     <div class="form-group">
+      <label class="form-label">Global Payout Multiplier (won bets &amp; parlays)</label>
+      <input type="number" name="payout_rate" class="form-control" step="0.01" min="0.01" value="{{ payout_rate }}">
+      <div class="form-help">Scales the gross payout of every winning bet/parlay (1.0 = no change). Per-role/user overrides on the Restrictions page take precedence. Applied before the payout cap and house cut; losing bets and refunds are unaffected.</div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">House Cut (% of winning profit)</label>
+      <input type="number" name="house_cut_pct" class="form-control" step="0.1" min="0" max="100" value="{{ house_cut_pct }}">
+      <div class="form-help">Percentage skimmed from the profit (payout − stake) of every WON bet/parlay. 0 = no cut. Per-market-type overrides remain bot-only (<code>/economy house_cut_type</code>).</div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">High-Odds Surcharge Threshold (American odds)</label>
+      <input type="number" name="hc_high_odds_threshold" class="form-control" step="1" value="{{ hc_high_odds_threshold }}" placeholder="e.g. 500 — leave blank to disable">
+      <div class="form-help">Winners paying above +this get the surcharge house-cut rate instead (whichever cut is higher wins). Blank disables the surcharge.</div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">High-Odds Surcharge Cut (%)</label>
+      <input type="number" name="hc_high_odds_pct" class="form-control" step="0.1" min="0" max="100" value="{{ hc_high_odds_pct }}">
+    </div>
+
+    <div class="form-group">
       <label class="form-label">Single Bet Payout Cap (chips)</label>
       <input type="number" name="single_payout_cap" class="form-control" min="1" value="{{ single_payout_cap }}">
       <div class="form-help">Max chips a single (non-parlay) bet can pay out on a win. A wager that would pay out more is rejected with the max wager they can place instead.</div>
@@ -62,6 +85,51 @@
     </div>
 
     <button type="submit" class="btn btn-primary">Save Settings</button>
+  </form>
+</div>
+
+<div class="card form-card mt-3">
+  <div class="card-label">PER-MARKET-TYPE HOUSE CUT</div>
+  <div class="form-help">Overrides the global house cut for straight bets on one market type (parlays always use the global rate). Whichever of the applicable cuts is higher wins.</div>
+
+  {% if house_cut_type_rows %}
+  <table class="table mt-2">
+    <thead><tr><th>Market Type</th><th>Cut %</th><th></th></tr></thead>
+    <tbody>
+      {% for row in house_cut_type_rows %}
+      <tr>
+        <td>{{ row.label }} <span class="text-dim" style="font-size:0.8rem">({{ row.type }})</span></td>
+        <td class="text-gold font-bold">{{ row.pct }}%</td>
+        <td>
+          <form method="post" action="/admin/settings/house-cut-type">
+            <input type="hidden" name="market_type" value="{{ row.type }}">
+            <input type="hidden" name="clear" value="on">
+            <button class="btn btn-sm btn-danger">Remove</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="text-dim mt-2">No per-type overrides — every market type uses the global house cut.</div>
+  {% endif %}
+
+  <form method="post" action="/admin/settings/house-cut-type" class="mt-2">
+    <div class="form-group">
+      <label class="form-label">Market Type</label>
+      <select name="market_type" class="form-control" required>
+        <option value="">— select —</option>
+        {% for mt in market_types %}
+        <option value="{{ mt.value }}">{{ mt.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Cut % (0–100)</label>
+      <input type="number" name="pct" class="form-control" step="0.1" min="0" max="100" value="0">
+    </div>
+    <button type="submit" class="btn btn-primary">Set Override</button>
   </form>
 </div>
 {% endblock %}

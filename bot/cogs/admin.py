@@ -100,6 +100,11 @@ from bot.utils.exchange_rates import (
     clear_override, get_global_rate, list_overrides, set_global_rate, set_override,
 )
 from bot.utils.formatters import fmt_chips, fmt_odds, safe_defer
+from bot.utils.house_cut import (
+    boosted_gross, get_house_cut_total_taken, load_house_cut_config, net_payout,
+    parlay_effective_odds, record_house_cut_taken, set_house_cut_for_type,
+    set_house_cut_global, set_house_cut_high_odds_rule,
+)
 from bot.utils.market_view import MarketPageView, MarketTypePageView, sort_markets
 from bot.utils.payout_caps import get_payout_cap, set_payout_cap
 from bot.utils.restrictions import is_public_bet_blocked, set_public_block
@@ -187,6 +192,8 @@ async def _send_resolution_dms(bot: commands.Bot, notifications: list[dict]) -> 
                         f"Your bet on **{notif['market_label']}** has **WON**! "
                         f"You've been paid **{fmt_chips(notif['payout'])}**."
                     )
+                    if notif.get("house_cut"):
+                        msg += f" (House cut: **{fmt_chips(notif['house_cut'])}**.)"
                 elif status == "LOST":
                     msg = f"Your bet on **{notif['market_label']}** has **LOST**. Better luck next time!"
                 else:
@@ -218,6 +225,8 @@ async def _send_resolution_dms(bot: commands.Bot, notifications: list[dict]) -> 
                         f"Your parlay has **WON**! "
                         f"You've been paid **{fmt_chips(notif['payout'])}**."
                     )
+                    if notif.get("house_cut"):
+                        msg += f" (House cut: **{fmt_chips(notif['house_cut'])}**.)"
                 elif status == "LOST":
                     msg = "Your parlay has **LOST**. Better luck next time!"
                 else:
@@ -1677,6 +1686,9 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
     bets = bet_result.scalars().all()
     resolved_count = 0
     credits_issued = 0
+    cut_taken = 0
+    hc_config = await load_house_cut_config()
+    single_cap = await get_payout_cap("SINGLE")
     buf = _notif_buffer.get()
     for bet in bets:
         if result is None:
@@ -1703,6 +1715,13 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                 )
         elif result is True and bet.parlay_id is None:
             bet.status = "WON"
+            paid, cut = net_payout(
+                hc_config, wager=bet.wager, payout_if_win=bet.payout_if_win,
+                market_type=market.type, odds=bet.odds_at_placement,
+                payout_rate=bet.payout_rate_at_placement, cap=single_cap,
+            )
+            bet.house_cut = cut
+            cut_taken += cut
             _ur = await session.execute(
                 select(User).where(
                     User.guild_id == bet.guild_id, User.discord_id == bet.user_id
@@ -1710,9 +1729,9 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
             )
             user = _ur.scalar_one_or_none()
             if user:
-                user.chips += bet.payout_if_win
-                user.total_won += bet.payout_if_win
-            credits_issued += bet.payout_if_win
+                user.chips += paid
+                user.total_won += paid
+            credits_issued += paid
             if buf is not None:
                 buf.append(
                     {
@@ -1722,7 +1741,8 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
                         "market_label": market.label,
                         "odds": bet.odds_at_placement,
                         "wager": bet.wager,
-                        "payout": bet.payout_if_win,
+                        "payout": paid,
+                        "house_cut": cut,
                     }
                 )
         elif result is False and bet.parlay_id is None:
@@ -1761,6 +1781,7 @@ async def _resolve_market(session, market: Market, result: bool | None) -> dict:
         if tpl and tpl.source == "AUTO":
             await session.delete(tpl)
 
+    await record_house_cut_taken(cut_taken)
     return {"resolved": resolved_count, "credits": credits_issued}
 
 
@@ -3664,6 +3685,14 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
     active_legs = [l for l in legs if l.status != "VOIDED"]
     if all(l.status == "WON" for l in active_legs):
         parlay.status = "WON"
+        hc_config = await load_house_cut_config()
+        paid, cut = net_payout(
+            hc_config, wager=parlay.total_wager, payout_if_win=parlay.total_payout,
+            market_type=None, odds=parlay_effective_odds(parlay.total_wager, parlay.total_payout),
+            payout_rate=parlay.payout_rate_at_placement, cap=await get_payout_cap("PARLAY"),
+        )
+        parlay.house_cut = cut
+        await record_house_cut_taken(cut)
         _pur = await session.execute(
             select(User).where(
                 User.guild_id == parlay.guild_id, User.discord_id == parlay.user_id
@@ -3671,8 +3700,8 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
         )
         user = _pur.scalar_one_or_none()
         if user:
-            user.chips += parlay.total_payout
-            user.total_won += parlay.total_payout
+            user.chips += paid
+            user.total_won += paid
         leg_data = []
         for leg in legs:
             mkt = await session.get(Market, leg.market_id)
@@ -3689,7 +3718,8 @@ async def _check_parlay(session, parlay_id: int) -> list[dict]:
                 "user_id": parlay.user_id,
                 "status": "WON",
                 "wager": parlay.total_wager,
-                "payout": parlay.total_payout,
+                "payout": paid,
+                "house_cut": cut,
                 "legs": leg_data,
             }
         )
@@ -3741,6 +3771,9 @@ async def _unresolve_market(
     bets = bet_result.scalars().all()
     unresolved_count = 0
     chips_reclaimed = 0
+    cut_reversed = 0
+    single_cap = await get_payout_cap("SINGLE")
+    parlay_cap = await get_payout_cap("PARLAY")
 
     for bet in bets:
         if bet.parlay_id is not None:
@@ -3765,8 +3798,13 @@ async def _unresolve_market(
                                 p_user.chips -= parlay.total_wager
                         else:
                             if p_user:
-                                p_user.chips -= parlay.total_payout
-                                p_user.total_won -= parlay.total_payout
+                                paid = boosted_gross(
+                                    parlay.total_payout, parlay.payout_rate_at_placement, parlay_cap,
+                                ) - parlay.house_cut
+                                p_user.chips -= paid
+                                p_user.total_won -= paid
+                            cut_reversed += parlay.house_cut
+                    parlay.house_cut = 0
                     parlay.status = "PENDING"
             bet.status = "PENDING"
         elif bet.status == "WON":
@@ -3776,10 +3814,15 @@ async def _unresolve_market(
                 )
             )
             user = _ur.scalar_one_or_none()
+            paid = boosted_gross(
+                bet.payout_if_win, bet.payout_rate_at_placement, single_cap,
+            ) - bet.house_cut
             if user:
-                user.chips -= bet.payout_if_win
-                user.total_won -= bet.payout_if_win
-            chips_reclaimed += bet.payout_if_win
+                user.chips -= paid
+                user.total_won -= paid
+            chips_reclaimed += paid
+            cut_reversed += bet.house_cut
+            bet.house_cut = 0
             bet.status = "PENDING"
         elif bet.status == "LOST":
             bet.status = "PENDING"
@@ -3798,6 +3841,7 @@ async def _unresolve_market(
 
     market.status = "OPEN"
     market.result = None
+    await record_house_cut_taken(-cut_reversed)
     return {"unresolved": unresolved_count, "chips_reclaimed": chips_reclaimed}
 
 
@@ -3854,6 +3898,21 @@ _PLACEMENT_MARKET_TYPES = (
     "TRIBUTE_TOP_N",
     "PLACEMENT_OU",
     "TRIBUTE_RUNNER_UP",
+)
+
+# Markets resolved from a tribute's training_score (via /tribute set_score),
+# entirely independent of whether that tribute is alive or dead. Reverting a
+# death (/tribute unkill) never touches training_score, so these must never be
+# swept up as "resolved because of the death" — doing so would claw back
+# winnings that have nothing to do with the death being undone.
+_SCORE_MARKET_TYPES = (
+    "EXACT_TRAINING_SCORE",
+    "TRAINING_SCORE_OU",
+    "COMBINED_DISTRICT_SCORE",
+    "PARTNER_SCORE_HIGHER",
+    "PARTNER_SCORE_LOWER",
+    "HIGHEST_TRAINING_SCORE",
+    "LOWEST_TRAINING_SCORE",
 )
 
 
@@ -3914,10 +3973,13 @@ async def _resolve_top_killer_markets(session) -> dict:
 
 
 async def _resolve_partner_place_markets(session) -> dict:
-    """Settle PARTNER_PLACE_HIGHER / PARTNER_PLACE_LOWER markets from final placements.
+    """Settle PARTNER_PLACE_HIGHER / PARTNER_PLACE_LOWER markets from recorded placements.
 
-    Both tributes must have a recorded placement for the market to resolve.
-    Markets where either tribute is still alive are left open.
+    A market resolves as soon as at least one tribute has a placement (i.e.
+    has died or won): if both are placed, compare them directly; if only one
+    is, the still-alive partner is guaranteed to eventually place better than
+    the dead one, so the outcome is already decided. Markets where neither
+    tribute has a placement yet are left open.
     """
     trib_res = await session.execute(select(Tribute))
     tributes = {t.id: t for t in trib_res.scalars().all()}
@@ -3935,9 +3997,7 @@ async def _resolve_partner_place_markets(session) -> dict:
         if ta is None or tb is None:
             await _resolve_market(session, m, None)
             resolved += 1
-        elif ta.placement is None or tb.placement is None:
-            skipped += 1
-        else:
+        elif ta.placement is not None and tb.placement is not None:
             # Lower placement number = better finish (1st beats 2nd)
             if m.type == "PARTNER_PLACE_HIGHER":
                 result = ta.placement < tb.placement
@@ -3945,6 +4005,16 @@ async def _resolve_partner_place_markets(session) -> dict:
                 result = ta.placement > tb.placement
             await _resolve_market(session, m, result)
             resolved += 1
+        elif ta.placement is not None or tb.placement is not None:
+            dead_is_a = ta.placement is not None
+            if m.type == "PARTNER_PLACE_HIGHER":
+                result = not dead_is_a
+            else:
+                result = dead_is_a
+            await _resolve_market(session, m, result)
+            resolved += 1
+        else:
+            skipped += 1
     return {"resolved": resolved, "skipped": skipped}
 
 
@@ -5497,8 +5567,16 @@ class AdminCog(commands.Cog):
             if not t:
                 await interaction.followup.send("Tribute not found.", ephemeral=True)
                 return
+            # Relabel unconditionally whenever `name` is passed at all — not
+            # just when it differs from the current value. That makes
+            # re-running this command with the tribute's current name a valid
+            # way to force-resync its markets' labels (e.g. to backfill
+            # markets that went stale before this relabeling existed), rather
+            # than silently no-op'ing because "nothing changed".
+            needs_relabel = False
             if name:
                 t.name = name
+                needs_relabel = True
             if district and district != t.district:
                 roster = list((await session.execute(select(Tribute))).scalars().all())
                 slot_error = _district_slot_error(
@@ -5508,6 +5586,7 @@ class AdminCog(commands.Cog):
                     await interaction.followup.send(slot_error, ephemeral=True)
                     return
                 t.district = district
+                needs_relabel = True
             if age is not None:
                 t.age = age
             if score:
@@ -5539,6 +5618,8 @@ class AdminCog(commands.Cog):
                 t.highest_placement = highest_placement
             updated_name = t.name
             seniority_factor = _seniority_factor(t.member_joined_at)
+            if needs_relabel:
+                await _relabel_tribute_markets(session, t.id)
             await _recalculate_markets(session)
 
         sf_str = f" (seniority: ×{seniority_factor})" if t.member_joined_at else ""
@@ -5860,7 +5941,6 @@ class AdminCog(commands.Cog):
                         session, mkt, _placement_market_result(mkt, t.placement)
                     )
                 elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
-                    # Resolve now only if the partner's placement is already known.
                     partner = (
                         await session.get(Tribute, mkt.tribute_b_id)
                         if mkt.tribute_b_id
@@ -5875,7 +5955,15 @@ class AdminCog(commands.Cog):
                             await _resolve_market(
                                 session, mkt, t.placement > partner.placement
                             )
-                    # else: leave open — partner not yet placed
+                    elif partner:
+                        # Partner is still alive — their eventual placement is
+                        # guaranteed to beat this tribute's now-fixed one, so
+                        # the market is already decided without waiting for
+                        # the partner to die too.
+                        await _resolve_market(
+                            session, mkt, mkt.type == "PARTNER_PLACE_LOWER"
+                        )
+                    # else: partner tribute missing — leave open
                 elif mkt.type == "TRIBUTE_KILLS":
                     # "Most kills" is undecided until the Games end — a dead tribute
                     # can still finish as the top killer. Leave OPEN for game end.
@@ -5893,7 +5981,7 @@ class AdminCog(commands.Cog):
                 if void_death:
                     await _resolve_market(session, mkt, None)
                 elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
-                    # tribute_b (the partner) just died — resolve if tribute_a placement is known.
+                    # tribute_b (the partner) just died.
                     ta_obj = (
                         await session.get(Tribute, mkt.tribute_a_id)
                         if mkt.tribute_a_id
@@ -5908,7 +5996,13 @@ class AdminCog(commands.Cog):
                             await _resolve_market(
                                 session, mkt, ta_obj.placement > t.placement
                             )
-                    # else: leave open — tribute_a not yet placed
+                    elif ta_obj:
+                        # tribute_a is still alive — guaranteed to eventually
+                        # place better than the now-dead tribute_b.
+                        await _resolve_market(
+                            session, mkt, mkt.type == "PARTNER_PLACE_HIGHER"
+                        )
+                    # else: tribute_a tribute missing — leave open
                 else:
                     result = (mkt.tribute_a_id == killer_id) if killer_id else False
                     await _resolve_market(session, mkt, result)
@@ -6112,17 +6206,24 @@ class AdminCog(commands.Cog):
             # ── Collect markets to revert ─────────────────────────────────────
             markets_to_revert: list[Market] = []
 
-            # All resolved markets involving the dead tribute
+            # All resolved markets involving the dead tribute whose outcome was
+            # actually decided by the death (score markets are resolved from
+            # training_score independently of alive/dead status and must not
+            # be clawed back here — see _SCORE_MARKET_TYPES).
             a_res = await session.execute(
                 select(Market).where(
-                    Market.tribute_a_id == dead_id, Market.status == "RESOLVED"
+                    Market.tribute_a_id == dead_id,
+                    Market.status == "RESOLVED",
+                    Market.type.notin_(_SCORE_MARKET_TYPES),
                 )
             )
             markets_to_revert.extend(a_res.scalars().all())
 
             b_res = await session.execute(
                 select(Market).where(
-                    Market.tribute_b_id == dead_id, Market.status == "RESOLVED"
+                    Market.tribute_b_id == dead_id,
+                    Market.status == "RESOLVED",
+                    Market.type.notin_(_SCORE_MARKET_TYPES),
                 )
             )
             markets_to_revert.extend(b_res.scalars().all())
@@ -7568,15 +7669,21 @@ class AdminCog(commands.Cog):
 
     @market.command(
         name="bulk_close",
-        description="Close open markets immediately, optionally filtered by type",
+        description="Close open markets immediately, optionally filtered by type and/or tribute",
     )
     @app_commands.describe(
         market_type="Market type filter (blank = close all open markets)",
+        tribute="Tribute filter (blank = all tributes) — matches markets on either side",
     )
-    @app_commands.autocomplete(market_type=market_type_autocomplete)
+    @app_commands.autocomplete(
+        market_type=market_type_autocomplete, tribute=tribute_autocomplete
+    )
     @is_admin()
     async def market_bulk_close(
-        self, interaction: discord.Interaction, market_type: str | None = None
+        self,
+        interaction: discord.Interaction,
+        market_type: str | None = None,
+        tribute: str | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
@@ -7584,20 +7691,35 @@ class AdminCog(commands.Cog):
             query = select(Market).where(Market.status == "OPEN")
             if market_type:
                 query = query.where(Market.type == market_type)
+            tribute_name: str | None = None
+            if tribute:
+                tribute_id = int(tribute)
+                trib = await session.get(Tribute, tribute_id)
+                if not trib:
+                    await interaction.followup.send("Tribute not found.", ephemeral=True)
+                    return
+                tribute_name = trib.name
+                query = query.where(
+                    or_(
+                        Market.tribute_a_id == tribute_id,
+                        Market.tribute_b_id == tribute_id,
+                    )
+                )
             result = await session.execute(query)
             markets = result.scalars().all()
             count = len(markets)
             for m in markets:
                 m.status = "CLOSED"
 
+        scope_bits: list[str] = []
         if market_type:
-            await interaction.followup.send(
-                f"Closed {count} open {market_type} market(s).", ephemeral=True
-            )
-        else:
-            await interaction.followup.send(
-                f"Closed {count} open market(s).", ephemeral=True
-            )
+            scope_bits.append(f"**{market_type}**")
+        if tribute_name:
+            scope_bits.append(f"on **{tribute_name}**")
+        scope = " " + " ".join(scope_bits) if scope_bits else ""
+        await interaction.followup.send(
+            f"Closed {count} open{scope} market(s).", ephemeral=True
+        )
 
     @market.command(
         name="bulk_open",
@@ -12753,14 +12875,15 @@ class AdminCog(commands.Cog):
     _RATE_DIRECTIONS = [
         app_commands.Choice(name="Deposit (Panars → chips)", value="DEPOSIT"),
         app_commands.Choice(name="Withdraw (chips → Panars)", value="WITHDRAW"),
+        app_commands.Choice(name="Payout (won bet/parlay multiplier)", value="PAYOUT"),
     ]
 
     @economy.command(
-        name="set_global_rate", description="Set the server-wide chip/Panar exchange rate"
+        name="set_global_rate", description="Set a server-wide exchange/payout rate"
     )
     @app_commands.describe(
-        direction="Which exchange this rate applies to",
-        rate="Multiplier applied to the amount entered (1.0 = current 1:1 exchange)",
+        direction="Which rate this applies to",
+        rate="Multiplier applied to the amount (1.0 = no change)",
     )
     @app_commands.choices(direction=_RATE_DIRECTIONS)
     @is_admin()
@@ -12778,109 +12901,99 @@ class AdminCog(commands.Cog):
         )
 
     @economy.command(
-        name="set_role_rate", description="Override the exchange rate for everyone with a role"
+        name="set_role_rate", description="Give everyone with a role a won-payout multiplier"
     )
     @app_commands.describe(
-        direction="Which exchange this rate applies to",
-        role="Role to set a rate override for",
-        rate="Multiplier applied to the amount entered",
+        role="Role to set a payout multiplier for",
+        rate="Multiplier applied to a won bet/parlay's payout (1.0 = no boost)",
     )
-    @app_commands.choices(direction=_RATE_DIRECTIONS)
     @is_admin()
     async def economy_set_role_rate(
         self,
         interaction: discord.Interaction,
-        direction: app_commands.Choice[str],
         role: discord.Role,
         rate: app_commands.Range[float, 0.01, 100.0],
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            await set_override(session, current_guild_id(), "ROLE", role.id, direction.value, rate)
+            await set_override(session, current_guild_id(), "ROLE", role.id, "PAYOUT", rate)
         await interaction.followup.send(
-            f"**@{role.name}**'s **{direction.name}** rate set to **{rate}**.", ephemeral=True
+            f"**@{role.name}**'s payout multiplier set to **{rate}**.", ephemeral=True
         )
 
     @economy.command(
-        name="set_user_rate", description="Override the exchange rate for one member"
+        name="set_user_rate", description="Give one member a won-payout multiplier"
     )
     @app_commands.describe(
-        direction="Which exchange this rate applies to",
-        member="Member to set a rate override for",
-        rate="Multiplier applied to the amount entered",
+        member="Member to set a payout multiplier for",
+        rate="Multiplier applied to a won bet/parlay's payout (1.0 = no boost)",
     )
-    @app_commands.choices(direction=_RATE_DIRECTIONS)
     @is_admin()
     async def economy_set_user_rate(
         self,
         interaction: discord.Interaction,
-        direction: app_commands.Choice[str],
         member: discord.Member,
         rate: app_commands.Range[float, 0.01, 100.0],
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            await set_override(session, current_guild_id(), "USER", member.id, direction.value, rate)
+            await set_override(session, current_guild_id(), "USER", member.id, "PAYOUT", rate)
         await interaction.followup.send(
-            f"**{member.display_name}**'s **{direction.name}** rate set to **{rate}**.", ephemeral=True
+            f"**{member.display_name}**'s payout multiplier set to **{rate}**.", ephemeral=True
         )
 
     @economy.command(
-        name="clear_role_rate", description="Remove a role's exchange-rate override"
+        name="clear_role_rate", description="Remove a role's payout multiplier"
     )
-    @app_commands.describe(direction="Which exchange to clear", role="Role to clear")
-    @app_commands.choices(direction=_RATE_DIRECTIONS)
+    @app_commands.describe(role="Role to clear")
     @is_admin()
     async def economy_clear_role_rate(
         self,
         interaction: discord.Interaction,
-        direction: app_commands.Choice[str],
         role: discord.Role,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            cleared = await clear_override(session, current_guild_id(), "ROLE", role.id, direction.value)
+            cleared = await clear_override(session, current_guild_id(), "ROLE", role.id, "PAYOUT")
         if not cleared:
             await interaction.followup.send(
-                f"**@{role.name}** has no **{direction.name}** override.", ephemeral=True
+                f"**@{role.name}** has no payout multiplier.", ephemeral=True
             )
             return
         await interaction.followup.send(
-            f"**@{role.name}**'s **{direction.name}** override cleared — back to the global rate.",
+            f"**@{role.name}**'s payout multiplier cleared — back to the global rate.",
             ephemeral=True,
         )
 
     @economy.command(
-        name="clear_user_rate", description="Remove a member's exchange-rate override"
+        name="clear_user_rate", description="Remove a member's payout multiplier"
     )
-    @app_commands.describe(direction="Which exchange to clear", member="Member to clear")
-    @app_commands.choices(direction=_RATE_DIRECTIONS)
+    @app_commands.describe(member="Member to clear")
     @is_admin()
     async def economy_clear_user_rate(
         self,
         interaction: discord.Interaction,
-        direction: app_commands.Choice[str],
         member: discord.Member,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
         async with get_session() as session:
-            cleared = await clear_override(session, current_guild_id(), "USER", member.id, direction.value)
+            cleared = await clear_override(session, current_guild_id(), "USER", member.id, "PAYOUT")
         if not cleared:
             await interaction.followup.send(
-                f"**{member.display_name}** has no **{direction.name}** override.", ephemeral=True
+                f"**{member.display_name}** has no payout multiplier.", ephemeral=True
             )
             return
         await interaction.followup.send(
-            f"**{member.display_name}**'s **{direction.name}** override cleared — back to the global rate.",
+            f"**{member.display_name}**'s payout multiplier cleared — back to the global rate.",
             ephemeral=True,
         )
 
     @economy.command(
-        name="view_rates", description="View the global exchange rates and all overrides"
+        name="view_rates", description="View the global exchange/payout rates and all overrides"
     )
     @is_admin()
     async def economy_view_rates(self, interaction: discord.Interaction) -> None:
@@ -12888,21 +13001,151 @@ class AdminCog(commands.Cog):
             return
         deposit_rate = await get_global_rate("DEPOSIT")
         withdraw_rate = await get_global_rate("WITHDRAW")
+        payout_rate = await get_global_rate("PAYOUT")
         async with get_read_session() as session:
             overrides = await list_overrides(session, current_guild_id())
 
-        embed = discord.Embed(title="Chip/Panar Exchange Rates", color=0x5B9BD5)
+        embed = discord.Embed(title="Exchange & Payout Rates", color=0x5B9BD5)
         embed.add_field(name="Global Deposit Rate", value=str(deposit_rate))
         embed.add_field(name="Global Withdraw Rate", value=str(withdraw_rate))
-        if overrides:
+        embed.add_field(name="Global Payout Rate", value=str(payout_rate))
+        payout_overrides = [o for o in overrides if o.direction == "PAYOUT"]
+        legacy = [o for o in overrides if o.direction != "PAYOUT"]
+        if payout_overrides:
             lines = []
-            for o in overrides:
+            for o in payout_overrides:
                 target = f"<@&{o.target_id}>" if o.scope == "ROLE" else f"<@{o.target_id}>"
-                lines.append(f"• {o.direction.title()} — {target}: **{o.rate}**")
-            embed.add_field(name="Overrides", value="\n".join(lines), inline=False)
+                lines.append(f"• {target}: **{o.rate}×**")
+            embed.add_field(name="Payout Multiplier Overrides", value="\n".join(lines), inline=False)
         else:
-            embed.add_field(name="Overrides", value="None set.", inline=False)
+            embed.add_field(name="Payout Multiplier Overrides", value="None set.", inline=False)
+        if legacy:
+            lines = []
+            for o in legacy:
+                target = f"<@&{o.target_id}>" if o.scope == "ROLE" else f"<@{o.target_id}>"
+                lines.append(f"• {o.direction.title()} — {target}: **{o.rate}** (inert)")
+            embed.add_field(
+                name="Legacy deposit/withdraw overrides (no longer applied)",
+                value="\n".join(lines), inline=False,
+            )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @economy.command(
+        name="house_cut",
+        description="View or set the global house cut taken from winnings",
+    )
+    @app_commands.describe(
+        pct="House cut percentage 0-100 taken from bet/parlay profit on a win — omit to view current",
+    )
+    @is_admin()
+    async def economy_house_cut(
+        self,
+        interaction: discord.Interaction,
+        pct: app_commands.Range[float, 0.0, 100.0] | None = None,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        if pct is None:
+            config = await load_house_cut_config()
+            total = await get_house_cut_total_taken()
+            await interaction.followup.send(
+                f"Global house cut: **{config.global_pct:.1f}%**. "
+                f"Total taken to date: **{fmt_chips(total)}**.",
+                ephemeral=True,
+            )
+            return
+        await set_house_cut_global(pct)
+        await interaction.followup.send(
+            f"Global house cut set to **{pct:.1f}%** of winnings.", ephemeral=True
+        )
+
+    @economy.command(
+        name="house_cut_type",
+        description="View, set, or clear the house cut for one market type",
+    )
+    @app_commands.describe(
+        market_type="Market type to configure",
+        pct="House cut percentage 0-100 for this market type — omit to view current",
+        clear="Remove this type's override and fall back to the global rate",
+    )
+    @app_commands.autocomplete(market_type=market_type_autocomplete)
+    @is_admin()
+    async def economy_house_cut_type(
+        self,
+        interaction: discord.Interaction,
+        market_type: str,
+        pct: app_commands.Range[float, 0.0, 100.0] | None = None,
+        clear: bool = False,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        if clear:
+            await set_house_cut_for_type(market_type, None)
+            await interaction.followup.send(
+                f"House cut override cleared for `{market_type}` — now uses the global rate.",
+                ephemeral=True,
+            )
+            return
+        if pct is None:
+            config = await load_house_cut_config()
+            current = config.by_type.get(market_type)
+            if current is None:
+                msg = f"`{market_type}` has no override — using the global rate of **{config.global_pct:.1f}%**."
+            else:
+                msg = f"`{market_type}` house cut override: **{current:.1f}%**."
+            await interaction.followup.send(msg, ephemeral=True)
+            return
+        await set_house_cut_for_type(market_type, pct)
+        await interaction.followup.send(
+            f"House cut for `{market_type}` set to **{pct:.1f}%**.", ephemeral=True
+        )
+
+    @economy.command(
+        name="house_cut_high_odds",
+        description="Extra house cut for bets/parlays paying above a given American odds threshold",
+    )
+    @app_commands.describe(
+        threshold="Odds threshold, e.g. 500 for +500 — winners paying above this get the higher rate",
+        pct="House cut percentage 0-100 applied when the threshold is exceeded",
+        disable="Turn off the high-odds surcharge entirely",
+    )
+    @is_admin()
+    async def economy_house_cut_high_odds(
+        self,
+        interaction: discord.Interaction,
+        threshold: app_commands.Range[int, 1, 999_900] | None = None,
+        pct: app_commands.Range[float, 0.0, 100.0] | None = None,
+        disable: bool = False,
+    ) -> None:
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        if disable:
+            await set_house_cut_high_odds_rule(None, 0.0)
+            await interaction.followup.send("High-odds house cut surcharge disabled.", ephemeral=True)
+            return
+        config = await load_house_cut_config()
+        if threshold is None and pct is None:
+            if config.high_odds_threshold is None:
+                await interaction.followup.send("No high-odds surcharge configured.", ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    f"Odds above **+{config.high_odds_threshold}** get a "
+                    f"**{config.high_odds_pct:.1f}%** house cut.",
+                    ephemeral=True,
+                )
+            return
+        new_threshold = threshold if threshold is not None else config.high_odds_threshold
+        new_pct = pct if pct is not None else config.high_odds_pct
+        if new_threshold is None:
+            await interaction.followup.send(
+                "Set a threshold before (or while) setting the rate.", ephemeral=True
+            )
+            return
+        await set_house_cut_high_odds_rule(new_threshold, new_pct)
+        await interaction.followup.send(
+            f"Odds above **+{new_threshold}** now get a **{new_pct:.1f}%** house cut.",
+            ephemeral=True,
+        )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -13025,6 +13268,29 @@ def _build_label(
         "EXACT_ALLIANCE_KILLS": f"{cause or 'Alliance'} Kills = {top_n or '?'}",
         "ALLIANCE_RUNNER_UP": f"{cause or 'Alliance'} Produces the Runner-Up",
     }.get(market_type, f"{a} — {market_type}")
+
+
+async def _relabel_tribute_markets(session, tribute_id: int) -> int:
+    """Rebuild Market.label for every market where ``tribute_id`` is tribute_a
+    or tribute_b. Labels are baked in as static text at creation time (see
+    _build_label) and won't pick up a name/district change on their own —
+    same idea as alliance_rename's relabel block, keyed on a tribute instead
+    of an alliance."""
+    result = await session.execute(
+        select(Market).where(
+            or_(Market.tribute_a_id == tribute_id, Market.tribute_b_id == tribute_id)
+        )
+    )
+    relabeled = 0
+    for mkt in result.scalars().all():
+        trib_a = await session.get(Tribute, mkt.tribute_a_id) if mkt.tribute_a_id else None
+        trib_b = await session.get(Tribute, mkt.tribute_b_id) if mkt.tribute_b_id else None
+        mkt.label = _build_label(
+            mkt.type, trib_a, trib_b, mkt.cause,
+            mkt.placement_num, mkt.top_n, mkt.ou_line, mkt.ou_side,
+        )
+        relabeled += 1
+    return relabeled
 
 
 def _ordinal(n: int) -> str:

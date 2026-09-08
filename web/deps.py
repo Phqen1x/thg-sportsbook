@@ -27,9 +27,18 @@ async def _session_or_none(request: Request) -> SessionUser | None:
     if u is not None and config.GUILD_ID and u.guild_id != config.GUILD_ID:
         return None
     if u is not None:
-        from bot.database.engine import get_tribute_lock, TRIBUTE_LOCK_MESSAGE
+        from bot.database.engine import get_tribute_lock, set_guild_context, TRIBUTE_LOCK_MESSAGE
         from web.database import set_request_guild, get_db
         set_request_guild(u.guild_id or 0)
+        # bot.database.engine keeps its own separate guild-context contextvar
+        # (used by get_setting/get_session, e.g. bot.utils.house_cut and
+        # .exchange_rates) — bind it here too, alongside set_request_guild(),
+        # so every website route gets it for free. Without this an unbound
+        # call raises a bare RuntimeError ("No guild context set"), which
+        # isn't an HTTPException and so surfaces as an unhandled 500 (see
+        # web/activity_auth.py's bearer_user() for the same fix on the
+        # Activity's auth path).
+        set_guild_context(u.guild_id or 0)
         async with get_db() as db:
             if await get_tribute_lock(db, u.guild_id or 0, u.discord_id) is not None:
                 raise HTTPException(status_code=403, detail=TRIBUTE_LOCK_MESSAGE)

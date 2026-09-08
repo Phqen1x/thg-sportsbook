@@ -636,6 +636,37 @@ async def _migrate_schema() -> None:
                 "UPDATE chip_requests SET converted_amount = amount WHERE converted_amount IS NULL"
             ))
 
+        # house_cut: chips skimmed from a WON bet/parlay's profit, frozen at
+        # settlement time (like payout_if_win/total_payout) so _unresolve_market
+        # can reverse exactly what was actually credited even if the house-cut
+        # settings change later.
+        rows = await conn.execute(text("PRAGMA table_info(bets)"))
+        if "house_cut" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE bets ADD COLUMN house_cut INTEGER NOT NULL DEFAULT 0"
+            ))
+        rows = await conn.execute(text("PRAGMA table_info(parlays)"))
+        if "house_cut" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN house_cut INTEGER NOT NULL DEFAULT 0"
+            ))
+
+        # payout_rate_at_placement: the PAYOUT-direction exchange-rate multiplier
+        # resolved for the bettor at submit time and frozen (like
+        # odds_at_placement) so an admin changing the rate can't retroactively
+        # alter a pending wager's payout. 1.0 = no boost; every pre-existing row
+        # was placed before the feature so 1.0 is the correct backfill.
+        rows = await conn.execute(text("PRAGMA table_info(bets)"))
+        if "payout_rate_at_placement" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE bets ADD COLUMN payout_rate_at_placement FLOAT NOT NULL DEFAULT 1.0"
+            ))
+        rows = await conn.execute(text("PRAGMA table_info(parlays)"))
+        if "payout_rate_at_placement" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE parlays ADD COLUMN payout_rate_at_placement FLOAT NOT NULL DEFAULT 1.0"
+            ))
+
 
 _BUILTIN_MARKET_TYPES = [
     ("TRIBUTE_WINS",            "Tribute Wins (Victor)",                "HARD",      "Tribute wins the entire Hunger Games and is declared Victor."),

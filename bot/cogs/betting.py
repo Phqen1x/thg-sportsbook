@@ -25,7 +25,7 @@ from bot.odds.calculator import (
     american_to_decimal, max_wager_for_cap,
 )
 from bot.utils.action_views import build_request_view, render_request_content
-from bot.utils.exchange_rates import effective_rate
+from bot.utils.exchange_rates import effective_rate, get_global_rate, member_role_ids
 from bot.utils.audit import post_bet_log
 from bot.utils.payout_caps import get_payout_cap
 from bot.utils.restrictions import is_fully_restricted, is_public_bet_blocked
@@ -81,6 +81,7 @@ async def _parlay_cap_error(wager: int, legs_odds: list[int]) -> str | None:
 
 
 _MAKES_MILESTONES = {"MAKES_FINAL_8", "MAKES_FINAL_5"}
+_MISS_MILESTONES = {"MISSES_FINAL_8", "MISSES_FINAL_5"}
 _ALL_MILESTONES = {
     "MAKES_FINAL_8", "MISSES_FINAL_8",
     "MAKES_FINAL_5", "MISSES_FINAL_5",
@@ -192,11 +193,11 @@ def _placement_conflict(existing_markets: list[Market], new_mkt: Market) -> str 
     """Return an error string if adding new_mkt would violate placement parlay rules.
 
     A tribute can only finish in one position, so two placement bets on the SAME
-    tribute conflict — the lone exception being an opposite over/under pair (e.g.
-    over 3rd AND under 12th, which together describe a finishing window). Across
-    DIFFERENT tributes placement bets are fine, except two bets that pin the same
-    exact position (two victors, or two tributes both finishing exactly Nth),
-    since only one tribute can occupy a given spot.
+    tribute conflict — including two placement over/under legs, which are just
+    two slices of that one finishing position. Across DIFFERENT tributes
+    placement bets are fine, except two bets that pin the same exact position
+    (two victors, or two tributes both finishing exactly Nth), since only one
+    tribute can occupy a given spot.
     """
     if new_mkt.type not in _PLACEMENT_TYPES:
         return None
@@ -207,21 +208,11 @@ def _placement_conflict(existing_markets: list[Market], new_mkt: Market) -> str 
             m.tribute_a_id is not None and m.tribute_a_id == new_mkt.tribute_a_id
         )
         if same_tribute:
-            # Opposite-side placement over/unders together describe a window and
-            # are the only allowed pairing on a single tribute.
-            if (
-                m.type == "PLACEMENT_OU"
-                and new_mkt.type == "PLACEMENT_OU"
-                and m.ou_side and new_mkt.ou_side
-                and m.ou_side != new_mkt.ou_side
-            ):
-                continue
             return (
                 "You can't parlay two placement bets on the same tribute — a "
                 "tribute only finishes in one position, so victor, exact "
                 "placement, top-N, and placement over/under bets all conflict "
-                "with each other. (The only exception is an opposite over/under "
-                "pair, e.g. over 3rd **and** under 12th.)"
+                "with each other."
             )
         ea, eb = _exact_placement(m), _exact_placement(new_mkt)
         if ea is not None and ea == eb:
@@ -231,6 +222,47 @@ def _placement_conflict(existing_markets: list[Market], new_mkt: Market) -> str 
                 f"You can't parlay two bets on a tribute finishing exactly "
                 f"{_ordinal(ea)} — only one tribute can take that position."
             )
+    return None
+
+
+def _kills_ou_conflict(existing_markets: list[Market], new_mkt: Market) -> str | None:
+    """Block parlaying two kills over/under legs on the same scope (tribute,
+    district, or alliance). Each scope ends the Games with one kill count, so
+    two over/under lines on it are just slices of that single number — the
+    legs never carry independent risk."""
+    if new_mkt.type == "KILLS_OU":
+        if new_mkt.tribute_a_id is None:
+            return None
+        for m in existing_markets:
+            if m.type == "KILLS_OU" and m.tribute_a_id == new_mkt.tribute_a_id:
+                return (
+                    "You can't parlay two kills over/under bets on the same "
+                    "tribute — a tribute finishes with one kill total, so the "
+                    "lines just carve up the same number."
+                )
+        return None
+    if new_mkt.type == "DISTRICT_KILLS_OU":
+        if new_mkt.placement_num is None:
+            return None
+        for m in existing_markets:
+            if m.type == "DISTRICT_KILLS_OU" and m.placement_num == new_mkt.placement_num:
+                return (
+                    "You can't parlay two kills over/under bets on the same "
+                    "district — the district finishes with one combined kill "
+                    "total, so the lines just carve up the same number."
+                )
+        return None
+    if new_mkt.type == "ALLIANCE_KILLS_OU":
+        if new_mkt.placement_num is None:
+            return None
+        for m in existing_markets:
+            if m.type == "ALLIANCE_KILLS_OU" and m.placement_num == new_mkt.placement_num:
+                return (
+                    "You can't parlay two kills over/under bets on the same "
+                    "alliance — the alliance finishes with one combined kill "
+                    "total, so the lines just carve up the same number."
+                )
+        return None
     return None
 
 
@@ -253,6 +285,14 @@ def _milestone_conflict(existing_markets: list[Market], new_mkt: Market) -> str 
         for m in same:
             if m.type in _MAKES_MILESTONES:
                 return "Cannot include two 'makes milestone' bets for the same tribute in one parlay."
+    if new_mkt.type in _MISS_MILESTONES:
+        for m in same:
+            if m.type in _MISS_MILESTONES:
+                return (
+                    "Cannot include two 'eliminated before final' bets for the same tribute "
+                    "in one parlay — going out before the Final 8 already means going out "
+                    "before the Final 5, so the legs aren't independent."
+                )
     return None
 
 
@@ -780,6 +820,7 @@ def _parlay_conflict(
     return (
         _milestone_conflict(existing_markets, new_mkt)
         or _placement_conflict(existing_markets, new_mkt)
+        or _kills_ou_conflict(existing_markets, new_mkt)
         or _placement_milestone_conflict(existing_markets, new_mkt)
         or _district_milestone_conflict(existing_markets, new_mkt)
         or _alliance_milestone_conflict(existing_markets, new_mkt)
@@ -1363,6 +1404,7 @@ async def _tail_submit(
     wager: int,
     tailed_from_user_id: int | None = None,
     tailed_from_parlay_id: int | None = None,
+    payout_rate: float = 1.0,
 ) -> tuple[str | None, dict | None]:
     """Build and commit a parlay from ``market_ids`` at current odds.
 
@@ -1398,6 +1440,7 @@ async def _tail_submit(
         user_id=user.discord_id,
         total_wager=wager,
         total_payout=total_payout,
+        payout_rate_at_placement=payout_rate,
         is_public=False,
         tailed_from_user_id=tailed_from_user_id,
         tailed_from_parlay_id=tailed_from_parlay_id,
@@ -1457,10 +1500,15 @@ class TailWagerModal(discord.ui.Modal, title="Tail this parlay"):
             return
         async with get_session() as session:
             user = await _get_or_create_user(session, interaction.user, current_guild_id())
+            payout_rate = await effective_rate(
+                session, user.guild_id,
+                user_id=user.discord_id, role_ids=member_role_ids(interaction.user),
+            )
             err, res = await _tail_submit(
                 session, user, self.entry["market_ids"], wager,
                 tailed_from_user_id=self.entry.get("owner_id"),
                 tailed_from_parlay_id=self.entry.get("source_parlay_id"),
+                payout_rate=payout_rate,
             )
             if err:
                 await interaction.followup.send(err, ephemeral=True)
@@ -1857,6 +1905,10 @@ class BettingCog(commands.Cog):
                 return
 
             payout = straight_payout(amount, mkt.odds)
+            payout_rate = await effective_rate(
+                session, user.guild_id,
+                user_id=user.discord_id, role_ids=member_role_ids(interaction.user),
+            )
             user.chips -= amount
             user.total_wagered += amount
 
@@ -1867,6 +1919,7 @@ class BettingCog(commands.Cog):
                 wager=amount,
                 odds_at_placement=mkt.odds,
                 payout_if_win=payout,
+                payout_rate_at_placement=payout_rate,
             )
             session.add(b)
             await session.flush()
@@ -2126,12 +2179,18 @@ class BettingCog(commands.Cog):
             downgraded = public and await is_public_bet_blocked(session, user.guild_id, user.discord_id, role_ids)
             public = public and not downgraded
 
+            payout_rate = await effective_rate(
+                session, user.guild_id,
+                user_id=user.discord_id, role_ids=member_role_ids(interaction.user),
+            )
+
             parlay = Parlay(
                 guild_id=user.guild_id,
                 user_id=user.discord_id,
                 name=name,
                 total_wager=wager,
                 total_payout=total_payout,
+                payout_rate_at_placement=payout_rate,
                 is_public=public,
             )
             session.add(parlay)
@@ -2410,7 +2469,7 @@ class BettingCog(commands.Cog):
                 )
                 return
 
-            rate = await effective_rate(session, user.guild_id, member, "WITHDRAW")
+            rate = await get_global_rate("WITHDRAW")
             panar_amount = round(amount * rate)
 
             user.chips -= amount
@@ -2470,7 +2529,7 @@ class BettingCog(commands.Cog):
             guild_id = user.guild_id
             blocked = await is_fully_restricted(session, guild_id, user.discord_id)
 
-            rate = await effective_rate(session, guild_id, member, "DEPOSIT")
+            rate = await get_global_rate("DEPOSIT")
             chip_amount = round(amount * rate)
 
             req = ChipRequest(

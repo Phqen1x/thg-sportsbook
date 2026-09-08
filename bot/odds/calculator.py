@@ -15,6 +15,13 @@ ODDS_TAU = 1000000.0
 # Internal probability clamp, far below the rail so the soft knee (not the
 # clamp) governs the tail. Symmetric so both extremes behave identically.
 _PROB_MIN = 0.00001
+# Hard ceiling on a single (non-parlay) bet's odds magnitude — no market,
+# including ALLIANCE_* and DISTRICT_* types, should ever price a straight bet
+# worse than 100-to-1. This is a business rule on top of the soft rail above,
+# not a replacement for it: prob_to_american's default `cap` enforces it for
+# every single-market call site, while combined_american (parlays) passes
+# cap=None so combined legs can still price beyond it, as expected.
+SINGLE_BET_ODDS_CAP = 9900.0
 # Parlays should be less extreme than a pure multiplication of independent legs.
 # This dampener gently reduces the combined probability for multi-leg slips 
 # (increasing the house edge/vig) in a more reasonable linear fashion.
@@ -42,13 +49,15 @@ def decimal_to_american(dec: float) -> int:
     return round(-100.0 / (dec - 1.0))
 
 
-def prob_to_american(prob: float) -> int:
+def prob_to_american(prob: float, cap: float | None = SINGLE_BET_ODDS_CAP) -> int:
     prob = max(_PROB_MIN, min(1.0 - _PROB_MIN, prob))
     if prob >= 0.5:
         raw = -(prob / (1.0 - prob)) * 100.0
     else:
         raw = ((1.0 - prob) / prob) * 100.0
     magnitude = _soft_rail(abs(raw))
+    if cap is not None:
+        magnitude = min(magnitude, cap)
     signed = -magnitude if raw < 0 else magnitude
     rounded = round(signed / 5.0) * 5
     return int(rounded)
@@ -64,7 +73,10 @@ def combined_american(legs_odds: list[int]) -> int:
     if not legs_odds:
         return 100
     combined_prob = parlay_combined_probability(legs_odds)
-    return prob_to_american(combined_prob)
+    # Parlays are explicitly exempt from SINGLE_BET_ODDS_CAP: combining several
+    # capped legs is expected to price beyond 100-to-1, so only the general
+    # soft rail (ODDS_RAIL) applies here.
+    return prob_to_american(combined_prob, cap=None)
 
 
 def straight_payout(wager: int, odds: int) -> int:

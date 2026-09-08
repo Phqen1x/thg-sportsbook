@@ -16,6 +16,7 @@ from bot.cogs.betting import (
 )
 from bot.database.models import Alliance, Bet, DistrictRecord, Market, Parlay, PendingParlayLeg, ParlayTemplate, ParlayTemplateLeg, Tribute, User
 from bot.utils.restrictions import is_fully_restricted, is_public_bet_blocked
+from bot.utils.exchange_rates import effective_rate
 from web.audit import post_bet_log
 from web.routes.public import _parlay_flavor
 from bot.odds.calculator import straight_payout, parlay_payout, combined_american, resolve_cashout
@@ -62,6 +63,17 @@ async def _parlay_cap_error_web(wager: int, odds_list: list[int]) -> str | None:
     set_guild_context(_GUILD_ID())
     err = await _parlay_cap_error(wager, odds_list)
     return err.replace("**", "") if err else None
+
+
+async def _payout_rate_web(db, user: SessionUser, role_ids=None) -> float:
+    """The bettor's frozen PAYOUT multiplier for a wager placed via the website.
+    Guild-context-bound (see _paused) so the global-rate fallback can read
+    settings through bot.database.engine."""
+    from bot.database.engine import set_guild_context
+    set_guild_context(_GUILD_ID())
+    if role_ids is None:
+        role_ids = await live_role_ids(user.discord_id, user.guild_id)
+    return await effective_rate(db, _GUILD_ID(), user_id=user.discord_id, role_ids=role_ids)
 
 
 async def _cashout_settings(db) -> tuple[bool, float, dict]:
@@ -356,6 +368,7 @@ async def place_bet(
             wager=wager,
             odds_at_placement=market.odds,
             payout_if_win=payout,
+            payout_rate_at_placement=await _payout_rate_web(db, user),
             status="PENDING",
         )
         db_user.chips -= wager
@@ -575,6 +588,7 @@ async def parlay_submit(
             user_id=user.discord_id,
             total_wager=wager,
             total_payout=total_payout,
+            payout_rate_at_placement=await _payout_rate_web(db, user, role_ids),
             status="PENDING",
             is_public=public,
         )
@@ -836,6 +850,7 @@ async def tail_parlay(
             user_id=user.discord_id,
             total_wager=wager,
             total_payout=total_payout,
+            payout_rate_at_placement=await _payout_rate_web(db, user),
             status="PENDING",
             is_public=False,
         )
@@ -912,6 +927,7 @@ async def tail_member_parlay(
             user_id=user.discord_id,
             total_wager=wager,
             total_payout=total_payout,
+            payout_rate_at_placement=await _payout_rate_web(db, user),
             status="PENDING",
             is_public=False,
         )
