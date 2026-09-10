@@ -5397,7 +5397,7 @@ class AdminCog(commands.Cog):
     )
     promo = app_commands.Group(
         name="promo",
-        description="Promotional claim drops (bonus bets / profit boosts)",
+        description="Promotional claim drops (Bonus Chips / profit boosts)",
         default_permissions=_ADMIN_PERMS,
     )
 
@@ -12039,21 +12039,21 @@ class AdminCog(commands.Cog):
 
     @promo.command(
         name="drop",
-        description="Post a claim message with a button that grants bonus bets or a profit boost",
+        description="Post a claim message with a button that grants Bonus Chips or a profit boost",
     )
     @app_commands.describe(
         channel="Channel to post the claim message in",
         reward="What pressing the button grants",
         message="The announcement body, shown inside the drop embed",
         role="Role to ping above the announcement embed (optional)",
-        bonus_amount="Bonus-bets drop: chips of bonus credit each claimer gets",
+        bonus_amount="Bonus Chips drop: chips of bonus credit each claimer gets",
         boost_template="Profit-boost drop: which boost template to hand out",
         max_claims="Stop accepting claims after this many people (blank = unlimited)",
         duration_hours="Deactivate the button this many hours after posting (blank = never)",
         reward_expiry_days="Expiry on the granted bonus/boost itself, in days (blank = permanent)",
     )
     @app_commands.choices(reward=[
-        app_commands.Choice(name="Bonus bets", value="bonus"),
+        app_commands.Choice(name="Bonus Chips", value="bonus"),
         app_commands.Choice(name="Profit boost", value="boost"),
     ])
     @app_commands.autocomplete(boost_template=boost_template_autocomplete)
@@ -12092,10 +12092,10 @@ class AdminCog(commands.Cog):
         if kind == "bonus":
             if not bonus_amount:
                 await interaction.followup.send(
-                    "Set `bonus_amount` for a bonus-bets drop.", ephemeral=True
+                    "Set `bonus_amount` for a Bonus Chips drop.", ephemeral=True
                 )
                 return
-            reward_label = f"{bonus_amount:,} bonus bets"
+            reward_label = f"{bonus_amount:,} Bonus Chips"
         else:
             if not boost_template or not str(boost_template).isdigit():
                 await interaction.followup.send(

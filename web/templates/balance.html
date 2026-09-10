@@ -12,7 +12,7 @@
     <div class="chip-count">{{ db_user.chips | fmt_chips }}</div>
     <div class="text-dim chip-label">chips</div>
     {% if bonus_balance %}
-    <div class="text-pos font-bold mt-1">{{ bonus_balance | fmt_chips }} bonus bets</div>
+    <div class="text-pos font-bold mt-1">{{ bonus_balance | fmt_chips }} Bonus Chips</div>
     <div class="text-dim" style="font-size:0.8rem">
       {% if bonus_expiry %}next expiry {{ bonus_expiry.strftime('%Y-%m-%d') }}{% else %}no expiry{% endif %}
     </div>

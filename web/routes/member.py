@@ -279,7 +279,7 @@ async def my_bets(
             if allowed:
                 parlay_cashout_preview[p.id] = amount
 
-        # Bonus-bet / profit-boost breakdown per bet & parlay (only where one
+        # Bonus Chip / profit-boost breakdown per bet & parlay (only where one
         # applies). "wager" is the total stake; the bonus slice never returns on
         # a win, so payouts here are net of it.
         bet_promo: dict[int, dict] = {}

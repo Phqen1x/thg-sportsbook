@@ -1896,8 +1896,8 @@ class BettingCog(commands.Cog):
         subject="Specific tribute/district/alliance to narrow further (optional)",
         market_type="Market category to narrow further (optional)",
         market_id="Market to bet on",
-        amount="Real chips to wager (optional if you apply bonus bets)",
-        bonus="Bonus-bet credit to stake on top of your chips (optional)",
+        amount="Real chips to wager (optional if you apply Bonus Chips)",
+        bonus="Bonus Chip credit to stake on top of your chips (optional)",
         boost="A profit boost you own to apply to this bet (optional)",
     )
     @app_commands.choices(subject_type=SUBJECT_TYPE_CHOICES)
@@ -2197,10 +2197,10 @@ class BettingCog(commands.Cog):
 
     @parlay_group.command(name="submit", description="Submit your parlay with a wager amount")
     @app_commands.describe(
-        wager="Real chips to wager on this parlay (optional if you apply bonus bets)",
+        wager="Real chips to wager on this parlay (optional if you apply Bonus Chips)",
         public="List this parlay on the tailing board for others to copy (default: yes)",
         name="Custom title shown on the tail board (default: \"{you}'s Parlay #{id}\")",
-        bonus="Bonus-bet credit to stake on top of your chips (optional)",
+        bonus="Bonus Chip credit to stake on top of your chips (optional)",
         boost="A profit boost you own to apply to this parlay (optional)",
     )
     @app_commands.autocomplete(boost=owned_boost_autocomplete)
@@ -2340,7 +2340,7 @@ class BettingCog(commands.Cog):
         else:
             listed = "🔒 Kept private — not listed for tailing."
         bonus_note = (
-            f"\n{fmt_chips(bonus_used)} of the stake was a bonus bet — a win pays winnings only."
+            f"\n{fmt_chips(bonus_used)} of the stake was Bonus Chips — a win pays winnings only."
             if bonus_used else ""
         )
         boost_note = (

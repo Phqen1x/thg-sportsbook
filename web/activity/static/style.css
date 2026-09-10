@@ -225,6 +225,16 @@ body {
   font-family: 'Barlow Semi Condensed', sans-serif; font-size: .9rem;
 }
 .input:focus { outline: none; border-color: var(--card-border); }
+.fund-toggle { display: flex; gap: .35rem; }
+.fund-toggle .fund-opt {
+  flex: 1; font-family: 'Barlow Semi Condensed', sans-serif; font-weight: 700;
+  font-size: .78rem; padding: .35rem .5rem; cursor: pointer;
+  background: var(--bg-mid); color: var(--text-dim);
+  border: 1px solid var(--divider); border-radius: var(--radius);
+}
+.fund-toggle .fund-opt.active {
+  background: var(--header-gold); color: var(--header-dark); border-color: var(--header-gold);
+}
 
 /* ── Modal ───────────────────────────────────────────────────────────────── */
 .modal-overlay {

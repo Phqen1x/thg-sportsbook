@@ -25,7 +25,7 @@ DEV_GUILD_ID: int | None = (
     int(os.environ["DEV_GUILD_ID"]) if os.environ.get("DEV_GUILD_ID") else None
 )
 
-# New members are seeded with bonus-bet credit (signup_bonus_bet_amount) instead
+# New members are seeded with Bonus Chip credit (signup_bonus_bet_amount) instead
 # of real chips, so the real-chip starting balance defaults to 0. Admins can
 # raise it from the settings UI / `/admin settings default_chips`.
 DEFAULT_CHIPS: int = int(os.environ.get("DEFAULT_CHIPS", "0"))

@@ -1,4 +1,4 @@
-"""Shared logic for the promotions system — bonus bets, profit boosts, and
+"""Shared logic for the promotions system — Bonus Chips, profit boosts, and
 deposit match. Imported by both the Discord bot cogs and the FastAPI web/Activity
 routes so all three betting surfaces (and all settlement surfaces) stay
 consistent.
@@ -28,7 +28,7 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
-# ── Bonus bets ───────────────────────────────────────────────────────────────
+# ── Bonus Chips ───────────────────────────────────────────────────────────────
 
 
 async def expire_stale(session, guild_id: int, user_id: int | None = None) -> None:
@@ -361,7 +361,7 @@ def claim_drop_reward_label(
 ) -> str:
     """Human "what you get" text for a claim drop, shared by every surface."""
     if (reward_kind or "").upper() == "BONUS":
-        return f"{int(bonus_amount or 0):,} bonus bets"
+        return f"{int(bonus_amount or 0):,} Bonus Chips"
     return (
         f"+{float(boost_pct or 0):g}% profit boost "
         f"({boost_scope_text(scope_type or 'ANY', scope_id)})"
@@ -470,7 +470,7 @@ async def claim_drop_redeem(
             session, drop.guild_id, [user_id], amount, exp_hours,
             source="CLAIM", grant_id=drop.id,
         )
-        reward_txt = f"{amount:,} bonus bets"
+        reward_txt = f"{amount:,} Bonus Chips"
         amount_or_pct = float(amount)
     else:
         tpl = await session.get(ProfitBoostTemplate, drop.boost_template_id or 0)
@@ -540,11 +540,11 @@ async def validate_wager_promos(
         bal = await bonus_balance(session, guild_id, user_id)
         if bonus_amount > bal:
             return None, (
-                f"You only have {bal:,} in bonus bets but tried to use {bonus_amount:,}."
+                f"You only have {bal:,} in Bonus Chips but tried to use {bonus_amount:,}."
             )
     total_stake = wager + bonus_amount
     if total_stake < 1:
-        return None, "Enter a wager, apply bonus bets, or both."
+        return None, "Enter a wager, apply Bonus Chips, or both."
     if current_chips < wager:
         return None, f"Insufficient chips. You have {current_chips:,} but need {wager:,}."
 
@@ -611,7 +611,7 @@ async def commit_wager_promos(
 
 
 async def apply_first_touch_grants(session, guild_id: int, user_id: int) -> None:
-    """Seed a just-created user with the signup bonus bet plus anything from
+    """Seed a just-created user with the signup Bonus Chips plus anything from
     FIRST_TOUCH bonus grants and first-touch profit-boost templates."""
     from bot.database.engine import get_setting
     import json
@@ -730,9 +730,9 @@ async def apply_deposit_match(
     member_role_ids: set[int] | None = None,
 ) -> int:
     """Record ``deposit_chips`` against the live promo (if any), grant the
-    matched amount to the member as a bonus-bet lot, and return that matched
+    matched amount to the member as a Bonus Chip lot, and return that matched
     amount (for the caller's confirmation message). The caller does NOT credit
-    real chips — the match is bonus bets only."""
+    real chips — the match is Bonus Chips only."""
     if deposit_chips <= 0:
         return 0
     promo = await active_deposit_promo(session, guild_id)
@@ -773,11 +773,11 @@ async def apply_deposit_match(
     return matched
 
 
-# ── Settlement rebate (bonus bets back on settled wagers) ────────────────────
+# ── Settlement rebate (Bonus Chips back on settled wagers) ────────────────────
 # A configurable perk: when a wager settles, give the member a slice of their
-# real-chip stake back as bonus bets — separate rates for wins and losses. Set
+# real-chip stake back as Bonus Chips — separate rates for wins and losses. Set
 # ``bonus_rebate_mode`` to OFF (default), PCT (% of the stake) or FLAT (a fixed
-# bonus-bet amount per settled wager).
+# Bonus Chip amount per settled wager).
 
 
 async def _rebate_settings() -> dict:
@@ -816,10 +816,10 @@ async def award_settle_rebate(
     session, guild_id: int, user_id: int, *, wager_placed: int, won: bool,
     bet_id: int | None = None, parlay_id: int | None = None,
 ) -> int:
-    """Grant the configured bonus-bet rebate for a wager that just settled to
+    """Grant the configured Bonus Chip rebate for a wager that just settled to
     WON (``won=True``) or LOST (``won=False``). ``wager_placed`` is the real
     chips the member risked (the bonus-funded slice is excluded). Returns the
-    bonus bets granted, or 0 when the perk is off / rounds to nothing."""
+    Bonus Chips granted, or 0 when the perk is off / rounds to nothing."""
     cfg = await _rebate_settings()
     if cfg["mode"] not in ("PCT", "FLAT"):
         return 0
@@ -859,7 +859,7 @@ async def revoke_settle_rebate(
     lot.status = "REVOKED"
 
 
-# ── Profit-boost shop (spend bonus bets on boost tokens) ─────────────────────
+# ── Profit-boost shop (spend Bonus Chips on boost tokens) ─────────────────────
 
 
 async def shop_listings(session, guild_id: int, *, active_only: bool = True):
@@ -895,7 +895,7 @@ async def _shop_purchase_count(session, guild_id: int, item_id: int, user_id: in
 async def purchase_boost(
     session, guild_id: int, user_id: int, item_id: int,
 ) -> tuple[dict | None, str | None]:
-    """Buy one shop listing: debit its bonus-bet price, grant the boost token,
+    """Buy one shop listing: debit its Bonus Chip price, grant the boost token,
     log the purchase. Returns ``({"message", "price", "token_id"}, None)`` or
     ``(None, error)``. The caller owns the transaction."""
     item = await session.get(BoostShopItem, item_id)
@@ -913,7 +913,7 @@ async def purchase_boost(
     bal = await bonus_balance(session, guild_id, user_id)
     if bal < item.price_bonus_bets:
         return None, (
-            f"Not enough bonus bets — this costs {item.price_bonus_bets:,}, "
+            f"Not enough Bonus Chips — this costs {item.price_bonus_bets:,}, "
             f"you have {bal:,}."
         )
 
@@ -932,6 +932,6 @@ async def purchase_boost(
     ))
     label = f"+{tpl.boost_pct:g}% profit boost ({boost_scope_text(tpl.scope_type, tpl.scope_id)})"
     return {
-        "message": f"Bought {label} for {item.price_bonus_bets:,} bonus bets.",
+        "message": f"Bought {label} for {item.price_bonus_bets:,} Bonus Chips.",
         "price": item.price_bonus_bets, "token_id": token.id,
     }, None

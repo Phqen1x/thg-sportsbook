@@ -41,7 +41,7 @@
     </div>
     {% if bonus_balance %}
     <div class="balance-row">
-      <span class="text-dim">Bonus bets</span>
+      <span class="text-dim">Bonus Chips</span>
       <span class="text-pos font-bold">{{ bonus_balance | fmt_chips }}</span>
     </div>
     {% endif %}
@@ -52,23 +52,28 @@
     </div>
     {% else %}
     <form method="post" action="/bet/{{ market.id }}" id="bet-form">
+      {% if bonus_balance %}
       <div class="form-group">
-        <label class="form-label" for="wager">Wager (chips){% if bonus_balance %} <span class="text-dim">(optional if you use bonus bets)</span>{% endif %}</label>
-        <input type="number" id="wager" name="wager" class="form-control" min="0" value="100" oninput="updatePayout()">
+        <label class="form-label">Pay with</label>
+        <div class="fund-toggle" id="fund-toggle">
+          <button type="button" class="fund-opt active" data-fund="chips" onclick="setFund('chips')">Chips ({{ db_user.chips | fmt_chips }})</button>
+          <button type="button" class="fund-opt" data-fund="bonus" onclick="setFund('bonus')">Bonus Chips ({{ bonus_balance | fmt_chips }})</button>
+        </div>
+      </div>
+      {% endif %}
+      <div class="form-group">
+        <label class="form-label" for="amount"><span id="amount-label">Wager (chips)</span></label>
+        <input type="number" id="amount" class="form-control" min="0" value="100" oninput="updatePayout()">
+        <input type="hidden" id="wager" name="wager" value="100">
+        <input type="hidden" id="bonus_amount" name="bonus_amount" value="0">
         <div class="quick-amounts">
           <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(100)">100</button>
           <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(500)">500</button>
           <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(1000)">1K</button>
           <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(5000)">5K</button>
-          <button type="button" class="btn btn-sm btn-ghost" onclick="setWager({{ db_user.chips }})">MAX</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="setWager(maxForFund())">MAX</button>
         </div>
       </div>
-      {% if bonus_balance %}
-      <div class="form-group">
-        <label class="form-label" for="bonus_amount">Bonus bets to stake <span class="text-dim">(max {{ bonus_balance | fmt_chips }} — staked on top of your wager; a win pays winnings only)</span></label>
-        <input type="number" id="bonus_amount" name="bonus_amount" class="form-control" min="0" max="{{ bonus_balance }}" value="0" oninput="updatePayout()">
-      </div>
-      {% endif %}
       {% if eligible_boosts %}
       <div class="form-group">
         <label class="form-label" for="profit_boost_token_id">Profit boost</label>
@@ -100,31 +105,47 @@
 {% block scripts %}
 <script>
 const odds = {{ market.odds }};
+const CHIPS_BAL = {{ db_user.chips }};
+const BONUS_BAL = {{ bonus_balance or 0 }};
+let fund = 'chips';
 
 function calcPayout(wager) {
   if (odds > 0) return Math.round(wager * (odds / 100 + 1));
   return Math.round(wager * (100 / Math.abs(odds) + 1));
 }
 
+function maxForFund() { return fund === 'bonus' ? BONUS_BAL : CHIPS_BAL; }
+
+function setFund(f) {
+  fund = f;
+  document.querySelectorAll('#fund-toggle .fund-opt').forEach(function (b) {
+    b.classList.toggle('active', b.dataset.fund === f);
+  });
+  const lbl = document.getElementById('amount-label');
+  if (lbl) lbl.textContent = f === 'bonus' ? 'Bonus Chips to stake' : 'Wager (chips)';
+  updatePayout();
+}
+
 function updatePayout() {
-  const w = parseInt(document.getElementById('wager').value) || 0;
-  const bonusEl = document.getElementById('bonus_amount');
-  const bonus = bonusEl ? (parseInt(bonusEl.value) || 0) : 0;
-  const stake = w + bonus;
-  let payout = calcPayout(stake);
+  const amt = parseInt(document.getElementById('amount').value) || 0;
+  const usingBonus = fund === 'bonus';
+  document.getElementById('wager').value = usingBonus ? 0 : amt;
+  document.getElementById('bonus_amount').value = usingBonus ? amt : 0;
+
+  let payout = calcPayout(amt);
   let pct = 0;
   const sel = document.getElementById('profit_boost_token_id');
   if (sel && sel.selectedOptions.length) pct = parseFloat(sel.selectedOptions[0].dataset.pct) || 0;
-  if (pct) payout = stake + Math.round((payout - stake) * (1 + pct / 100));
-  const shown = payout - bonus;   // bonus stake is not returned on a win
-  let txt = stake > 0 ? shown.toLocaleString() + ' chips' : '—';
-  if (stake > 0 && pct) txt += ' (+' + pct + '% boost)';
-  if (stake > 0 && bonus) txt += ' — winnings only, bonus stake not returned';
+  if (pct) payout = amt + Math.round((payout - amt) * (1 + pct / 100));
+  const shown = usingBonus ? payout - amt : payout;   // bonus stake is not returned on a win
+  let txt = amt > 0 ? shown.toLocaleString() + ' chips' : '—';
+  if (amt > 0 && pct) txt += ' (+' + pct + '% boost)';
+  if (amt > 0 && usingBonus) txt += ' — winnings only, bonus stake not returned';
   document.getElementById('payout-display').textContent = txt;
 }
 
 function setWager(n) {
-  document.getElementById('wager').value = n;
+  document.getElementById('amount').value = n;
   updatePayout();
 }
 

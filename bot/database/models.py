@@ -480,7 +480,7 @@ class PublicBetRestriction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
-# ── Promotions: bonus bets, profit boosts, deposit match ──────────────────────
+# ── Promotions: Bonus Chips, profit boosts, deposit match ──────────────────────
 
 
 class BonusBetLot(Base):
@@ -510,7 +510,7 @@ class BonusBetLot(Base):
 
 
 class BonusGrant(Base):
-    """Audit record of one admin bonus-bet grant action, and — for
+    """Audit record of one admin Bonus Chip grant action, and — for
     ``scope='FIRST_TOUCH'`` — a standing rule consulted when a brand-new user
     row is created. For ``scope='USER'`` the grant is materialised eagerly into
     a ``BonusBetLot`` row at grant time and this row is audit-only.
@@ -592,7 +592,7 @@ class ProfitBoostGrant(Base):
 
 class DepositMatchPromo(Base):
     """A time-boxed promotion: when a member's deposit is fulfilled during the
-    window, the sportsbook grants ``match_pct`` of it as *bonus bets*, capped per
+    window, the sportsbook grants ``match_pct`` of it as *Bonus Chips*, capped per
     member by ``max_match_per_user`` measured against cumulative matched chips."""
     __tablename__ = "deposit_match_promos"
 
@@ -601,7 +601,7 @@ class DepositMatchPromo(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     match_pct: Mapped[float] = mapped_column(Float, nullable=False, default=100.0)
     max_match_per_user: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Expiry applied to the granted bonus-bet lot (days). Null = permanent.
+    # Expiry applied to the granted Bonus Chip lot (days). Null = permanent.
     match_bonus_expiry_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     starts_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -631,7 +631,7 @@ class DepositMatchClaim(Base):
 class PromoClaimDrop(Base):
     """An admin-posted message in a channel carrying a "Claim" button. Any
     member who presses it (and isn't blocked from betting) is granted the
-    configured reward — a fixed bonus-bet amount or a profit-boost template —
+    configured reward — a fixed Bonus Chip amount or a profit-boost template —
     once. The button self-deactivates when ``max_claims`` redemptions have
     happened or ``expires_at`` passes."""
     __tablename__ = "promo_claim_drops"
@@ -676,8 +676,8 @@ class PromoClaimRedemption(Base):
 
 class BoostShopItem(Base):
     """A profit-boost template listed for sale in the Activity shop. Members
-    spend bonus bets to buy the boost token instead of wagering bonus credit
-    directly. Admins add/remove listings and set the bonus-bet price."""
+    spend Bonus Chips to buy the boost token instead of wagering bonus credit
+    directly. Admins add/remove listings and set the Bonus Chip price."""
     __tablename__ = "boost_shop_items"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

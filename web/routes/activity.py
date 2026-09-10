@@ -560,7 +560,7 @@ async def place_bet(
     profit_boost_token_id: Annotated[int | None, Body()] = None,
 ):
     if wager < 1 and bonus_amount < 1:
-        raise HTTPException(status_code=400, detail="Enter a wager or apply bonus bets.")
+        raise HTTPException(status_code=400, detail="Enter a wager or apply Bonus Chips.")
     if await _paused():
         raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
@@ -626,7 +626,7 @@ async def place_bet(
     asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "BET", [market_label], total_stake, net_if_win))
     msg = f"Bet placed! Win {net_if_win:,} chips if correct."
     if bonus_used:
-        msg = f"Bonus bet placed! Win {net_if_win:,} chips (winnings only — bonus stake not returned)."
+        msg = f"Bonus Chips bet placed! Win {net_if_win:,} chips (winnings only — bonus stake not returned)."
     return {"ok": True, "payout_if_win": net_if_win, "chips": chips_left, "message": msg}
 
 
@@ -789,7 +789,7 @@ async def parlay_submit(
     profit_boost_token_id: Annotated[int | None, Body()] = None,
 ):
     if wager < 1 and bonus_amount < 1:
-        raise HTTPException(status_code=400, detail="Enter a wager or apply bonus bets.")
+        raise HTTPException(status_code=400, detail="Enter a wager or apply Bonus Chips.")
     if await _paused():
         raise HTTPException(status_code=423, detail=BETTING_PAUSED_MSG)
 
@@ -869,7 +869,7 @@ async def parlay_submit(
     asyncio.create_task(post_bet_log(_GUILD_ID(), user.discord_id, "PARLAY", labels, total_stake, net_if_win))
     message = f"Parlay submitted! Potential payout: {net_if_win:,} chips."
     if bonus_used:
-        message += f" {bonus_used:,} staked as a bonus bet — winnings only on a win."
+        message += f" {bonus_used:,} staked as Bonus Chips — winnings only on a win."
     if downgraded:
         message += " Kept private — public posting is restricted for you."
     return {"ok": True, "total_payout": net_if_win, "chips": chips_left, "message": message}
@@ -2188,7 +2188,7 @@ async def my_boosts(market_id: int = 0, user: SessionUser = Depends(bearer_user)
 
 @router.get("/my-bonus-lots")
 async def my_bonus_lots(user: SessionUser = Depends(bearer_user)):
-    """Per-lot breakdown of the caller's bonus-bet balance (soonest expiry
+    """Per-lot breakdown of the caller's Bonus Chip balance (soonest expiry
     first), for the balance-screen drill-down."""
     _SRC_LABEL = {
         "SIGNUP": "Sign-up bonus", "GRANT_USER": "Admin grant", "ADMIN": "Admin grant",
@@ -2346,7 +2346,7 @@ async def admin_promos_claim_drop(
         if kind == "BONUS":
             if bonus_amount <= 0:
                 raise HTTPException(status_code=400, detail="Set a positive bonus amount.")
-            reward_label = f"{bonus_amount:,} bonus bets"
+            reward_label = f"{bonus_amount:,} Bonus Chips"
         else:
             tpl = await db.get(ProfitBoostTemplate, int(boost_template_id or 0))
             if tpl is None or tpl.guild_id != gid:
@@ -2455,8 +2455,8 @@ async def admin_promos_bonus_grant(
         n = await promos.grant_bonus_to_users(db, gid, ids, amount, hours, "GRANT_USER", grant_id=grant.id)
         grant.recipients_count = n
         await db.commit()
-    asyncio.create_task(post_admin_action(admin, "Bonus bets granted", {"scope": scope, "amount": f"{amount:,}", "recipients": str(n)}, source="Discord Activity"))
-    return {"ok": True, "message": f"Granted {amount:,} bonus bets to {n} member(s)."}
+    asyncio.create_task(post_admin_action(admin, "Bonus Chips granted", {"scope": scope, "amount": f"{amount:,}", "recipients": str(n)}, source="Discord Activity"))
+    return {"ok": True, "message": f"Granted {amount:,} Bonus Chips to {n} member(s)."}
 
 
 @router.post("/admin/promos/bonus/deduct")
@@ -2473,8 +2473,8 @@ async def admin_promos_bonus_deduct(
             raise HTTPException(status_code=400, detail=err)
         n = await promos.deduct_bonus_from_users(db, _GUILD_ID(), ids, amount if amount > 0 else 0)
         await db.commit()
-    asyncio.create_task(post_admin_action(admin, "Bonus bets deducted", {"scope": scope, "members": str(n)}, source="Discord Activity"))
-    return {"ok": True, "message": f"Deducted bonus bets from {n} member(s)."}
+    asyncio.create_task(post_admin_action(admin, "Bonus Chips deducted", {"scope": scope, "members": str(n)}, source="Discord Activity"))
+    return {"ok": True, "message": f"Deducted Bonus Chips from {n} member(s)."}
 
 
 @router.post("/admin/promos/bonus/user/{uid}/revoke")
@@ -2482,7 +2482,7 @@ async def admin_promos_bonus_user_revoke(uid: int, admin: SessionUser = Depends(
     async with get_db() as db:
         await promos.deduct_bonus_from_users(db, _GUILD_ID(), [uid], 0)
         await db.commit()
-    return {"ok": True, "message": "Revoked that member's bonus bets."}
+    return {"ok": True, "message": "Revoked that member's Bonus Chips."}
 
 
 @router.delete("/admin/promos/bonus/first-touch/{grant_id}")
@@ -2641,7 +2641,7 @@ async def admin_promos_deposit_match_delete(promo_id: int, admin: SessionUser = 
     return {"ok": True, "message": "Promo deleted."}
 
 
-# ── Bonus-bet rebate (admin config) ─────────────────────────────────────────
+# ── Bonus Chip rebate (admin config) ─────────────────────────────────────────
 
 _REBATE_KEYS = (
     "bonus_rebate_mode", "bonus_rebate_win_pct", "bonus_rebate_loss_pct",
@@ -2686,7 +2686,7 @@ async def admin_promos_rebate_save(
     await set_setting("bonus_rebate_loss_flat", max(0, int(loss_flat)))
     await set_setting("bonus_rebate_expiry_days", int(expiry_days) or None)
     asyncio.create_task(post_admin_action(
-        admin, "Bonus-bet rebate updated", {"mode": mode}, source="Discord Activity"
+        admin, "Bonus Chip rebate updated", {"mode": mode}, source="Discord Activity"
     ))
     return {"ok": True, "message": "Rebate settings saved."}
 
@@ -2771,7 +2771,7 @@ async def admin_shop_item_new(
     per_user_limit: Annotated[int, Body()] = 0,
 ):
     if price_bonus_bets <= 0:
-        raise HTTPException(status_code=400, detail="Set a positive bonus-bet price.")
+        raise HTTPException(status_code=400, detail="Set a positive Bonus Chip price.")
     async with get_db() as db:
         gid = _GUILD_ID()
         tpl = await db.get(ProfitBoostTemplate, int(boost_template_id or 0))

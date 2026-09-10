@@ -667,7 +667,7 @@ async def _migrate_schema() -> None:
                 "ALTER TABLE parlays ADD COLUMN payout_rate_at_placement FLOAT NOT NULL DEFAULT 1.0"
             ))
 
-        # Promotions: bonus-bet portion + frozen profit-boost fields on each
+        # Promotions: Bonus Chip portion + frozen profit-boost fields on each
         # wager row. bonus_bet_amount is the slice of `wager` funded from free
         # credit (its stake is never returned on a win); profit_boost_pct is the
         # boost frozen at placement and already baked into payout_if_win /
@@ -701,7 +701,7 @@ async def _migrate_schema() -> None:
                 "ALTER TABLE users ADD COLUMN bonus_won INTEGER NOT NULL DEFAULT 0"
             ))
 
-        # Deposit match now pays out as bonus bets with an optional expiry.
+        # Deposit match now pays out as Bonus Chips with an optional expiry.
         rows = await conn.execute(text("PRAGMA table_info(deposit_match_promos)"))
         if "match_bonus_expiry_days" not in {row[1] for row in rows.fetchall()}:
             await conn.execute(text(
@@ -799,7 +799,7 @@ async def _seed_defaults() -> None:
         "game_active": json.dumps(False),
         "betting_paused": json.dumps(False),
         "default_chips": json.dumps(config.DEFAULT_CHIPS),
-        # New members are seeded with bonus-bet credit instead of real chips.
+        # New members are seeded with Bonus Chip credit instead of real chips.
         "signup_bonus_bet_amount": json.dumps(2500),
         "signup_bonus_bet_expiry_hours": json.dumps(None),
         "current_phase_id": json.dumps(None),

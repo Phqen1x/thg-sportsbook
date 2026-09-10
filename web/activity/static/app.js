@@ -713,8 +713,11 @@ async function viewParlay(view) {
       </div>
       ${legs.length >= 2 ? `
         <div class="card parlay-submit">
-          <input id="parlay-wager" type="number" min="0" placeholder="${bonusBal ? "Wager in chips (optional with bonus bets)" : "Wager (chips)"}" class="input">
-          ${bonusBal ? `<input id="parlay-bonus" class="input" type="number" min="0" max="${bonusBal}" value="0" placeholder="Bonus bets to stake (max ${fmtChips(bonusBal)})">` : ""}
+          ${bonusBal ? `<div class="fund-toggle" id="parlay-fund">
+            <button type="button" class="fund-opt active" data-fund="chips">Chips</button>
+            <button type="button" class="fund-opt" data-fund="bonus">Bonus Chips</button>
+          </div>` : ""}
+          <input id="parlay-wager" type="number" min="0" placeholder="Wager (chips)" class="input">
           ${promoInfo.boosts.length ? `<select id="parlay-boost" class="input">
             <option value="">No profit boost</option>
             ${promoInfo.boosts.map((b) => `<option value="${b.id}">${esc(b.label)}</option>`).join("")}
@@ -736,39 +739,47 @@ async function viewParlay(view) {
   const feature = $("#parlay-feature", view);
   if (feature) feature.addEventListener("click", () => openFeatureParlayModal());
   const wagerEl = $("#parlay-wager", view);
-  const pBonusEl = $("#parlay-bonus", view);
+  const pFundEl = $("#parlay-fund", view);
   const pBoostEl = $("#parlay-boost", view);
+  let fund = "chips";
   if (wagerEl && data.combined_odds != null) {
     const recalc = () => {
-      const w = Number(wagerEl.value) || 0;
-      const bonus = pBonusEl ? (Number(pBonusEl.value) || 0) : 0;
-      const stake = w + bonus;
-      let payout = payoutForWager(stake, data.combined_odds);
+      const amt = Number(wagerEl.value) || 0;
+      const usingBonus = fund === "bonus";
+      let payout = payoutForWager(amt, data.combined_odds);
       let pct = 0;
       if (pBoostEl && pBoostEl.value) {
         const b = promoInfo.boosts.find((x) => String(x.id) === pBoostEl.value);
         if (b) pct = b.pct;
       }
       // client preview only — server applies the boost per matching leg
-      if (pct) payout = stake + Math.round((payout - stake) * (1 + pct / 100));
+      if (pct) payout = amt + Math.round((payout - amt) * (1 + pct / 100));
       payout = Math.min(payout, parlayPayoutCap());
-      const shown = payout - bonus;
-      $("#parlay-payout", view).textContent = stake
-        ? `Win ~${fmtChips(shown)} chips${pct ? ` (+${pct}% boost, applied to matching legs)` : ""}${bonus ? ` — winnings only, bonus stake not returned` : ""}`
+      const shown = usingBonus ? payout - amt : payout;
+      $("#parlay-payout", view).textContent = amt
+        ? `Win ~${fmtChips(shown)} chips${pct ? ` (+${pct}% boost, applied to matching legs)` : ""}${usingBonus ? ` — winnings only, bonus stake not returned` : ""}`
         : "";
     };
+    if (pFundEl) {
+      pFundEl.querySelectorAll(".fund-opt").forEach((b) => b.addEventListener("click", () => {
+        fund = b.dataset.fund;
+        pFundEl.querySelectorAll(".fund-opt").forEach((x) => x.classList.toggle("active", x === b));
+        wagerEl.placeholder = fund === "bonus" ? `Bonus Chips (max ${fmtChips(bonusBal)})` : "Wager (chips)";
+        recalc();
+      }));
+    }
     wagerEl.addEventListener("input", recalc);
-    if (pBonusEl) pBonusEl.addEventListener("input", recalc);
     if (pBoostEl) pBoostEl.addEventListener("change", recalc);
   }
   const go = $("#parlay-go", view);
   if (go) go.addEventListener("click", async () => {
-    const wager = Number($("#parlay-wager", view).value) || 0;
+    const amt = Number($("#parlay-wager", view).value) || 0;
     const is_public = $("#parlay-public", view).checked;
-    const bonusV = pBonusEl ? (Number(pBonusEl.value) || 0) : 0;
-    if (wager < 1 && bonusV < 1) return toast("Enter a wager or apply bonus bets.", "error");
-    const body = { wager, is_public };
-    if (bonusV > 0) body.bonus_amount = bonusV;
+    if (amt < 1) return toast(fund === "bonus" ? "Enter a Bonus Chips amount." : "Enter a wager.", "error");
+    if (fund === "bonus" && amt > bonusBal) return toast(`You only have ${fmtChips(bonusBal)} in Bonus Chips.`, "error");
+    const body = { is_public };
+    if (fund === "bonus") body.bonus_amount = amt;
+    else body.wager = amt;
     if (pBoostEl && pBoostEl.value) body.profit_boost_token_id = Number(pBoostEl.value);
     try {
       const r = await api("/parlay/submit", { method: "POST", body });
@@ -843,7 +854,7 @@ async function viewBalance(view) {
       <div class="card balance-chip-card">
         <div class="balance-chip-count">${fmtChips(meData.chips)}</div>
         <div class="dim">chips</div>
-        ${meData.bonus_bet_balance ? `<div class="odds-pos" id="bonus-toggle" role="button" tabindex="0" style="margin-top:6px;cursor:pointer;text-decoration:underline dotted">${fmtChips(meData.bonus_bet_balance)} bonus bets ▸</div>
+        ${meData.bonus_bet_balance ? `<div class="odds-pos" id="bonus-toggle" role="button" tabindex="0" style="margin-top:6px;cursor:pointer;text-decoration:underline dotted">${fmtChips(meData.bonus_bet_balance)} Bonus Chips ▸</div>
           <div class="dim" style="font-size:0.8rem">${meData.bonus_bet_next_expiry ? "next expiry " + meData.bonus_bet_next_expiry.slice(0, 10) : "no expiry"}</div>
           <div id="bonus-breakdown" hidden style="margin-top:8px;text-align:left"></div>` : ""}
       </div>
@@ -894,7 +905,7 @@ async function viewBalance(view) {
                 <span class="dim"> / ${fmtChips(l.original_amount)}</span> · ${esc(l.source)}
                 <div class="dim" style="font-size:0.8rem">${l.expires_at ? "expires " + l.expires_at.slice(0, 10) : "no expiry"}</div>
               </div>`).join("")
-            : `<div class="dim">No active bonus bets.</div>`;
+            : `<div class="dim">No active Bonus Chips.</div>`;
         } catch (e) {
           panel.innerHTML = `<div class="dim">${esc(e.message)}</div>`;
         }
@@ -902,7 +913,7 @@ async function viewBalance(view) {
       }
       const showing = !panel.hidden;
       panel.hidden = showing;
-      toggle.textContent = `${fmtChips(meData.bonus_bet_balance)} bonus bets ${showing ? "▸" : "▾"}`;
+      toggle.textContent = `${fmtChips(meData.bonus_bet_balance)} Bonus Chips ${showing ? "▸" : "▾"}`;
     };
     toggle.addEventListener("click", open);
     toggle.addEventListener("keydown", (ev) => {
@@ -927,14 +938,14 @@ async function viewShop(view) {
     view.innerHTML = `
       <h2 class="section-title">Profit Boost Shop</h2>
       <div class="card" style="display:flex;justify-content:space-between;align-items:center">
-        <span class="dim">Spend bonus bets on single-use profit boosts.</span>
-        <span class="odds-pos">${fmtChips(data.bonus_balance)} bonus bets</span>
+        <span class="dim">Spend Bonus Chips on single-use profit boosts.</span>
+        <span class="odds-pos">${fmtChips(data.bonus_balance)} Bonus Chips</span>
       </div>
       <div class="list" style="margin-top:.6rem">
         ${data.items.length ? data.items.map((it) => {
           const disabled = it.sold_out || !it.affordable;
           const note = it.sold_out ? "Purchase limit reached"
-            : !it.affordable ? "Not enough bonus bets" : "";
+            : !it.affordable ? "Not enough Bonus Chips" : "";
           return `<div class="card bet-row" style="display:block">
             <div style="display:flex;justify-content:space-between;gap:.5rem">
               <div>
@@ -1049,7 +1060,7 @@ async function adminPromos(body) {
       ${channelField}
       ${roleField}
       <select id="cd-kind" class="input">
-        <option value="BONUS">Bonus bets</option>
+        <option value="BONUS">Bonus Chips</option>
         <option value="BOOST">Profit boost</option>
       </select>
       <input id="cd-amount" class="input" type="number" min="1" value="2500" placeholder="Bonus amount (chips)">
@@ -1069,7 +1080,7 @@ async function adminPromos(body) {
     </div>
 
     <div class="card admin-form">
-      <div class="card-label">GRANT BONUS BETS</div>
+      <div class="card-label">GRANT BONUS CHIPS</div>
       <div class="dim" style="width:100%">Free credit in chips. A win pays winnings only; a loss costs nothing; no cash value. To reach a role or the whole server, use <code>/promo drop</code> in Discord.</div>
       ${scopeSel("bg-scope")}
       <input id="bg-target" class="input" placeholder="Discord user ID (blank for first-interaction)">
@@ -1081,7 +1092,7 @@ async function adminPromos(body) {
     </div>
 
     <div class="card admin-form">
-      <div class="card-label">DEDUCT BONUS BETS</div>
+      <div class="card-label">DEDUCT BONUS CHIPS</div>
       <select id="bd-scope" class="input"><option value="USER">A user</option></select>
       <input id="bd-target" class="input" placeholder="Discord user ID">
       <input id="bd-amount" class="input" type="number" min="1" placeholder="Amount (blank = wipe balance)">
@@ -1101,7 +1112,7 @@ async function adminPromos(body) {
       ${data.bonus_users.length ? data.bonus_users.map((e) => `<div class="list-row">
         <span>${esc(e.name)} <span class="dim">${e.uid}</span> — <span class="odds-pos">${fmtChips(e.total)}</span>${e.expiry ? ` <span class="dim">exp ${e.expiry.slice(0, 16).replace("T", " ")}</span>` : ""}</span>
         <button class="btn btn-sm btn-danger" data-act="bu-revoke" data-id="${e.uid}">Revoke all</button>
-      </div>`).join("") : `<div class="dim">No outstanding bonus bets.</div>`}
+      </div>`).join("") : `<div class="dim">No outstanding Bonus Chips.</div>`}
     </div>
 
     <div class="card admin-form">
@@ -1153,11 +1164,11 @@ async function adminPromos(body) {
 
     <div class="card admin-form">
       <div class="card-label">NEW DEPOSIT MATCH PROMO</div>
-      <div class="dim" style="width:100%">On "Mark Done" of a member's /deposit during the window, grant the match % as bonus bets, up to the per-member cap (cumulative).</div>
+      <div class="dim" style="width:100%">On "Mark Done" of a member's /deposit during the window, grant the match % as Bonus Chips, up to the per-member cap (cumulative).</div>
       <input id="dm-name" class="input" placeholder="Name">
       <input id="dm-pct" class="input" type="number" min="1" value="100" placeholder="Match %">
-      <input id="dm-cap" class="input" type="number" min="1" value="5000" placeholder="Max match per member (bonus bets)">
-      <input id="dm-bexp" class="input" type="number" min="1" placeholder="Matched bonus bets expire after N days (blank = permanent)">
+      <input id="dm-cap" class="input" type="number" min="1" value="5000" placeholder="Max match per member (Bonus Chips)">
+      <input id="dm-bexp" class="input" type="number" min="1" placeholder="Matched Bonus Chips expire after N days (blank = permanent)">
       <input id="dm-start" class="input" type="datetime-local" placeholder="Starts (blank = now)">
       <input id="dm-end" class="input" type="datetime-local" placeholder="Ends">
       <input id="dm-role" class="input" placeholder="Restrict to role ID (optional)">
@@ -1167,7 +1178,7 @@ async function adminPromos(body) {
     <div class="card">
       <div class="card-label">DEPOSIT MATCH PROMOS</div>
       ${data.deposit_promos.length ? data.deposit_promos.map((p) => `<div class="list-row">
-        <span>${esc(p.name)} ${p.live ? "<span class='odds-pos'>● live</span>" : ""} — ${p.match_pct}% up to ${fmtChips(p.max_match_per_user)} in bonus bets · <span class="dim">${p.match_bonus_expiry_days ? `${p.match_bonus_expiry_days}d expiry · ` : ""}${fmtDt(p.starts_at)} → ${fmtDt(p.ends_at)}${p.role_id ? ` · role ${p.role_id}` : ""} · ${p.claims.members} claim(s), ${fmtChips(p.claims.matched)} matched</span></span>
+        <span>${esc(p.name)} ${p.live ? "<span class='odds-pos'>● live</span>" : ""} — ${p.match_pct}% up to ${fmtChips(p.max_match_per_user)} in Bonus Chips · <span class="dim">${p.match_bonus_expiry_days ? `${p.match_bonus_expiry_days}d expiry · ` : ""}${fmtDt(p.starts_at)} → ${fmtDt(p.ends_at)}${p.role_id ? ` · role ${p.role_id}` : ""} · ${p.claims.members} claim(s), ${fmtChips(p.claims.matched)} matched</span></span>
         <span>
           ${p.live ? `<button class="btn btn-sm" data-act="dm-end" data-id="${p.id}">End now</button>` : ""}
           <button class="btn btn-sm btn-danger" data-act="dm-del" data-id="${p.id}">Delete</button>
@@ -1175,35 +1186,35 @@ async function adminPromos(body) {
       </div>`).join("") : `<div class="dim">No promos.</div>`}
     </div>
 
-    <div class="section-title">Bonus Bet Rebate</div>
+    <div class="section-title">Bonus Chip Rebate</div>
     <div class="card admin-form">
-      <div class="card-label">BONUS BETS BACK ON SETTLED WAGERS</div>
-      <div class="dim" style="width:100%">Give members a % of their real-chip stake (or a flat amount) back as bonus bets when a bet or parlay settles — separate rates for wins and losses.</div>
+      <div class="card-label">BONUS CHIPS BACK ON SETTLED WAGERS</div>
+      <div class="dim" style="width:100%">Give members a % of their real-chip stake (or a flat amount) back as Bonus Chips when a bet or parlay settles — separate rates for wins and losses.</div>
       <select id="rb-mode" class="input">
         <option value="OFF">Off</option>
         <option value="PCT">% of wager placed</option>
-        <option value="FLAT">Flat bonus bets per settled wager</option>
+        <option value="FLAT">Flat Bonus Chips per settled wager</option>
       </select>
       <div id="rb-pct" style="display:flex;gap:.5rem;width:100%">
         <input id="rb-winpct" class="input" type="number" min="0" max="100" step="0.5" placeholder="Win %">
         <input id="rb-losspct" class="input" type="number" min="0" max="100" step="0.5" placeholder="Loss %">
       </div>
       <div id="rb-flat" style="display:none;gap:.5rem;width:100%">
-        <input id="rb-winflat" class="input" type="number" min="0" placeholder="Win — bonus bets">
-        <input id="rb-lossflat" class="input" type="number" min="0" placeholder="Loss — bonus bets">
+        <input id="rb-winflat" class="input" type="number" min="0" placeholder="Win — Bonus Chips">
+        <input id="rb-lossflat" class="input" type="number" min="0" placeholder="Loss — Bonus Chips">
       </div>
-      <input id="rb-exp" class="input" type="number" min="1" placeholder="Rebate bonus bets expire after N days (blank = permanent)">
+      <input id="rb-exp" class="input" type="number" min="1" placeholder="Rebate Bonus Chips expire after N days (blank = permanent)">
       <button class="btn btn-primary" id="rb-go">Save Rebate</button>
     </div>
 
     <div class="section-title">Profit Boost Shop</div>
     <div class="card admin-form">
       <div class="card-label">ADD SHOP ITEM</div>
-      <div class="dim" style="width:100%">List a boost template for members to buy with bonus bets in the Shop tab.</div>
+      <div class="dim" style="width:100%">List a boost template for members to buy with Bonus Chips in the Shop tab.</div>
       <select id="si-tpl" class="input">
         ${data.templates.map((t) => `<option value="${t.id}">${esc(t.name)} (+${t.boost_pct}%, ${t.scope_type})</option>`).join("")}
       </select>
-      <input id="si-price" class="input" type="number" min="1" placeholder="Price (bonus bets)">
+      <input id="si-price" class="input" type="number" min="1" placeholder="Price (Bonus Chips)">
       <input id="si-exp" class="input" type="number" min="1" placeholder="Token expires after N days (blank = permanent)">
       <input id="si-limit" class="input" type="number" min="1" placeholder="Per-member purchase limit (blank = unlimited)">
       <button class="btn btn-primary" id="si-go">Add Item</button>
@@ -1265,7 +1276,7 @@ async function adminPromos(body) {
     return "role";
   };
   const cdRewardLabel = () => {
-    if (cdKind.value === "BONUS") return `${fmtChips(num("cd-amount"))} bonus bets`;
+    if (cdKind.value === "BONUS") return `${fmtChips(num("cd-amount"))} Bonus Chips`;
     const t = data.templates.find((x) => String(x.id) === $("#cd-tpl", body).value);
     if (!t) return "a profit boost";
     const scope = t.scope_type === "DISTRICT" ? `District ${t.scope_id}`
@@ -1346,7 +1357,7 @@ async function adminPromos(body) {
       starts_at: isoUtc("dm-start"), ends_at: isoUtc("dm-end"), role_id: val("dm-role") },
   }));
 
-  // Bonus-bet rebate config
+  // Bonus Chip rebate config
   const rb = data.rebate || {};
   $("#rb-mode", body).value = rb.bonus_rebate_mode || "OFF";
   const setRbVal = (id, v) => { if (v != null) $("#" + id, body).value = v; };
@@ -2006,8 +2017,11 @@ async function openBetModal(marketId) {
   const overlay = modal(`
     <h3>${esc(m.label)}</h3>
     <div class="dim">Odds <span class="${oddsClass(m.odds)}">${fmtOdds(m.odds)}</span> · Balance ${fmtChips(ME.chips)}${bonusBal ? ` · Bonus ${fmtChips(bonusBal)}` : ""}</div>
-    <input id="bet-wager" class="input" type="number" min="0" placeholder="${bonusBal ? "Wager in chips (optional with bonus bets)" : "Wager (chips)"}">
-    ${bonusBal ? `<input id="bet-bonus" class="input" type="number" min="0" max="${bonusBal}" value="0" placeholder="Bonus bets to stake (max ${fmtChips(bonusBal)})">` : ""}
+    ${bonusBal ? `<div class="fund-toggle" id="bet-fund">
+      <button type="button" class="fund-opt active" data-fund="chips">Chips</button>
+      <button type="button" class="fund-opt" data-fund="bonus">Bonus Chips</button>
+    </div>` : ""}
+    <input id="bet-wager" class="input" type="number" min="0" placeholder="Wager (chips)">
     ${promoInfo.boosts.length ? `<select id="bet-boost" class="input">
       <option value="">No profit boost</option>
       ${promoInfo.boosts.map((b) => `<option value="${b.id}">${esc(b.label)}${b.max_wager ? ` (max ${fmtChips(b.max_wager)})` : ""}</option>`).join("")}
@@ -2018,35 +2032,43 @@ async function openBetModal(marketId) {
       <button class="btn btn-outline" id="bet-cancel">Cancel</button>
     </div>`);
   const wagerEl = $("#bet-wager", overlay);
-  const bonusEl = $("#bet-bonus", overlay);
   const boostEl = $("#bet-boost", overlay);
+  const fundEl = $("#bet-fund", overlay);
+  let fund = "chips";
   const recalc = () => {
-    const w = Number(wagerEl.value) || 0;
-    const bonus = bonusEl ? (Number(bonusEl.value) || 0) : 0;
-    const stake = w + bonus;
-    let payout = payoutForWager(stake, m.odds);
+    const amt = Number(wagerEl.value) || 0;
+    const usingBonus = fund === "bonus";
+    let payout = payoutForWager(amt, m.odds);
     let pct = 0;
     if (boostEl && boostEl.value) {
       const b = promoInfo.boosts.find((x) => String(x.id) === boostEl.value);
       if (b) pct = b.pct;
     }
-    if (pct) payout = stake + Math.round((payout - stake) * (1 + pct / 100));
+    if (pct) payout = amt + Math.round((payout - amt) * (1 + pct / 100));
     payout = Math.min(payout, singlePayoutCap());
-    const shown = payout - bonus;
-    $("#bet-payout", overlay).textContent = stake
-      ? `Win ${fmtChips(shown)} chips${pct ? ` (+${pct}% boost)` : ""}${bonus ? ` — winnings only, bonus stake not returned` : ""}`
+    const shown = usingBonus ? payout - amt : payout;
+    $("#bet-payout", overlay).textContent = amt
+      ? `Win ${fmtChips(shown)} chips${pct ? ` (+${pct}% boost)` : ""}${usingBonus ? ` — winnings only, bonus stake not returned` : ""}`
       : "";
   };
+  if (fundEl) {
+    fundEl.querySelectorAll(".fund-opt").forEach((b) => b.addEventListener("click", () => {
+      fund = b.dataset.fund;
+      fundEl.querySelectorAll(".fund-opt").forEach((x) => x.classList.toggle("active", x === b));
+      wagerEl.placeholder = fund === "bonus" ? `Bonus Chips (max ${fmtChips(bonusBal)})` : "Wager (chips)";
+      recalc();
+    }));
+  }
   wagerEl.addEventListener("input", recalc);
-  if (bonusEl) bonusEl.addEventListener("input", recalc);
   if (boostEl) boostEl.addEventListener("change", recalc);
   $("#bet-cancel", overlay).addEventListener("click", () => overlay.remove());
   $("#bet-go", overlay).addEventListener("click", async () => {
-    const wager = Number(wagerEl.value) || 0;
-    const bonusV = bonusEl ? (Number(bonusEl.value) || 0) : 0;
-    if (wager < 1 && bonusV < 1) return toast("Enter a wager or apply bonus bets.", "error");
-    const body = { market_id: marketId, wager };
-    if (bonusV > 0) body.bonus_amount = bonusV;
+    const amt = Number(wagerEl.value) || 0;
+    if (amt < 1) return toast(fund === "bonus" ? "Enter a Bonus Chips amount." : "Enter a wager.", "error");
+    if (fund === "bonus" && amt > bonusBal) return toast(`You only have ${fmtChips(bonusBal)} in Bonus Chips.`, "error");
+    const body = { market_id: marketId };
+    if (fund === "bonus") body.bonus_amount = amt;
+    else body.wager = amt;
     if (boostEl && boostEl.value) body.profit_boost_token_id = Number(boostEl.value);
     try {
       const r = await api("/bet", { method: "POST", body });

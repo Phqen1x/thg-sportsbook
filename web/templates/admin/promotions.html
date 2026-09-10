@@ -7,19 +7,19 @@
 </div>
 
 <p class="text-dim">
-  Bonus bets are free credit (in chips): a win pays winnings only, a loss costs nothing,
-  they have no cash value and can't be withdrawn. New members are seeded with bonus bets
+  Bonus Chips are free credit (in chips): a win pays winnings only, a loss costs nothing,
+  they have no cash value and can't be withdrawn. New members are seeded with Bonus Chips
   instead of real chips (amount set by <code>signup_bonus_bet_amount</code> in Settings).
   Grants here go to one member at a time or to every new member on first interaction. To
   hand a reward to a role or the whole server, post a claim drop with
   <code>/promo drop</code> in Discord.
 </p>
 
-<!-- ── Bonus bets ─────────────────────────────────────────────────────────── -->
-<div class="section-header mt-3"><h2>Bonus Bets</h2></div>
+<!-- ── Bonus Chips ─────────────────────────────────────────────────────────── -->
+<div class="section-header mt-3"><h2>Bonus Chips</h2></div>
 
 <div class="card">
-  <div class="card-label">GRANT BONUS BETS</div>
+  <div class="card-label">GRANT BONUS CHIPS</div>
   <form method="post" action="/admin/promotions/bonus/grant">
     <div class="form-group">
       <label class="form-label">Target</label>
@@ -52,8 +52,8 @@
 </div>
 
 <div class="card mt-3">
-  <div class="card-label">DEDUCT BONUS BETS</div>
-  <form method="post" action="/admin/promotions/bonus/deduct" onsubmit="return confirm('Deduct bonus bets now?')">
+  <div class="card-label">DEDUCT BONUS CHIPS</div>
+  <form method="post" action="/admin/promotions/bonus/deduct" onsubmit="return confirm('Deduct Bonus Chips now?')">
     <div class="form-group">
       <label class="form-label">Target</label>
       <select name="scope" class="form-control">
@@ -112,7 +112,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="4" class="text-dim text-center">No outstanding bonus bets.</td></tr>
+      <tr><td colspan="4" class="text-dim text-center">No outstanding Bonus Chips.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -232,10 +232,10 @@
   </table>
 </div>
 
-<!-- ── Bonus bet rebate ─────────────────────────────────────────────────── -->
-<div class="section-header mt-3"><h2>Bonus Bet Rebate</h2></div>
+<!-- ── Bonus Chip rebate ────────────────────────────────────────────────── -->
+<div class="section-header mt-3"><h2>Bonus Chip Rebate</h2></div>
 <p class="text-dim">
-  Give members a slice of their real-chip stake back as bonus bets when a bet or
+  Give members a slice of their real-chip stake back as Bonus Chips when a bet or
   parlay settles. Separate rates for wins and losses; set the mode to <em>Off</em>
   to disable. Reversed automatically if a resolution is undone.
 </p>
@@ -247,7 +247,7 @@
       <select name="mode" class="form-control" id="rb-mode">
         <option value="OFF" {{ "selected" if rebate.mode == "OFF" }}>Off</option>
         <option value="PCT" {{ "selected" if rebate.mode == "PCT" }}>% of wager placed</option>
-        <option value="FLAT" {{ "selected" if rebate.mode == "FLAT" }}>Flat bonus bets per settled wager</option>
+        <option value="FLAT" {{ "selected" if rebate.mode == "FLAT" }}>Flat Bonus Chips per settled wager</option>
       </select>
     </div>
     <div class="form-group rb-pct">
@@ -258,14 +258,14 @@
       </div>
     </div>
     <div class="form-group rb-flat">
-      <label class="form-label">Win / Loss (bonus bets)</label>
+      <label class="form-label">Win / Loss (Bonus Chips)</label>
       <div style="display:flex;gap:8px">
         <input type="number" name="win_flat" class="form-control" min="0" value="{{ rebate.win_flat }}" placeholder="win amount">
         <input type="number" name="loss_flat" class="form-control" min="0" value="{{ rebate.loss_flat }}" placeholder="loss amount">
       </div>
     </div>
     <div class="form-group">
-      <label class="form-label">Rebate bonus bets expire after <span class="text-dim">(days — blank = permanent)</span></label>
+      <label class="form-label">Rebate Bonus Chips expire after <span class="text-dim">(days — blank = permanent)</span></label>
       <input type="number" name="expiry_days" class="form-control" min="1" value="{{ rebate.expiry_days }}">
     </div>
     <button type="submit" class="btn btn-primary">Save Rebate</button>
@@ -290,7 +290,7 @@
 <div class="section-header mt-3"><h2>Deposit Match</h2></div>
 <p class="text-dim">
   When an admin marks a member's <code>/deposit</code> request <em>Done</em> during the
-  window, the sportsbook grants the match % of that deposit as <strong>bonus bets</strong>,
+  window, the sportsbook grants the match % of that deposit as <strong>Bonus Chips</strong>,
   up to the per-member cap (measured against cumulative matched chips so it can't be
   farmed).
 </p>
@@ -300,8 +300,8 @@
   <form method="post" action="/admin/promotions/deposit-match/new" id="dm-new-form">
     <div class="form-group"><label class="form-label">Name</label><input type="text" name="name" class="form-control" required maxlength="100"></div>
     <div class="form-group"><label class="form-label">Match %</label><input type="number" name="match_pct" class="form-control" step="1" min="1" value="100" required></div>
-    <div class="form-group"><label class="form-label">Max match per member (bonus bets)</label><input type="number" name="max_match_per_user" class="form-control" min="1" value="5000" required></div>
-    <div class="form-group"><label class="form-label">Matched bonus bets expire after <span class="text-dim">(days — blank/0 = permanent)</span></label><input type="number" name="match_bonus_expiry_days" class="form-control" min="0" value="0"></div>
+    <div class="form-group"><label class="form-label">Max match per member (Bonus Chips)</label><input type="number" name="max_match_per_user" class="form-control" min="1" value="5000" required></div>
+    <div class="form-group"><label class="form-label">Matched Bonus Chips expire after <span class="text-dim">(days — blank/0 = permanent)</span></label><input type="number" name="match_bonus_expiry_days" class="form-control" min="0" value="0"></div>
     <div class="form-group"><label class="form-label">Starts <span class="text-dim">(blank = now, your local time)</span></label><input type="datetime-local" id="dm-starts" class="form-control"></div>
     <div class="form-group"><label class="form-label">Ends <span class="text-dim">(your local time)</span></label><input type="datetime-local" id="dm-ends" class="form-control" required></div>
     <div class="form-group"><label class="form-label">Restrict to role ID <span class="text-dim">(optional — blank = everyone)</span></label><input type="text" name="role_id" class="form-control"></div>

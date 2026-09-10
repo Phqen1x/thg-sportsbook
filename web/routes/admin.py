@@ -1200,7 +1200,7 @@ async def parlay_template_delete(tpl_id: int, user: SessionUser = Depends(requir
     return _redirect("/admin/parlays", msg="Template+deleted.")
 
 
-# ── Promotions (bonus bets / profit boosts / deposit match) ────────────────────
+# ── Promotions (Bonus Chips / profit boosts / deposit match) ────────────────────
 
 
 def _parse_expiry_hours(days: int, hours: int) -> int | None:
@@ -1346,7 +1346,7 @@ async def promotions_rebate_save(
         await upsert("bonus_rebate_loss_flat", max(0, int(loss_flat)))
         await upsert("bonus_rebate_expiry_days", exp)
         await db.commit()
-    asyncio.create_task(post_admin_action(user, "Bonus-bet rebate updated", {"mode": mode}))
+    asyncio.create_task(post_admin_action(user, "Bonus Chip rebate updated", {"mode": mode}))
     return _redirect("/admin/promotions", msg="Rebate+settings+saved.")
 
 
@@ -1384,7 +1384,7 @@ async def promotions_bonus_grant(
         n = await promos.grant_bonus_to_users(db, gid, ids, amount, hours, "GRANT_USER", grant_id=grant.id)
         grant.recipients_count = n
         await db.commit()
-    asyncio.create_task(post_admin_action(user, "Bonus bets granted", {"scope": scope, "amount": f"{amount:,}", "recipients": str(n)}))
+    asyncio.create_task(post_admin_action(user, "Bonus Chips granted", {"scope": scope, "amount": f"{amount:,}", "recipients": str(n)}))
     return _redirect("/admin/promotions", msg=f"Granted+{amount:,}+bonus+bets+to+{n}+member(s).")
 
 
@@ -1403,7 +1403,7 @@ async def promotions_bonus_deduct(
             return _redirect("/admin/promotions", error=err.replace(" ", "+"))
         n = await promos.deduct_bonus_from_users(db, gid, ids, amount if amount > 0 else 0)
         await db.commit()
-    asyncio.create_task(post_admin_action(user, "Bonus bets deducted", {"scope": scope, "amount": (f"{amount:,}" if amount > 0 else "ALL"), "members": str(n)}))
+    asyncio.create_task(post_admin_action(user, "Bonus Chips deducted", {"scope": scope, "amount": (f"{amount:,}" if amount > 0 else "ALL"), "members": str(n)}))
     return _redirect("/admin/promotions", msg=f"Deducted+bonus+bets+from+{n}+member(s).")
 
 
@@ -1412,7 +1412,7 @@ async def promotions_bonus_user_revoke(uid: int, user: SessionUser = Depends(req
     async with get_db() as db:
         await promos.deduct_bonus_from_users(db, _GUILD_ID(), [uid], 0)
         await db.commit()
-    asyncio.create_task(post_admin_action(user, "Bonus bets revoked", {"user": str(uid)}))
+    asyncio.create_task(post_admin_action(user, "Bonus Chips revoked", {"user": str(uid)}))
     return _redirect("/admin/promotions", msg="Revoked+that+member's+bonus+bets.")
 
 

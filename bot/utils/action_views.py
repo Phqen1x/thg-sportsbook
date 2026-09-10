@@ -183,7 +183,7 @@ class RequestDoneButton(
                             gm = None
                     if gm is not None:
                         role_ids = {r.id for r in gm.roles}
-                # apply_deposit_match grants the matched amount as a bonus-bet
+                # apply_deposit_match grants the matched amount as a Bonus Chip
                 # lot itself — no real chips are credited here.
                 deposit_match = await promos.apply_deposit_match(
                     session, guild_id, user_id, converted_amount, member_role_ids=role_ids
@@ -196,7 +196,7 @@ class RequestDoneButton(
         if deposit_match > 0:
             content += (
                 f"\n\n➕ **Deposit match promo:** <@{user_id}> was granted "
-                f"**{fmt_chips(deposit_match)}** in bonus bets."
+                f"**{fmt_chips(deposit_match)}** in Bonus Chips."
             )
         new_view = build_request_view(None, guild_id, user_id, blocked)
         try:
@@ -210,7 +210,7 @@ class PromoClaimButton(
     template=r"promoclaim:(?P<drop_id>[0-9]+)",
 ):
     """Persistent "Claim" button on an admin-posted promo drop message. Any
-    member may press it once to be granted the drop's bonus bets or profit
+    member may press it once to be granted the drop's Bonus Chips or profit
     boost; only members with a FULL ("ALL") betting ban are turned away —
     partial restrictions (district/tribute) and public-parlay blocks still get
     to claim. When the drop's claim limit or expiry is reached, the next press

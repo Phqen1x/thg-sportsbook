@@ -851,7 +851,7 @@ class DisplayCog(commands.Cog):
             val = fmt_chips(bonus_bal)
             if bonus_next_exp is not None:
                 val += f"\nnext expires {_ts(bonus_next_exp)}"
-            embed.add_field(name="Bonus Bets", value=val, inline=False)
+            embed.add_field(name="Bonus Chips", value=val, inline=False)
         embed.add_field(name="Total Wagered", value=fmt_chips(wagered))
         embed.add_field(name="Total Won", value=fmt_chips(won))
         if wagered > 0:
