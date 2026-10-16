@@ -2288,6 +2288,18 @@ function openKillModal(tributeId, name) {
   });
 }
 
+// Inside Discord's iframe a normal target=_blank link is blocked; external links
+// (policy text, invite URLs) must go through the SDK so Discord opens them.
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest("a[href]");
+  if (!a || !SDK) return;
+  let url;
+  try { url = new URL(a.href, location.href); } catch (_) { return; }
+  if (!/^https?:$/.test(url.protocol) || url.origin === location.origin) return;
+  e.preventDefault();
+  SDK.commands.openExternalLink({ url: url.href }).catch(() => {});
+});
+
 // ── Boot ───────────────────────────────────────────────────────────────────────
 
 (async function main() {
