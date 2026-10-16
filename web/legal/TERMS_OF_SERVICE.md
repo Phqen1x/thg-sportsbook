@@ -1,7 +1,7 @@
 # Terms of Service for Panem Sportsbook
 
 **Effective Date:** September 23, 2026
-**Last Updated:** September 23, 2026
+**Last Updated:** October 16, 2026
 
 Welcome to **Panem Sportsbook** ("we", "us", "our", or the "Application"). These Terms of Service ("Terms") constitute a legally binding agreement between you ("User", "you", or "your") and the operators, developers, and administrators of Panem Sportsbook.
 
@@ -147,4 +147,3 @@ If you have any questions, feedback, or concerns regarding these Terms of Servic
 - **Discord Server:** [Interactive Discord Hunger Games](https://discord.gg/sunriseonthereaping)
 - **Primary Administrator / Developer:** @phqen1x
 - **Contact Email:** rustyphqenix@gmail.com
-- **Project Repository:** [https://github.com/phqen1x/thg-sportsbook](https://github.com/phqen1x/thg-sportsbook)
