@@ -1,9 +1,9 @@
 # Privacy Policy for Panem Sportsbook
 
 **Effective Date:** September 23, 2026 
-**Last Updated:** September 23, 2026
+**Last Updated:** October 16, 2026
 
-Welcome to **Panem Sportsbook** ("we", "us", "our", or the "Application"). Panem Sportsbook is an interactive, fan-made, community entertainment simulation designed for the Interatctive Discord Hunger Games server running Hunger Games-themed roleplay. The Application encompasses:
+Welcome to **Panem Sportsbook** ("we", "us", "our", or the "Application"). Panem Sportsbook is an interactive, fan-made, community entertainment simulation designed for the Interactive Discord Hunger Games server running Hunger Games-themed roleplay. The Application encompasses:
 
 1. The **Panem Sportsbook Discord Bot** (slash commands such as `/bet`, `/parlay`, `/odds`, `/balance`, `/mybets`, etc.),
 2. The **Panem Sportsbook Discord Activity** (an embedded application accessible inside Discord voice and text channels), and
@@ -75,7 +75,6 @@ We do not disclose your personal information except to the third-party platforms
 
 - **Discord Inc.:** The bot and Activity operate on the Discord platform. Use of our service is subject to [Discord’s Privacy Policy](https://discord.com/privacy) and [Discord's Developer Terms](https://discord.com/developers/docs/policies-and-agreements/developer-terms-of-service).
 - **Hosting & Infrastructure Providers:** Our web server, SQLite databases, and reverse proxy/tunnel services (e.g., Cloudflare, VPS provider) process requests to deliver network traffic securely.
-- **Local AI Commentary (Lemonade SDK):** When automated flavor text or odds commentary is generated using our integrated local AI engine, data is processed locally on our host server. No personal data is sent to external, commercial third-party LLM providers.
 - **Legal Compliance:** We may disclose minimal records if required by valid legal process, law enforcement subpoena, or to protect the safety, security, and rights of our users and administrators.
 
 ---
@@ -132,4 +131,3 @@ If you have questions, concerns, or requests regarding this Privacy Policy or yo
 - **Discord Server:** [Interactive Discord Hunger Games](https://discord.gg/sunriseonthereaping)
 - **Discord Contact / Bot Administrator:** @phqen1x
 - **Email:** rustyphqenix@gmail.com
-- **GitHub Repository:** [https://github.com/phqen1x/thg-sportsbook](https://github.com/phqen1x/thg-sportsbook)
