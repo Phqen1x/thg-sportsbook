@@ -726,6 +726,9 @@ def default_odds(
         lam = total_kills * (score_a * score_a) / sum_sq
         line = ou_line if ou_line is not None else 0.5
         m = int(math.floor(line)) + 1   # over 0.5 → ≥1, over 1.5 → ≥2
+        # Kills already scored count toward the line; only the remainder is
+        # still to be earned (lines shift up with each kill).
+        m = max(0, m - int(getattr(tribute_a, "kills", 0) or 0))
         p_over = _poisson_at_least(m, lam)
         prob = p_over if ou_side == "OVER" else 1.0 - p_over
         return prob_to_american(prob)

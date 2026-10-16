@@ -3993,6 +3993,103 @@ def _placement_market_result(market: Market, placement: int) -> bool:
     return placement > line if market.ou_side == "OVER" else placement <= line
 
 
+# Baseline lines for every tribute's Kills Over/Under markets. The lines offered
+# for future betting are these shifted up by the kills the tribute already has
+# (e.g. with 1 kill: 1.5, 2.5) — kills already scored are never bettable.
+KILLS_OU_BASE_LINES = (0.5, 1.5)
+
+
+def _kills_ou_lines(kills: int | None) -> list[float]:
+    return [b + (kills or 0) for b in KILLS_OU_BASE_LINES]
+
+
+async def _ensure_kills_ou_markets(session, tribute: Tribute, template) -> int:
+    """Create any missing KILLS_OU markets at the tribute's shifted lines.
+
+    `template` is an existing unresolved KILLS_OU market of the tribute (taken
+    before the latest kill resolved the crossed ones) used to copy status/phase,
+    or None to default to OPEN."""
+    existing = await session.execute(
+        select(Market).where(
+            Market.type == "KILLS_OU",
+            Market.tribute_a_id == tribute.id,
+            Market.status.in_(["OPEN", "CLOSED"]),
+        )
+    )
+    have = {(m.ou_line, m.ou_side) for m in existing.scalars().all()}
+    all_result = await session.execute(select(Tribute))
+    all_tributes = list(all_result.scalars().all())
+    created = 0
+    for line in _kills_ou_lines(tribute.kills):
+        for side in ("OVER", "UNDER"):
+            if (line, side) in have:
+                continue
+            session.add(
+                Market(
+                    type="KILLS_OU",
+                    label=_build_label(
+                        "KILLS_OU", tribute, None, None, None, None, line, side
+                    ),
+                    tribute_a_id=tribute.id,
+                    ou_line=line,
+                    ou_side=side,
+                    phase_id=template.phase_id if template else None,
+                    odds=_compute_odds(
+                        "KILLS_OU", tribute, all_tributes, ou_line=line, ou_side=side
+                    ),
+                    status=template.status if template else "OPEN",
+                )
+            )
+            created += 1
+    return created
+
+
+async def _prune_kills_ou_markets(session, tribute: Tribute) -> None:
+    """After a kill is reverted, drop unresolved KILLS_OU markets above the
+    tribute's now-lower shifted lines (only if nobody bet on them)."""
+    allowed = set(_kills_ou_lines(tribute.kills))
+    res = await session.execute(
+        select(Market).where(
+            Market.type == "KILLS_OU",
+            Market.tribute_a_id == tribute.id,
+            Market.status.in_(["OPEN", "CLOSED"]),
+        )
+    )
+    for m in res.scalars().all():
+        if m.ou_line in allowed or m.ou_line is None or m.ou_line < min(allowed):
+            continue
+        bets = await session.scalar(
+            select(func.count()).select_from(Bet).where(Bet.market_id == m.id)
+        )
+        if not bets:
+            await session.delete(m)
+
+
+async def _auto_resolve_placement_ou(
+    session, alive_count: int, exclude_id: int | None = None
+) -> None:
+    """Once the field is small enough, settle Placement O/U for survivors.
+
+    Every surviving tribute finishes at worst `alive_count`th, so any line at or
+    above that is already decided: UNDER wins and OVER loses for the living.
+    Dead tributes' markets are settled by their exact placement at death."""
+    res = await session.execute(
+        select(Market, Tribute)
+        .join(Tribute, Tribute.id == Market.tribute_a_id)
+        .where(
+            Market.type == "PLACEMENT_OU",
+            Market.status.in_(["OPEN", "CLOSED"]),
+            Tribute.status == "ALIVE",
+        )
+    )
+    for mkt, trib in res.all():
+        if trib.id == exclude_id:
+            continue
+        line = mkt.ou_line if mkt.ou_line is not None else PLACEMENT_OU_LINE
+        if alive_count <= line:
+            await _resolve_market(session, mkt, mkt.ou_side == "UNDER")
+
+
 # Fixed line for every tribute's Placement Over/Under market — previously this
 # was computed from the field size *at the moment that tribute's markets were
 # generated* (e.g. during a staggered reaping reveal), so different tributes
@@ -4271,7 +4368,7 @@ async def _auto_create_tribute_markets(
     for cause in _DEATH_CAUSES:
         created += _add("DEATH_CAUSE", new_tribute, cause=cause)
 
-    for line in [0.5, 1.5]:
+    for line in _kills_ou_lines(new_tribute.kills):
         for side in ["OVER", "UNDER"]:
             created += _add("KILLS_OU", new_tribute, ou_line=line, ou_side=side)
 
@@ -4653,7 +4750,7 @@ async def _backfill_missing_markets(session) -> dict[str, int]:
                 _make("DEATH_CAUSE", tribute, cause=cause)
                 existing_keyed.add(key)
 
-        for line in [0.5, 1.5]:
+        for line in _kills_ou_lines(tribute.kills):
             for side in ["OVER", "UNDER"]:
                 key = ("KILLS_OU", tid, line, side)
                 if key not in existing_keyed:
@@ -5308,6 +5405,631 @@ class AnnouncementModal(discord.ui.Modal, title="Gamemaker Announcement"):
 _ADMIN_PERMS = discord.Permissions(administrator=True)
 
 
+async def perform_tribute_kill(
+    tribute_id: str | int, cause: str, killed_by_id: str | int | None = None
+) -> tuple[str | None, dict, list[dict]]:
+    """Kill a tribute and run every market-resolution side effect.
+
+    Shared by the Discord command and the web / Activity admin endpoints so all
+    three behave identically. Returns (error, info, notifications): `error` is a
+    user-facing message (and nothing was changed) or None; `info` describes the
+    death; `notifications` are bet-result DMs for the caller to send, if it can."""
+    killed_by_id = str(killed_by_id) if killed_by_id else None
+    current_phase_raw = await get_setting("current_phase_id")
+    current_phase_id = json.loads(current_phase_raw) if current_phase_raw else None
+
+    _kill_notifs: list[dict] = []
+    _kill_token = _notif_buffer.set(_kill_notifs)
+    async with get_session() as session:
+        t = await session.get(Tribute, int(tribute_id))
+        if not t:
+            _notif_buffer.reset(_kill_token)
+            return "Tribute not found.", {}, []
+        if t.status != "ALIVE":
+            _notif_buffer.reset(_kill_token)
+            return f"{t.name} is not alive.", {}, []
+        if killed_by_id and int(killed_by_id) == t.id:
+            _notif_buffer.reset(_kill_token)
+            return "A tribute cannot be their own killer.", {}, []
+        # Kills scored while Bloodbath is the active phase also bump the
+        # tribute's bloodbath-scoped counter, so BLOODBATH_KILLS_OU /
+        # ANY_BB_DOUBLE_KILL resolve on exactly the kills that happened
+        # during the Bloodbath — regardless of when the admin later
+        # triggers the transition into Arena.
+        in_bloodbath = False
+        if current_phase_id is not None:
+            cur_phase = await session.get(BettingPhase, current_phase_id)
+            in_bloodbath = bool(cur_phase and cur_phase.name == "Bloodbath")
+        t.status = "DEAD"
+        t.death_cause = cause
+        # Died before ever receiving a training score (typically a Pre-Games
+        # death) — every bet made on them is voided and refunded rather than
+        # resolved as a loss, since they never got a fair shot at the Games.
+        void_scoreless_death = t.training_score is None
+        # Disqualification is a GM ruling, not an in-game outcome bettors
+        # could have predicted — void every market on this tribute (straight
+        # bets refunded, parlay legs voided) rather than resolving them as
+        # losses.
+        void_death = void_scoreless_death or cause == "Disqualified"
+        killer_name = None
+        killer_district = None
+        killer_gender = None
+        kill_boost_factor = 1.0
+        if killed_by_id:
+            t.killed_by_id = int(killed_by_id)
+            killer = await session.get(Tribute, int(killed_by_id))
+            if killer:
+                # Additive kill boost: quality contribution with diminishing
+                # returns past half the national kill record.
+                kill_boost_factor = await _kill_quality_for_victim(session, t)
+                nkr = await session.scalar(
+                    select(func.max(DistrictRecord.kill_record))
+                )
+                dr = kill_boost_dr_factor(killer.kills, nkr)
+                killer.kill_boost = (killer.kill_boost or 0.0) + max(
+                    0.0, kill_boost_factor - 1.0
+                ) * dr
+                killer.kills += 1
+                if in_bloodbath:
+                    killer.bloodbath_kills += 1
+                killer_name = killer.name
+                killer_district = killer.district
+                killer_gender = killer.display_gender
+                # Resolve any KILLS_OU markets for the killer whose line was just crossed
+                kou_result = await session.execute(
+                    select(Market).where(
+                        Market.tribute_a_id == killer.id,
+                        Market.type == "KILLS_OU",
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                    )
+                )
+                kou_all = kou_result.scalars().all()
+                kou_template = kou_all[0] if kou_all else None
+                for kou in kou_all:
+                    line = kou.ou_line if kou.ou_line is not None else 0.5
+                    if killer.kills > line:
+                        await _resolve_market(session, kou, kou.ou_side == "OVER")
+                # Shift the offered lines up by the kills already scored.
+                await _ensure_kills_ou_markets(
+                    session, killer, kou_template
+                )
+        # Placement = one more than the number of OTHER tributes still alive
+        # — every survivor outlasts this tribute. Sessions here run with
+        # autoflush=False, so the pending status="DEAD" write above hasn't
+        # hit the DB yet; excluding this tribute's id explicitly (rather than
+        # relying on the flush) keeps the first kill landing on the correct
+        # last-place number instead of one past it.
+        alive_result = await session.execute(
+            select(Tribute).where(Tribute.status == "ALIVE", Tribute.id != t.id)
+        )
+        alive_remaining = len(alive_result.scalars().all())
+        t.placement = alive_remaining + 1
+        tribute_name = t.name
+        tribute_district = t.district
+        tribute_gender = t.display_gender
+
+        # Resolve all open markets for the dead tribute
+        dead_id = t.id
+        killer_id = int(killed_by_id) if killed_by_id else None
+
+        # First blood: if a tribute killed this one, check whether first blood
+        # hasn't been drawn yet. If not, resolve ALL FIRST_BLOOD markets now.
+        if killer_id is not None:
+            fb_result = await session.execute(
+                select(Market).where(
+                    Market.type == "FIRST_BLOOD",
+                    Market.status.in_(["OPEN", "CLOSED"]),
+                )
+            )
+            fb_markets = fb_result.scalars().all()
+            if fb_markets:
+                for fb in fb_markets:
+                    await _resolve_market(session, fb, fb.tribute_a_id == killer_id)
+
+        # FIRST_TRIBUTE_TO_DIE: resolve if no other tribute has died yet
+        prev_deaths = await session.scalar(
+            select(func.count())
+            .select_from(Tribute)
+            .where(Tribute.placement.isnot(None), Tribute.id != dead_id)
+        )
+        if prev_deaths == 0:
+            ftd_result = await session.execute(
+                select(Market).where(
+                    Market.type == "FIRST_TRIBUTE_TO_DIE",
+                    Market.status.in_(["OPEN", "CLOSED"]),
+                )
+            )
+            for mkt in ftd_result.scalars().all():
+                await _resolve_market(session, mkt, mkt.tribute_a_id == dead_id)
+
+        a_mkts = await session.execute(
+            select(Market).where(
+                Market.tribute_a_id == dead_id,
+                Market.status.in_(["OPEN", "CLOSED"]),
+            )
+        )
+        for mkt in a_mkts.scalars().all():
+            if void_death:
+                # Never trained/scored before dying, or disqualified — void
+                # every bet on them instead of resolving it, win or lose.
+                await _resolve_market(session, mkt, None)
+            elif mkt.type in ("MISSES_FINAL_8", "MISSES_FINAL_5"):
+                await _resolve_market(session, mkt, True)
+            elif mkt.type == "TRIBUTE_KILLED_BLOODBATH":
+                # WIN only if this death happened while Bloodbath was the
+                # active phase — the catch-all below would otherwise always
+                # resolve this LOSE, since dying is the winning condition.
+                await _resolve_market(session, mkt, in_bloodbath)
+            elif mkt.type == "DEATH_CAUSE":
+                # Exactly one cause wins; all others lose.
+                await _resolve_market(session, mkt, mkt.cause == cause)
+            elif mkt.type == "KILLS_OU":
+                line = mkt.ou_line if mkt.ou_line is not None else 0.5
+                if mkt.ou_side == "OVER":
+                    await _resolve_market(session, mkt, t.kills > line)
+                else:  # UNDER
+                    await _resolve_market(session, mkt, t.kills <= line)
+            elif mkt.type in _PLACEMENT_MARKET_TYPES:
+                # Placement is final the moment a tribute dies — settle precisely
+                # (e.g. dying 8th WINS a "Top 8" or "finishes 8th" bet).
+                await _resolve_market(
+                    session, mkt, _placement_market_result(mkt, t.placement)
+                )
+            elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
+                partner = (
+                    await session.get(Tribute, mkt.tribute_b_id)
+                    if mkt.tribute_b_id
+                    else None
+                )
+                if partner and partner.placement is not None:
+                    if mkt.type == "PARTNER_PLACE_HIGHER":
+                        await _resolve_market(
+                            session, mkt, t.placement < partner.placement
+                        )
+                    else:
+                        await _resolve_market(
+                            session, mkt, t.placement > partner.placement
+                        )
+                elif partner:
+                    # Partner is still alive — their eventual placement is
+                    # guaranteed to beat this tribute's now-fixed one, so
+                    # the market is already decided without waiting for
+                    # the partner to die too.
+                    await _resolve_market(
+                        session, mkt, mkt.type == "PARTNER_PLACE_LOWER"
+                    )
+                # else: partner tribute missing — leave open
+            elif mkt.type == "TRIBUTE_KILLS":
+                # "Most kills" is undecided until the Games end — a dead tribute
+                # can still finish as the top killer. Leave OPEN for game end.
+                continue
+            else:
+                await _resolve_market(session, mkt, False)
+
+        b_mkts = await session.execute(
+            select(Market).where(
+                Market.tribute_b_id == dead_id,
+                Market.status.in_(["OPEN", "CLOSED"]),
+            )
+        )
+        for mkt in b_mkts.scalars().all():
+            if void_death:
+                await _resolve_market(session, mkt, None)
+            elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
+                # tribute_b (the partner) just died.
+                ta_obj = (
+                    await session.get(Tribute, mkt.tribute_a_id)
+                    if mkt.tribute_a_id
+                    else None
+                )
+                if ta_obj and ta_obj.placement is not None:
+                    if mkt.type == "PARTNER_PLACE_HIGHER":
+                        await _resolve_market(
+                            session, mkt, ta_obj.placement < t.placement
+                        )
+                    else:
+                        await _resolve_market(
+                            session, mkt, ta_obj.placement > t.placement
+                        )
+                elif ta_obj:
+                    # tribute_a is still alive — guaranteed to eventually
+                    # place better than the now-dead tribute_b.
+                    await _resolve_market(
+                        session, mkt, mkt.type == "PARTNER_PLACE_HIGHER"
+                    )
+                # else: tribute_a tribute missing — leave open
+            else:
+                result = (mkt.tribute_a_id == killer_id) if killer_id else False
+                await _resolve_market(session, mkt, result)
+
+        # Few enough tributes left that every survivor is guaranteed to
+        # finish under the placement line — settle their Placement O/U now.
+        await _auto_resolve_placement_ou(session, alive_remaining, exclude_id=t.id)
+
+        # ── Early-resolve district milestone markets ───────────────────────
+        t_district = t.district
+        dist_mbr_res = await session.execute(
+            select(Tribute).where(Tribute.district == t_district)
+        )
+        dist_members = dist_mbr_res.scalars().all()
+        # Count alive members excluding the tribute that just died
+        dist_alive_after = sum(
+            1 for ti in dist_members if ti.id != dead_id and ti.status == "ALIVE"
+        )
+        # DISTRICT_BOTH_*: impossible the moment any district member dies → FALSE
+        dist_both_q = await session.execute(
+            select(Market).where(
+                Market.type.in_(["DISTRICT_BOTH_FINAL_8", "DISTRICT_BOTH_FINAL_5"]),
+                Market.placement_num == t_district,
+                Market.status.in_(["OPEN", "CLOSED"]),
+            )
+        )
+        for mkt in dist_both_q.scalars().all():
+            await _resolve_market(session, mkt, False)
+        # DISTRICT_ONE_*: impossible only once every district member is dead → FALSE
+        if dist_alive_after == 0:
+            dist_one_q = await session.execute(
+                select(Market).where(
+                    Market.type.in_(
+                        ["DISTRICT_ONE_FINAL_8", "DISTRICT_ONE_FINAL_5"]
+                    ),
+                    Market.placement_num == t_district,
+                    Market.status.in_(["OPEN", "CLOSED"]),
+                )
+            )
+            for mkt in dist_one_q.scalars().all():
+                await _resolve_market(session, mkt, False)
+
+            # FIRST_DISTRICT_WIPE: first district to be completely eliminated wins
+            already_wiped = await session.scalar(
+                select(func.count())
+                .select_from(Market)
+                .where(
+                    Market.type == "FIRST_DISTRICT_WIPE",
+                    Market.status == "RESOLVED",
+                )
+            )
+            if already_wiped == 0:
+                fdw_result = await session.execute(
+                    select(Market).where(
+                        Market.type == "FIRST_DISTRICT_WIPE",
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                    )
+                )
+                for mkt in fdw_result.scalars().all():
+                    await _resolve_market(
+                        session, mkt, mkt.placement_num == t_district
+                    )
+
+        # ── Early-resolve alliance milestone markets ───────────────────────
+        t_alliance_id = t.alliance_id
+        if t_alliance_id is not None:
+            ally_mbr_res = await session.execute(
+                select(Tribute).where(Tribute.alliance_id == t_alliance_id)
+            )
+            ally_members = ally_mbr_res.scalars().all()
+            ally_alive_after = sum(
+                1
+                for ti in ally_members
+                if ti.id != dead_id and ti.status == "ALIVE"
+            )
+            # ALLIANCE_ALL_*: impossible the moment any alliance member dies → FALSE
+            ally_all_q = await session.execute(
+                select(Market).where(
+                    Market.type.in_(
+                        ["ALLIANCE_ALL_FINAL_8", "ALLIANCE_ALL_FINAL_5"]
+                    ),
+                    Market.placement_num == t_alliance_id,
+                    Market.status.in_(["OPEN", "CLOSED"]),
+                )
+            )
+            for mkt in ally_all_q.scalars().all():
+                await _resolve_market(session, mkt, False)
+            # ALLIANCE_ONE_*: impossible only once every alliance member is dead → FALSE
+            if ally_alive_after == 0:
+                ally_one_q = await session.execute(
+                    select(Market).where(
+                        Market.type.in_(
+                            ["ALLIANCE_ONE_FINAL_8", "ALLIANCE_ONE_FINAL_5"]
+                        ),
+                        Market.placement_num == t_alliance_id,
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                    )
+                )
+                for mkt in ally_one_q.scalars().all():
+                    await _resolve_market(session, mkt, False)
+
+            # FIRST_IN_ALLIANCE_DEATH: resolve if no other member of this alliance has died
+            prev_alliance_deaths = await session.scalar(
+                select(func.count())
+                .select_from(Tribute)
+                .where(
+                    Tribute.alliance_id == t_alliance_id,
+                    Tribute.placement.isnot(None),
+                    Tribute.id != dead_id,
+                )
+            )
+            if prev_alliance_deaths == 0:
+                fiad_result = await session.execute(
+                    select(Market).where(
+                        Market.type == "FIRST_IN_ALLIANCE_DEATH",
+                        Market.placement_num == t_alliance_id,
+                        Market.status.in_(["OPEN", "CLOSED"]),
+                    )
+                )
+                for mkt in fiad_result.scalars().all():
+                    await _resolve_market(session, mkt, mkt.tribute_a_id == dead_id)
+
+            # FIRST_ALLIANCE_WIPED: first alliance to reach ≤1 surviving members wins
+            if ally_alive_after <= 1:
+                already_wiped = await session.scalar(
+                    select(func.count())
+                    .select_from(Market)
+                    .where(
+                        Market.type == "FIRST_ALLIANCE_WIPED",
+                        Market.status == "RESOLVED",
+                    )
+                )
+                if already_wiped == 0:
+                    faw_result = await session.execute(
+                        select(Market).where(
+                            Market.type == "FIRST_ALLIANCE_WIPED",
+                            Market.status.in_(["OPEN", "CLOSED"]),
+                        )
+                    )
+                    for mkt in faw_result.scalars().all():
+                        await _resolve_market(
+                            session, mkt, mkt.placement_num == t_alliance_id
+                        )
+
+        # This tribute is now excluded from the training-score completion
+        # check (dead + never scored counts as null) — dying may be exactly
+        # what was blocking HIGHEST/LOWEST_TRAINING_SCORE / DISTRICT_HIGHEST_SCORE
+        # from resolving, so re-check now rather than waiting on a future
+        # /admin tribute set_score call that will never come for this tribute.
+        all_result = await session.execute(select(Tribute))
+        all_tributes = list(all_result.scalars().all())
+        tribute_map = {tr.id: tr for tr in all_tributes}
+        await _resolve_score_completion_markets(session, all_tributes, tribute_map)
+
+        await _recalculate_markets(session)
+
+    _notif_buffer.reset(_kill_token)
+    return None, {
+        "name": tribute_name,
+        "district": tribute_district,
+        "gender": tribute_gender,
+        "killer_name": killer_name,
+        "killer_district": killer_district,
+        "killer_gender": killer_gender,
+    }, _kill_notifs
+
+
+async def perform_tribute_unkill(tribute_id: str | int) -> tuple[str | None, dict]:
+    """Revert a tribute's death and every market side effect. Shared by the
+    Discord command and the web / Activity admin endpoints. Returns
+    (error, info); `error` is a user-facing message or None."""
+    current_phase_raw = await get_setting("current_phase_id")
+    current_phase_id = json.loads(current_phase_raw) if current_phase_raw else None
+    async with get_session() as session:
+        in_bloodbath = False
+        if current_phase_id is not None:
+            cur_phase = await session.get(BettingPhase, current_phase_id)
+            in_bloodbath = bool(cur_phase and cur_phase.name == "Bloodbath")
+        t = await session.get(Tribute, int(tribute_id))
+        if not t:
+            return "Tribute not found.", {}
+        if t.status != "DEAD":
+            return f"**{t.name}** is not dead — nothing to revert.", {}
+
+        dead_id = t.id
+        killer_id = t.killed_by_id
+        tribute_name = t.name
+        tribute_district = t.district
+        tribute_gender = t.display_gender
+
+        killer = await session.get(Tribute, killer_id) if killer_id else None
+
+        # ── Collect markets to revert ─────────────────────────────────────
+        markets_to_revert: list[Market] = []
+
+        # All resolved markets involving the dead tribute whose outcome was
+        # actually decided by the death (score markets are resolved from
+        # training_score independently of alive/dead status and must not
+        # be clawed back here — see _SCORE_MARKET_TYPES).
+        a_res = await session.execute(
+            select(Market).where(
+                Market.tribute_a_id == dead_id,
+                Market.status == "RESOLVED",
+                Market.type.notin_(_SCORE_MARKET_TYPES),
+            )
+        )
+        markets_to_revert.extend(a_res.scalars().all())
+
+        b_res = await session.execute(
+            select(Market).where(
+                Market.tribute_b_id == dead_id,
+                Market.status == "RESOLVED",
+                Market.type.notin_(_SCORE_MARKET_TYPES),
+            )
+        )
+        markets_to_revert.extend(b_res.scalars().all())
+
+        # District milestone markets resolved FALSE due to this tribute's death
+        t_district = t.district
+        dist_mbr_res = await session.execute(
+            select(Tribute).where(Tribute.district == t_district)
+        )
+        dist_others = [
+            ti for ti in dist_mbr_res.scalars().all() if ti.id != dead_id
+        ]
+        other_dist_dead = sum(1 for ti in dist_others if ti.status == "DEAD")
+        other_dist_alive = sum(1 for ti in dist_others if ti.status == "ALIVE")
+        # BOTH markets: only revert if T was the sole dead member (after unkill all alive)
+        if other_dist_dead == 0:
+            dist_both_rev = await session.execute(
+                select(Market).where(
+                    Market.type.in_(
+                        ["DISTRICT_BOTH_FINAL_8", "DISTRICT_BOTH_FINAL_5"]
+                    ),
+                    Market.placement_num == t_district,
+                    Market.status == "RESOLVED",
+                    Market.result == False,
+                )
+            )
+            markets_to_revert.extend(dist_both_rev.scalars().all())
+        # ONE markets: only revert if all other district members are also dead
+        # (meaning the FALSE resolution was caused by everyone dying)
+        if other_dist_alive == 0:
+            dist_one_rev = await session.execute(
+                select(Market).where(
+                    Market.type.in_(
+                        ["DISTRICT_ONE_FINAL_8", "DISTRICT_ONE_FINAL_5"]
+                    ),
+                    Market.placement_num == t_district,
+                    Market.status == "RESOLVED",
+                    Market.result == False,
+                )
+            )
+            markets_to_revert.extend(dist_one_rev.scalars().all())
+
+        # Alliance milestone markets resolved FALSE due to this tribute's death
+        t_alliance_id = t.alliance_id
+        if t_alliance_id is not None:
+            ally_mbr_res = await session.execute(
+                select(Tribute).where(Tribute.alliance_id == t_alliance_id)
+            )
+            ally_others = [
+                ti for ti in ally_mbr_res.scalars().all() if ti.id != dead_id
+            ]
+            other_ally_dead = sum(1 for ti in ally_others if ti.status == "DEAD")
+            other_ally_alive = sum(1 for ti in ally_others if ti.status == "ALIVE")
+            if other_ally_dead == 0:
+                ally_all_rev = await session.execute(
+                    select(Market).where(
+                        Market.type.in_(
+                            ["ALLIANCE_ALL_FINAL_8", "ALLIANCE_ALL_FINAL_5"]
+                        ),
+                        Market.placement_num == t_alliance_id,
+                        Market.status == "RESOLVED",
+                        Market.result == False,
+                    )
+                )
+                markets_to_revert.extend(ally_all_rev.scalars().all())
+            if other_ally_alive == 0:
+                ally_one_rev = await session.execute(
+                    select(Market).where(
+                        Market.type.in_(
+                            ["ALLIANCE_ONE_FINAL_8", "ALLIANCE_ONE_FINAL_5"]
+                        ),
+                        Market.placement_num == t_alliance_id,
+                        Market.status == "RESOLVED",
+                        Market.result == False,
+                    )
+                )
+                markets_to_revert.extend(ally_one_rev.scalars().all())
+
+        if killer is not None:
+            # KILLS_OU markets for the killer where THIS kill crossed the line
+            kou_res = await session.execute(
+                select(Market).where(
+                    Market.tribute_a_id == killer.id,
+                    Market.type == "KILLS_OU",
+                    Market.status == "RESOLVED",
+                )
+            )
+            for kou in kou_res.scalars().all():
+                line = kou.ou_line if kou.ou_line is not None else 0.5
+                if (killer.kills - 1) <= line < killer.kills:
+                    markets_to_revert.append(kou)
+
+            # FIRST_BLOOD markets — only revert if no other tribute was killed by someone
+            other_killed_res = await session.execute(
+                select(Tribute).where(
+                    Tribute.status == "DEAD",
+                    Tribute.id != dead_id,
+                    Tribute.killed_by_id.is_not(None),
+                )
+            )
+            if not other_killed_res.scalars().all():
+                fb_res = await session.execute(
+                    select(Market).where(
+                        Market.type == "FIRST_BLOOD",
+                        Market.status == "RESOLVED",
+                    )
+                )
+                markets_to_revert.extend(fb_res.scalars().all())
+
+        # Placement O/U markets auto-resolved for survivors because the field
+        # was small: once this tribute is back, any whose line is now below
+        # the living count are no longer guaranteed.
+        alive_after_unkill = 1 + (
+            await session.scalar(
+                select(func.count())
+                .select_from(Tribute)
+                .where(Tribute.status == "ALIVE", Tribute.id != dead_id)
+            )
+            or 0
+        )
+        pou_res = await session.execute(
+            select(Market)
+            .join(Tribute, Tribute.id == Market.tribute_a_id)
+            .where(
+                Market.type == "PLACEMENT_OU",
+                Market.status == "RESOLVED",
+                Tribute.status == "ALIVE",
+                Market.ou_line < alive_after_unkill,
+            )
+        )
+        markets_to_revert.extend(pou_res.scalars().all())
+
+        # Deduplicate (tribute_b markets might overlap with tribute_a on kills_ou etc.)
+        seen_ids: set[int] = set()
+        unique_markets: list[Market] = []
+        for m in markets_to_revert:
+            if m.id not in seen_ids:
+                seen_ids.add(m.id)
+                unique_markets.append(m)
+
+        # ── Revert markets and bets ───────────────────────────────────────
+        reverted_parlays: set[int] = set()
+        total_unresolved = 0
+        for mkt in unique_markets:
+            result = await _unresolve_market(session, mkt, reverted_parlays)
+            total_unresolved += result["unresolved"]
+
+        # ── Revert the tribute ────────────────────────────────────────────
+        t.status = "ALIVE"
+        t.death_cause = None
+        t.killed_by_id = None
+        t.placement = None
+
+        # ── Revert the killer's stats ─────────────────────────────────────
+        killer_str = ""
+        if killer is not None:
+            kill_boost_factor = await _kill_quality_for_victim(session, t)
+            nkr = await session.scalar(select(func.max(DistrictRecord.kill_record)))
+            # kills_before the reverted kill was killer.kills - 1
+            dr = kill_boost_dr_factor(killer.kills - 1, nkr)
+            contribution = max(0.0, kill_boost_factor - 1.0) * dr
+            killer.kills -= 1
+            if in_bloodbath and killer.bloodbath_kills > 0:
+                killer.bloodbath_kills -= 1
+            killer.kill_boost = max(0.0, (killer.kill_boost or 0.0) - contribution)
+            killer_str = f" (credited kill removed from D{killer.district}{killer.display_gender} {killer.name})"
+            await _prune_kills_ou_markets(session, killer)
+
+        await _recalculate_markets(session)
+    return None, {
+        "name": tribute_name,
+        "district": tribute_district,
+        "gender": tribute_gender,
+        "killer_str": killer_str,
+        "unresolved": total_unresolved,
+        "markets": len(unique_markets),
+    }
+
+
 class AdminCog(commands.Cog):
     admin = app_commands.Group(
         name="admin",
@@ -5899,376 +6621,17 @@ class AdminCog(commands.Cog):
                 ephemeral=True,
             )
             return
-        current_phase_raw = await get_setting("current_phase_id")
-        current_phase_id = json.loads(current_phase_raw) if current_phase_raw else None
-
-        _kill_notifs: list[dict] = []
-        _kill_token = _notif_buffer.set(_kill_notifs)
-        async with get_session() as session:
-            t = await session.get(Tribute, int(tribute_id))
-            if not t:
-                await interaction.followup.send("Tribute not found.", ephemeral=True)
-                return
-            if killed_by_id and int(killed_by_id) == t.id:
-                await interaction.followup.send(
-                    "A tribute cannot be their own killer.", ephemeral=True
-                )
-                return
-            # Kills scored while Bloodbath is the active phase also bump the
-            # tribute's bloodbath-scoped counter, so BLOODBATH_KILLS_OU /
-            # ANY_BB_DOUBLE_KILL resolve on exactly the kills that happened
-            # during the Bloodbath — regardless of when the admin later
-            # triggers the transition into Arena.
-            in_bloodbath = False
-            if current_phase_id is not None:
-                cur_phase = await session.get(BettingPhase, current_phase_id)
-                in_bloodbath = bool(cur_phase and cur_phase.name == "Bloodbath")
-            t.status = "DEAD"
-            t.death_cause = cause
-            # Died before ever receiving a training score (typically a Pre-Games
-            # death) — every bet made on them is voided and refunded rather than
-            # resolved as a loss, since they never got a fair shot at the Games.
-            void_scoreless_death = t.training_score is None
-            # Disqualification is a GM ruling, not an in-game outcome bettors
-            # could have predicted — void every market on this tribute (straight
-            # bets refunded, parlay legs voided) rather than resolving them as
-            # losses.
-            void_death = void_scoreless_death or cause == "Disqualified"
-            killer_name = None
-            killer_district = None
-            killer_gender = None
-            kill_boost_factor = 1.0
-            if killed_by_id:
-                t.killed_by_id = int(killed_by_id)
-                killer = await session.get(Tribute, int(killed_by_id))
-                if killer:
-                    # Additive kill boost: quality contribution with diminishing
-                    # returns past half the national kill record.
-                    kill_boost_factor = await _kill_quality_for_victim(session, t)
-                    nkr = await session.scalar(
-                        select(func.max(DistrictRecord.kill_record))
-                    )
-                    dr = kill_boost_dr_factor(killer.kills, nkr)
-                    killer.kill_boost = (killer.kill_boost or 0.0) + max(
-                        0.0, kill_boost_factor - 1.0
-                    ) * dr
-                    killer.kills += 1
-                    if in_bloodbath:
-                        killer.bloodbath_kills += 1
-                    killer_name = killer.name
-                    killer_district = killer.district
-                    killer_gender = killer.display_gender
-                    # Resolve any KILLS_OU markets for the killer whose line was just crossed
-                    kou_result = await session.execute(
-                        select(Market).where(
-                            Market.tribute_a_id == killer.id,
-                            Market.type == "KILLS_OU",
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )
-                    )
-                    for kou in kou_result.scalars().all():
-                        line = kou.ou_line if kou.ou_line is not None else 0.5
-                        if killer.kills > line:
-                            await _resolve_market(session, kou, kou.ou_side == "OVER")
-            # Placement = one more than the number of OTHER tributes still alive
-            # — every survivor outlasts this tribute. Sessions here run with
-            # autoflush=False, so the pending status="DEAD" write above hasn't
-            # hit the DB yet; excluding this tribute's id explicitly (rather than
-            # relying on the flush) keeps the first kill landing on the correct
-            # last-place number instead of one past it.
-            alive_result = await session.execute(
-                select(Tribute).where(Tribute.status == "ALIVE", Tribute.id != t.id)
-            )
-            alive_remaining = len(alive_result.scalars().all())
-            t.placement = alive_remaining + 1
-            tribute_name = t.name
-            tribute_district = t.district
-            tribute_gender = t.display_gender
-
-            # Resolve all open markets for the dead tribute
-            dead_id = t.id
-            killer_id = int(killed_by_id) if killed_by_id else None
-
-            # First blood: if a tribute killed this one, check whether first blood
-            # hasn't been drawn yet. If not, resolve ALL FIRST_BLOOD markets now.
-            if killer_id is not None:
-                fb_result = await session.execute(
-                    select(Market).where(
-                        Market.type == "FIRST_BLOOD",
-                        Market.status.in_(["OPEN", "CLOSED"]),
-                    )
-                )
-                fb_markets = fb_result.scalars().all()
-                if fb_markets:
-                    for fb in fb_markets:
-                        await _resolve_market(session, fb, fb.tribute_a_id == killer_id)
-
-            # FIRST_TRIBUTE_TO_DIE: resolve if no other tribute has died yet
-            prev_deaths = await session.scalar(
-                select(func.count())
-                .select_from(Tribute)
-                .where(Tribute.placement.isnot(None), Tribute.id != dead_id)
-            )
-            if prev_deaths == 0:
-                ftd_result = await session.execute(
-                    select(Market).where(
-                        Market.type == "FIRST_TRIBUTE_TO_DIE",
-                        Market.status.in_(["OPEN", "CLOSED"]),
-                    )
-                )
-                for mkt in ftd_result.scalars().all():
-                    await _resolve_market(session, mkt, mkt.tribute_a_id == dead_id)
-
-            a_mkts = await session.execute(
-                select(Market).where(
-                    Market.tribute_a_id == dead_id,
-                    Market.status.in_(["OPEN", "CLOSED"]),
-                )
-            )
-            for mkt in a_mkts.scalars().all():
-                if void_death:
-                    # Never trained/scored before dying, or disqualified — void
-                    # every bet on them instead of resolving it, win or lose.
-                    await _resolve_market(session, mkt, None)
-                elif mkt.type in ("MISSES_FINAL_8", "MISSES_FINAL_5"):
-                    await _resolve_market(session, mkt, True)
-                elif mkt.type == "TRIBUTE_KILLED_BLOODBATH":
-                    # WIN only if this death happened while Bloodbath was the
-                    # active phase — the catch-all below would otherwise always
-                    # resolve this LOSE, since dying is the winning condition.
-                    await _resolve_market(session, mkt, in_bloodbath)
-                elif mkt.type == "DEATH_CAUSE":
-                    # Exactly one cause wins; all others lose.
-                    await _resolve_market(session, mkt, mkt.cause == cause)
-                elif mkt.type == "KILLS_OU":
-                    line = mkt.ou_line if mkt.ou_line is not None else 0.5
-                    if mkt.ou_side == "OVER":
-                        await _resolve_market(session, mkt, t.kills > line)
-                    else:  # UNDER
-                        await _resolve_market(session, mkt, t.kills <= line)
-                elif mkt.type in _PLACEMENT_MARKET_TYPES:
-                    # Placement is final the moment a tribute dies — settle precisely
-                    # (e.g. dying 8th WINS a "Top 8" or "finishes 8th" bet).
-                    await _resolve_market(
-                        session, mkt, _placement_market_result(mkt, t.placement)
-                    )
-                elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
-                    partner = (
-                        await session.get(Tribute, mkt.tribute_b_id)
-                        if mkt.tribute_b_id
-                        else None
-                    )
-                    if partner and partner.placement is not None:
-                        if mkt.type == "PARTNER_PLACE_HIGHER":
-                            await _resolve_market(
-                                session, mkt, t.placement < partner.placement
-                            )
-                        else:
-                            await _resolve_market(
-                                session, mkt, t.placement > partner.placement
-                            )
-                    elif partner:
-                        # Partner is still alive — their eventual placement is
-                        # guaranteed to beat this tribute's now-fixed one, so
-                        # the market is already decided without waiting for
-                        # the partner to die too.
-                        await _resolve_market(
-                            session, mkt, mkt.type == "PARTNER_PLACE_LOWER"
-                        )
-                    # else: partner tribute missing — leave open
-                elif mkt.type == "TRIBUTE_KILLS":
-                    # "Most kills" is undecided until the Games end — a dead tribute
-                    # can still finish as the top killer. Leave OPEN for game end.
-                    continue
-                else:
-                    await _resolve_market(session, mkt, False)
-
-            b_mkts = await session.execute(
-                select(Market).where(
-                    Market.tribute_b_id == dead_id,
-                    Market.status.in_(["OPEN", "CLOSED"]),
-                )
-            )
-            for mkt in b_mkts.scalars().all():
-                if void_death:
-                    await _resolve_market(session, mkt, None)
-                elif mkt.type in ("PARTNER_PLACE_HIGHER", "PARTNER_PLACE_LOWER"):
-                    # tribute_b (the partner) just died.
-                    ta_obj = (
-                        await session.get(Tribute, mkt.tribute_a_id)
-                        if mkt.tribute_a_id
-                        else None
-                    )
-                    if ta_obj and ta_obj.placement is not None:
-                        if mkt.type == "PARTNER_PLACE_HIGHER":
-                            await _resolve_market(
-                                session, mkt, ta_obj.placement < t.placement
-                            )
-                        else:
-                            await _resolve_market(
-                                session, mkt, ta_obj.placement > t.placement
-                            )
-                    elif ta_obj:
-                        # tribute_a is still alive — guaranteed to eventually
-                        # place better than the now-dead tribute_b.
-                        await _resolve_market(
-                            session, mkt, mkt.type == "PARTNER_PLACE_HIGHER"
-                        )
-                    # else: tribute_a tribute missing — leave open
-                else:
-                    result = (mkt.tribute_a_id == killer_id) if killer_id else False
-                    await _resolve_market(session, mkt, result)
-
-            # ── Early-resolve district milestone markets ───────────────────────
-            t_district = t.district
-            dist_mbr_res = await session.execute(
-                select(Tribute).where(Tribute.district == t_district)
-            )
-            dist_members = dist_mbr_res.scalars().all()
-            # Count alive members excluding the tribute that just died
-            dist_alive_after = sum(
-                1 for ti in dist_members if ti.id != dead_id and ti.status == "ALIVE"
-            )
-            # DISTRICT_BOTH_*: impossible the moment any district member dies → FALSE
-            dist_both_q = await session.execute(
-                select(Market).where(
-                    Market.type.in_(["DISTRICT_BOTH_FINAL_8", "DISTRICT_BOTH_FINAL_5"]),
-                    Market.placement_num == t_district,
-                    Market.status.in_(["OPEN", "CLOSED"]),
-                )
-            )
-            for mkt in dist_both_q.scalars().all():
-                await _resolve_market(session, mkt, False)
-            # DISTRICT_ONE_*: impossible only once every district member is dead → FALSE
-            if dist_alive_after == 0:
-                dist_one_q = await session.execute(
-                    select(Market).where(
-                        Market.type.in_(
-                            ["DISTRICT_ONE_FINAL_8", "DISTRICT_ONE_FINAL_5"]
-                        ),
-                        Market.placement_num == t_district,
-                        Market.status.in_(["OPEN", "CLOSED"]),
-                    )
-                )
-                for mkt in dist_one_q.scalars().all():
-                    await _resolve_market(session, mkt, False)
-
-                # FIRST_DISTRICT_WIPE: first district to be completely eliminated wins
-                already_wiped = await session.scalar(
-                    select(func.count())
-                    .select_from(Market)
-                    .where(
-                        Market.type == "FIRST_DISTRICT_WIPE",
-                        Market.status == "RESOLVED",
-                    )
-                )
-                if already_wiped == 0:
-                    fdw_result = await session.execute(
-                        select(Market).where(
-                            Market.type == "FIRST_DISTRICT_WIPE",
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )
-                    )
-                    for mkt in fdw_result.scalars().all():
-                        await _resolve_market(
-                            session, mkt, mkt.placement_num == t_district
-                        )
-
-            # ── Early-resolve alliance milestone markets ───────────────────────
-            t_alliance_id = t.alliance_id
-            if t_alliance_id is not None:
-                ally_mbr_res = await session.execute(
-                    select(Tribute).where(Tribute.alliance_id == t_alliance_id)
-                )
-                ally_members = ally_mbr_res.scalars().all()
-                ally_alive_after = sum(
-                    1
-                    for ti in ally_members
-                    if ti.id != dead_id and ti.status == "ALIVE"
-                )
-                # ALLIANCE_ALL_*: impossible the moment any alliance member dies → FALSE
-                ally_all_q = await session.execute(
-                    select(Market).where(
-                        Market.type.in_(
-                            ["ALLIANCE_ALL_FINAL_8", "ALLIANCE_ALL_FINAL_5"]
-                        ),
-                        Market.placement_num == t_alliance_id,
-                        Market.status.in_(["OPEN", "CLOSED"]),
-                    )
-                )
-                for mkt in ally_all_q.scalars().all():
-                    await _resolve_market(session, mkt, False)
-                # ALLIANCE_ONE_*: impossible only once every alliance member is dead → FALSE
-                if ally_alive_after == 0:
-                    ally_one_q = await session.execute(
-                        select(Market).where(
-                            Market.type.in_(
-                                ["ALLIANCE_ONE_FINAL_8", "ALLIANCE_ONE_FINAL_5"]
-                            ),
-                            Market.placement_num == t_alliance_id,
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )
-                    )
-                    for mkt in ally_one_q.scalars().all():
-                        await _resolve_market(session, mkt, False)
-
-                # FIRST_IN_ALLIANCE_DEATH: resolve if no other member of this alliance has died
-                prev_alliance_deaths = await session.scalar(
-                    select(func.count())
-                    .select_from(Tribute)
-                    .where(
-                        Tribute.alliance_id == t_alliance_id,
-                        Tribute.placement.isnot(None),
-                        Tribute.id != dead_id,
-                    )
-                )
-                if prev_alliance_deaths == 0:
-                    fiad_result = await session.execute(
-                        select(Market).where(
-                            Market.type == "FIRST_IN_ALLIANCE_DEATH",
-                            Market.placement_num == t_alliance_id,
-                            Market.status.in_(["OPEN", "CLOSED"]),
-                        )
-                    )
-                    for mkt in fiad_result.scalars().all():
-                        await _resolve_market(session, mkt, mkt.tribute_a_id == dead_id)
-
-                # FIRST_ALLIANCE_WIPED: first alliance to reach ≤1 surviving members wins
-                if ally_alive_after <= 1:
-                    already_wiped = await session.scalar(
-                        select(func.count())
-                        .select_from(Market)
-                        .where(
-                            Market.type == "FIRST_ALLIANCE_WIPED",
-                            Market.status == "RESOLVED",
-                        )
-                    )
-                    if already_wiped == 0:
-                        faw_result = await session.execute(
-                            select(Market).where(
-                                Market.type == "FIRST_ALLIANCE_WIPED",
-                                Market.status.in_(["OPEN", "CLOSED"]),
-                            )
-                        )
-                        for mkt in faw_result.scalars().all():
-                            await _resolve_market(
-                                session, mkt, mkt.placement_num == t_alliance_id
-                            )
-
-            # This tribute is now excluded from the training-score completion
-            # check (dead + never scored counts as null) — dying may be exactly
-            # what was blocking HIGHEST/LOWEST_TRAINING_SCORE / DISTRICT_HIGHEST_SCORE
-            # from resolving, so re-check now rather than waiting on a future
-            # /admin tribute set_score call that will never come for this tribute.
-            all_result = await session.execute(select(Tribute))
-            all_tributes = list(all_result.scalars().all())
-            tribute_map = {tr.id: tr for tr in all_tributes}
-            await _resolve_score_completion_markets(session, all_tributes, tribute_map)
-
-            await _recalculate_markets(session)
-
-        _notif_buffer.reset(_kill_token)
+        err, info, _kill_notifs = await perform_tribute_kill(tribute_id, cause, killed_by_id)
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
         await _send_resolution_dms(self.bot, _kill_notifs)
+        tribute_name = info["name"]
+        tribute_district = info["district"]
+        tribute_gender = info["gender"]
+        killer_name = info["killer_name"]
+        killer_district = info["killer_district"]
+        killer_gender = info["killer_gender"]
         killer_str = (
             f" by D{killer_district}{killer_gender} {killer_name}"
             if killer_name
@@ -6290,197 +6653,16 @@ class AdminCog(commands.Cog):
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
-        current_phase_raw = await get_setting("current_phase_id")
-        current_phase_id = json.loads(current_phase_raw) if current_phase_raw else None
-        async with get_session() as session:
-            in_bloodbath = False
-            if current_phase_id is not None:
-                cur_phase = await session.get(BettingPhase, current_phase_id)
-                in_bloodbath = bool(cur_phase and cur_phase.name == "Bloodbath")
-            t = await session.get(Tribute, int(tribute_id))
-            if not t:
-                await interaction.followup.send("Tribute not found.", ephemeral=True)
-                return
-            if t.status != "DEAD":
-                await interaction.followup.send(
-                    f"**{t.name}** is not dead — nothing to revert.", ephemeral=True
-                )
-                return
-
-            dead_id = t.id
-            killer_id = t.killed_by_id
-            tribute_name = t.name
-            tribute_district = t.district
-            tribute_gender = t.display_gender
-
-            killer = await session.get(Tribute, killer_id) if killer_id else None
-
-            # ── Collect markets to revert ─────────────────────────────────────
-            markets_to_revert: list[Market] = []
-
-            # All resolved markets involving the dead tribute whose outcome was
-            # actually decided by the death (score markets are resolved from
-            # training_score independently of alive/dead status and must not
-            # be clawed back here — see _SCORE_MARKET_TYPES).
-            a_res = await session.execute(
-                select(Market).where(
-                    Market.tribute_a_id == dead_id,
-                    Market.status == "RESOLVED",
-                    Market.type.notin_(_SCORE_MARKET_TYPES),
-                )
-            )
-            markets_to_revert.extend(a_res.scalars().all())
-
-            b_res = await session.execute(
-                select(Market).where(
-                    Market.tribute_b_id == dead_id,
-                    Market.status == "RESOLVED",
-                    Market.type.notin_(_SCORE_MARKET_TYPES),
-                )
-            )
-            markets_to_revert.extend(b_res.scalars().all())
-
-            # District milestone markets resolved FALSE due to this tribute's death
-            t_district = t.district
-            dist_mbr_res = await session.execute(
-                select(Tribute).where(Tribute.district == t_district)
-            )
-            dist_others = [
-                ti for ti in dist_mbr_res.scalars().all() if ti.id != dead_id
-            ]
-            other_dist_dead = sum(1 for ti in dist_others if ti.status == "DEAD")
-            other_dist_alive = sum(1 for ti in dist_others if ti.status == "ALIVE")
-            # BOTH markets: only revert if T was the sole dead member (after unkill all alive)
-            if other_dist_dead == 0:
-                dist_both_rev = await session.execute(
-                    select(Market).where(
-                        Market.type.in_(
-                            ["DISTRICT_BOTH_FINAL_8", "DISTRICT_BOTH_FINAL_5"]
-                        ),
-                        Market.placement_num == t_district,
-                        Market.status == "RESOLVED",
-                        Market.result == False,
-                    )
-                )
-                markets_to_revert.extend(dist_both_rev.scalars().all())
-            # ONE markets: only revert if all other district members are also dead
-            # (meaning the FALSE resolution was caused by everyone dying)
-            if other_dist_alive == 0:
-                dist_one_rev = await session.execute(
-                    select(Market).where(
-                        Market.type.in_(
-                            ["DISTRICT_ONE_FINAL_8", "DISTRICT_ONE_FINAL_5"]
-                        ),
-                        Market.placement_num == t_district,
-                        Market.status == "RESOLVED",
-                        Market.result == False,
-                    )
-                )
-                markets_to_revert.extend(dist_one_rev.scalars().all())
-
-            # Alliance milestone markets resolved FALSE due to this tribute's death
-            t_alliance_id = t.alliance_id
-            if t_alliance_id is not None:
-                ally_mbr_res = await session.execute(
-                    select(Tribute).where(Tribute.alliance_id == t_alliance_id)
-                )
-                ally_others = [
-                    ti for ti in ally_mbr_res.scalars().all() if ti.id != dead_id
-                ]
-                other_ally_dead = sum(1 for ti in ally_others if ti.status == "DEAD")
-                other_ally_alive = sum(1 for ti in ally_others if ti.status == "ALIVE")
-                if other_ally_dead == 0:
-                    ally_all_rev = await session.execute(
-                        select(Market).where(
-                            Market.type.in_(
-                                ["ALLIANCE_ALL_FINAL_8", "ALLIANCE_ALL_FINAL_5"]
-                            ),
-                            Market.placement_num == t_alliance_id,
-                            Market.status == "RESOLVED",
-                            Market.result == False,
-                        )
-                    )
-                    markets_to_revert.extend(ally_all_rev.scalars().all())
-                if other_ally_alive == 0:
-                    ally_one_rev = await session.execute(
-                        select(Market).where(
-                            Market.type.in_(
-                                ["ALLIANCE_ONE_FINAL_8", "ALLIANCE_ONE_FINAL_5"]
-                            ),
-                            Market.placement_num == t_alliance_id,
-                            Market.status == "RESOLVED",
-                            Market.result == False,
-                        )
-                    )
-                    markets_to_revert.extend(ally_one_rev.scalars().all())
-
-            if killer is not None:
-                # KILLS_OU markets for the killer where THIS kill crossed the line
-                kou_res = await session.execute(
-                    select(Market).where(
-                        Market.tribute_a_id == killer.id,
-                        Market.type == "KILLS_OU",
-                        Market.status == "RESOLVED",
-                    )
-                )
-                for kou in kou_res.scalars().all():
-                    line = kou.ou_line if kou.ou_line is not None else 0.5
-                    if (killer.kills - 1) <= line < killer.kills:
-                        markets_to_revert.append(kou)
-
-                # FIRST_BLOOD markets — only revert if no other tribute was killed by someone
-                other_killed_res = await session.execute(
-                    select(Tribute).where(
-                        Tribute.status == "DEAD",
-                        Tribute.id != dead_id,
-                        Tribute.killed_by_id.is_not(None),
-                    )
-                )
-                if not other_killed_res.scalars().all():
-                    fb_res = await session.execute(
-                        select(Market).where(
-                            Market.type == "FIRST_BLOOD",
-                            Market.status == "RESOLVED",
-                        )
-                    )
-                    markets_to_revert.extend(fb_res.scalars().all())
-
-            # Deduplicate (tribute_b markets might overlap with tribute_a on kills_ou etc.)
-            seen_ids: set[int] = set()
-            unique_markets: list[Market] = []
-            for m in markets_to_revert:
-                if m.id not in seen_ids:
-                    seen_ids.add(m.id)
-                    unique_markets.append(m)
-
-            # ── Revert markets and bets ───────────────────────────────────────
-            reverted_parlays: set[int] = set()
-            total_unresolved = 0
-            for mkt in unique_markets:
-                result = await _unresolve_market(session, mkt, reverted_parlays)
-                total_unresolved += result["unresolved"]
-
-            # ── Revert the tribute ────────────────────────────────────────────
-            t.status = "ALIVE"
-            t.death_cause = None
-            t.killed_by_id = None
-            t.placement = None
-
-            # ── Revert the killer's stats ─────────────────────────────────────
-            killer_str = ""
-            if killer is not None:
-                kill_boost_factor = await _kill_quality_for_victim(session, t)
-                nkr = await session.scalar(select(func.max(DistrictRecord.kill_record)))
-                # kills_before the reverted kill was killer.kills - 1
-                dr = kill_boost_dr_factor(killer.kills - 1, nkr)
-                contribution = max(0.0, kill_boost_factor - 1.0) * dr
-                killer.kills -= 1
-                if in_bloodbath and killer.bloodbath_kills > 0:
-                    killer.bloodbath_kills -= 1
-                killer.kill_boost = max(0.0, (killer.kill_boost or 0.0) - contribution)
-                killer_str = f" (credited kill removed from D{killer.district}{killer.display_gender} {killer.name})"
-
-            await _recalculate_markets(session)
+        err, info = await perform_tribute_unkill(tribute_id)
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        tribute_name = info["name"]
+        tribute_district = info["district"]
+        tribute_gender = info["gender"]
+        killer_str = info["killer_str"]
+        total_unresolved = info["unresolved"]
+        unique_markets = range(info["markets"])
 
         await interaction.followup.send(
             f"↩️ **{tribute_name}** (D{tribute_district}{tribute_gender}) has been reinstated as ALIVE."
@@ -12051,6 +12233,7 @@ class AdminCog(commands.Cog):
         max_claims="Stop accepting claims after this many people (blank = unlimited)",
         duration_hours="Deactivate the button this many hours after posting (blank = never)",
         reward_expiry_days="Expiry on the granted bonus/boost itself, in days (blank = permanent)",
+        reward_expiry_date="…or an exact expiry date for the reward, YYYY-MM-DD UTC (overrides reward_expiry_days)",
     )
     @app_commands.choices(reward=[
         app_commands.Choice(name="Bonus Chips", value="bonus"),
@@ -12070,6 +12253,7 @@ class AdminCog(commands.Cog):
         max_claims: app_commands.Range[int, 1, 100_000] | None = None,
         duration_hours: app_commands.Range[int, 1, 8760] | None = None,
         reward_expiry_days: app_commands.Range[int, 1, 3650] | None = None,
+        reward_expiry_date: str | None = None,
     ) -> None:
         if not await safe_defer(interaction, ephemeral=True):
             return
@@ -12085,6 +12269,17 @@ class AdminCog(commands.Cog):
                 "Keep the message under 1900 characters.", ephemeral=True
             )
             return
+        reward_expires_at = None
+        if reward_expiry_date:
+            try:
+                reward_expires_at = datetime.strptime(
+                    reward_expiry_date.strip(), "%Y-%m-%d"
+                ).replace(hour=23, minute=59, second=59)
+            except ValueError:
+                await interaction.followup.send(
+                    "`reward_expiry_date` must be `YYYY-MM-DD`.", ephemeral=True
+                )
+                return
 
         gid = current_guild_id()
         tpl_id = None
@@ -12132,6 +12327,7 @@ class AdminCog(commands.Cog):
                 bonus_amount=int(bonus_amount) if kind == "bonus" else None,
                 boost_template_id=tpl_id,
                 reward_expiry_hours=reward_expiry_hours,
+                reward_expires_at=reward_expires_at,
                 ping_role_id=role.id if role else None,
                 message_text=message[:2000],
                 max_claims=max_claims_val,
@@ -12143,7 +12339,7 @@ class AdminCog(commands.Cog):
 
         embed = discord.Embed.from_dict(promos.build_claim_drop_embed(
             message, reward_label, reward_expiry_hours=reward_expiry_hours,
-            max_claims=max_claims_val,
+            reward_expires_at=reward_expires_at, max_claims=max_claims_val,
         ))
         try:
             sent = await channel.send(
@@ -12173,7 +12369,9 @@ class AdminCog(commands.Cog):
             limits.append(f"first {max_claims:,} claimers")
         if duration_hours:
             limits.append(f"open for {duration_hours}h")
-        if reward_expiry_days:
+        if reward_expires_at:
+            limits.append(f"reward expires {reward_expires_at.strftime('%b %d, %Y')}")
+        elif reward_expiry_days:
             limits.append(f"reward expires in {reward_expiry_days}d")
         tail = f" ({'; '.join(limits)})" if limits else ""
         await interaction.followup.send(

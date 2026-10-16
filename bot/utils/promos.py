@@ -142,11 +142,21 @@ def _expiry_from_hours(hours: int | None) -> datetime | None:
     return _now() + timedelta(hours=hours)
 
 
+def _resolve_expiry(hours: int | None, at: datetime | None) -> datetime | None:
+    """Resolve an expiry that can be set either as a relative duration
+    (``hours`` from now) or an absolute date (``at``). ``at`` wins when both
+    are given — it's the more specific choice an admin can make."""
+    if at is not None:
+        return at
+    return _expiry_from_hours(hours)
+
+
 async def grant_bonus_to_users(
     session, guild_id: int, user_ids: list[int], amount: int,
     expiry_hours: int | None, source: str, grant_id: int | None = None,
+    expires_at: datetime | None = None,
 ) -> int:
-    exp = _expiry_from_hours(expiry_hours)
+    exp = _resolve_expiry(expiry_hours, expires_at)
     n = 0
     for uid in user_ids:
         session.add(BonusBetLot(
@@ -335,8 +345,9 @@ async def reconsume_boost(
 async def grant_boost_to_users(
     session, guild_id: int, template: ProfitBoostTemplate, user_ids: list[int],
     expiry_hours: int | None, granted_by: int | None, grant_id: int | None = None,
+    expires_at: datetime | None = None,
 ) -> int:
-    exp = _expiry_from_hours(expiry_hours)
+    exp = _resolve_expiry(expiry_hours, expires_at)
     n = 0
     for uid in user_ids:
         session.add(ProfitBoostToken(
@@ -370,7 +381,8 @@ def claim_drop_reward_label(
 
 def build_claim_drop_embed(
     message_text: str, reward_label: str, *,
-    reward_expiry_hours: int | None = None, max_claims: int | None = None,
+    reward_expiry_hours: int | None = None, reward_expires_at: datetime | None = None,
+    max_claims: int | None = None,
 ) -> dict:
     """Raw Discord embed dict for a claim-drop announcement. The custom body goes
     in the description; a field at the bottom spells out what the drop contains.
@@ -378,7 +390,9 @@ def build_claim_drop_embed(
     straight through the REST API."""
     contains = reward_label
     extras = []
-    if reward_expiry_hours:
+    if reward_expires_at:
+        extras.append(f"expires {reward_expires_at.strftime('%b %d, %Y %H:%M UTC')}")
+    elif reward_expiry_hours:
         if reward_expiry_hours % 24:
             extras.append(f"expires {reward_expiry_hours}h after you claim")
         else:
@@ -415,7 +429,8 @@ async def claim_drop_embed_for(
             reward_label = "a profit boost"
     embed = build_claim_drop_embed(
         drop.message_text, reward_label,
-        reward_expiry_hours=drop.reward_expiry_hours, max_claims=drop.max_claims,
+        reward_expiry_hours=drop.reward_expiry_hours,
+        reward_expires_at=drop.reward_expires_at, max_claims=drop.max_claims,
     )
     if closed_reason == "expired":
         embed["description"] = (embed["description"] + "\n\n⏰ **This promo drop has expired.**")[:4000]
@@ -462,13 +477,14 @@ async def claim_drop_redeem(
         return None, "Every claim for this drop has already been taken."
 
     exp_hours = drop.reward_expiry_hours
+    exp_at = drop.reward_expires_at
     if drop.reward_kind == "BONUS":
         amount = int(drop.bonus_amount or 0)
         if amount <= 0:
             return None, "This drop isn't configured correctly."
         await grant_bonus_to_users(
             session, drop.guild_id, [user_id], amount, exp_hours,
-            source="CLAIM", grant_id=drop.id,
+            source="CLAIM", grant_id=drop.id, expires_at=exp_at,
         )
         reward_txt = f"{amount:,} Bonus Chips"
         amount_or_pct = float(amount)
@@ -478,7 +494,7 @@ async def claim_drop_redeem(
             return None, "The profit boost for this drop no longer exists."
         await grant_boost_to_users(
             session, drop.guild_id, tpl, [user_id], exp_hours,
-            granted_by=drop.created_by, grant_id=drop.id,
+            granted_by=drop.created_by, grant_id=drop.id, expires_at=exp_at,
         )
         reward_txt = (
             f"a +{tpl.boost_pct:g}% profit boost ({boost_scope_text(tpl.scope_type, tpl.scope_id)})"
@@ -494,7 +510,9 @@ async def claim_drop_redeem(
     if exhausted:
         drop.active = False
     exp_note = ""
-    if exp_hours:
+    if exp_at:
+        exp_note = f" It expires {exp_at.strftime('%b %d, %Y %H:%M UTC')}."
+    elif exp_hours:
         exp_note = f" It expires in {exp_hours}h." if exp_hours % 24 else f" It expires in {exp_hours // 24}d."
     return {"message": f"🎁 You claimed {reward_txt}!{exp_note}", "exhausted": exhausted}, None
 
@@ -639,7 +657,7 @@ async def apply_first_touch_grants(session, guild_id: int, user_id: int) -> None
         session.add(BonusBetLot(
             guild_id=guild_id, discord_user_id=user_id,
             original_amount=g.amount, amount_remaining=g.amount,
-            expires_at=_expiry_from_hours(g.expiry_hours),
+            expires_at=_resolve_expiry(g.expiry_hours, g.expires_at),
             source="GRANT_USER", grant_id=g.id, status="ACTIVE",
         ))
 
@@ -651,6 +669,7 @@ async def apply_first_touch_grants(session, guild_id: int, user_id: int) -> None
         )
     )).scalars().all()
     ft_grant_hours: dict[int, int | None] = {}
+    ft_grant_expires_at: dict[int, datetime | None] = {}
     if ft_templates:
         for pg in (await session.execute(
             select(ProfitBoostGrant).where(
@@ -660,12 +679,15 @@ async def apply_first_touch_grants(session, guild_id: int, user_id: int) -> None
             )
         )).scalars().all():
             ft_grant_hours[pg.template_id] = pg.expiry_hours
+            ft_grant_expires_at[pg.template_id] = pg.expires_at
     for tpl in ft_templates:
         session.add(ProfitBoostToken(
             guild_id=guild_id, discord_user_id=user_id, template_id=tpl.id,
             boost_pct=tpl.boost_pct, scope_type=tpl.scope_type,
             scope_id=tpl.scope_id, max_wager=tpl.max_wager, status="ACTIVE",
-            expires_at=_expiry_from_hours(ft_grant_hours.get(tpl.id)),
+            expires_at=_resolve_expiry(
+                ft_grant_hours.get(tpl.id), ft_grant_expires_at.get(tpl.id)
+            ),
         ))
 
 
@@ -769,6 +791,7 @@ async def apply_deposit_match(
         await grant_bonus_to_users(
             session, guild_id, [user_id], matched, expiry_hours,
             source="DEPOSIT_MATCH", grant_id=promo.id,
+            expires_at=promo.match_bonus_expires_at,
         )
     return matched
 
@@ -922,7 +945,9 @@ async def purchase_boost(
         guild_id=guild_id, discord_user_id=user_id, template_id=tpl.id,
         boost_pct=tpl.boost_pct, scope_type=tpl.scope_type, scope_id=tpl.scope_id,
         max_wager=tpl.max_wager, status="ACTIVE",
-        expires_at=_expiry_from_hours(item.expiry_days * 24 if item.expiry_days else None),
+        expires_at=_resolve_expiry(
+            item.expiry_days * 24 if item.expiry_days else None, item.expiry_at
+        ),
     )
     session.add(token)
     await session.flush()

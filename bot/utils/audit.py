@@ -124,6 +124,12 @@ async def _log_channel(bot: commands.Bot, guild_id: int) -> discord.TextChannel 
     if channel_id is None:
         return None
     channel = bot.get_channel(channel_id)
+    if channel is None:
+        # REST-only clients (the web process) have no channel cache.
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.HTTPException:
+            return None
     return channel if isinstance(channel, discord.TextChannel) else None
 
 

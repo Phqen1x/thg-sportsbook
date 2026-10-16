@@ -446,6 +446,21 @@ def _placement_milestone_conflict(existing_markets: list[Market], new_mkt: Marke
                 continue
             if new_mkt.type in _implied_milestones(m):
                 return _MSG
+    # Placement over/under legs overlap with final-8/final-5 legs on the same
+    # tribute (an "under" line implies making the cut, an "over" implies missing
+    # it), so the two are never independent.
+    if new_mkt.tribute_a_id is not None:
+        for m in existing_markets:
+            if m.tribute_a_id != new_mkt.tribute_a_id:
+                continue
+            if (new_mkt.type == "PLACEMENT_OU" and m.type in _ALL_MILESTONES) or (
+                new_mkt.type in _ALL_MILESTONES and m.type == "PLACEMENT_OU"
+            ):
+                return (
+                    "You can't parlay a placement over/under with a final 8 / "
+                    "final 5 bet on the same tribute — they depend on the same "
+                    "finishing position."
+                )
     return None
 
 

@@ -13,6 +13,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 from bot import config as _bot
 
 BOT_TOKEN: str = _bot.BOT_TOKEN
+MAIN_GUILD_ID: int = _bot.MAIN_GUILD_ID
 ADMIN_ROLE_ID: int | None = _bot.ADMIN_ROLE_ID
 DB_PATH: str = _bot.DB_PATH
 DEFAULT_CHIPS: int = _bot.DEFAULT_CHIPS

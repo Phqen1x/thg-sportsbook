@@ -13,6 +13,7 @@ from bot.database.engine import (
     get_session, get_read_session, get_setting, current_guild_id,
     get_guild_setting, set_guild_setting, set_guild_context,
 )
+from bot import config
 from bot.database.models import Alliance, Bet, BettingPhase, Market, MarketTemplate, Parlay, Tribute, User
 from bot.imaging.hot_odds import (
     BoardCardData, FeaturedMarket, TributeDetailData,
@@ -445,6 +446,8 @@ class DisplayCog(commands.Cog):
     @tasks.loop(minutes=1)
     async def _odds_watch_loop(self) -> None:
         for guild in list(self.bot.guilds):
+            if guild.id != config.MAIN_GUILD_ID:
+                continue
             try:
                 await self._check_odds_updates(guild)
             except Exception:

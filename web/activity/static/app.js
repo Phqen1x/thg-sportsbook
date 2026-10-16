@@ -163,7 +163,7 @@ function renderShell() {
   if (isAdmin) tabs.push(["admin", "Admin"]);
   document.getElementById("app").innerHTML = `
     <header class="topbar">
-      <div class="brand"><img src="static/panem.png" alt="" class="brand-logo"> PANEM</div>
+      <div class="brand"><img src="static/panem.png" alt="" class="brand-logo"> PANEM SPORTSBOOK</div>
       <nav class="tabs" id="tabs">
         ${tabs.map((t) => tabLink(t)).join("")}
       </nav>
@@ -176,8 +176,14 @@ function renderShell() {
       ${TABS.map((t) => tabLink(t)).join("")}
       ${isAdmin ? tabLink(["admin", "Admin"], "tabs-grid-admin") : ""}
     </nav>
-    <main id="view" class="view"></main>`;
+    <main id="view" class="view"></main>
+    <footer class="act-footer">
+      <button type="button" class="btn btn-sm btn-outline act-footer-btn" id="act-btn-privacy">Privacy Policy</button>
+      <button type="button" class="btn btn-sm btn-outline act-footer-btn" id="act-btn-terms">Terms of Service</button>
+    </footer>`;
   window.addEventListener("hashchange", route);
+  document.getElementById("act-btn-privacy")?.addEventListener("click", () => openLegalModal("privacy"));
+  document.getElementById("act-btn-terms")?.addEventListener("click", () => openLegalModal("terms"));
 }
 
 const VIEWS = {
@@ -190,6 +196,8 @@ const VIEWS = {
   shop: viewShop,
   admin: viewAdmin,
   balance: viewBalance,
+  privacy: (v) => viewLegalDoc(v, "privacy"),
+  terms: (v) => viewLegalDoc(v, "terms"),
 };
 
 async function route() {
@@ -889,7 +897,15 @@ async function viewBalance(view) {
           </div>
           <span class="status status-${esc(a.status.toLowerCase())}">${esc(a.status)}</span>
         </div>`).join("") : `<div class="empty">No activity yet.</div>`}
+    </div>
+    <h2 class="section-title">Legal & Information</h2>
+    <div class="card" style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+      <button type="button" class="btn btn-sm btn-outline" id="bal-btn-privacy">Privacy Policy</button>
+      <button type="button" class="btn btn-sm btn-outline" id="bal-btn-terms">Terms of Service</button>
     </div>`;
+
+  $("#bal-btn-privacy", view)?.addEventListener("click", () => openLegalModal("privacy"));
+  $("#bal-btn-terms", view)?.addEventListener("click", () => openLegalModal("terms"));
 
   const toggle = $("#bonus-toggle", view);
   if (toggle) {
@@ -951,7 +967,7 @@ async function viewShop(view) {
               <div>
                 <div><span class="odds-pos">+${it.boost_pct}%</span> profit boost · ${esc(scopeText(it))}</div>
                 <div class="dim" style="font-size:.8rem">
-                  ${esc(it.name)}${it.max_wager ? ` · max wager ${fmtChips(it.max_wager)}` : ""}${it.expiry_days ? ` · expires ${it.expiry_days}d after purchase` : ""}${it.per_user_limit ? ` · limit ${it.per_user_limit} (bought ${it.owned})` : ""}
+                  ${esc(it.name)}${it.max_wager ? ` · max wager ${fmtChips(it.max_wager)}` : ""}${it.expiry_at ? ` · expires ${new Date(it.expiry_at).toLocaleString([], { month: "short", day: "numeric" })}` : it.expiry_days ? ` · expires ${it.expiry_days}d after purchase` : ""}${it.per_user_limit ? ` · limit ${it.per_user_limit} (bought ${it.owned})` : ""}
                 </div>
               </div>
               <div style="text-align:right;white-space:nowrap">
@@ -1071,6 +1087,7 @@ async function adminPromos(body) {
       <input id="cd-max" class="input" type="number" min="1" placeholder="Max claims (blank = unlimited)">
       <input id="cd-dur" class="input" type="number" min="1" placeholder="Button open for N hours (blank = no limit)">
       <input id="cd-rexp" class="input" type="number" min="1" placeholder="Reward expires after N days (blank = permanent)">
+      <input id="cd-rexpat" class="input" type="datetime-local" title="…or reward expires on this exact date (overrides the days above)">
       <button class="btn btn-primary" id="cd-go">Post Drop</button>
     </div>
     <div class="card" style="flex:1 1 260px">
@@ -1087,6 +1104,7 @@ async function adminPromos(body) {
       <input id="bg-amount" class="input" type="number" min="1" value="2500" placeholder="Amount (chips)">
       <input id="bg-days" class="input" type="number" min="1" placeholder="Valid days (blank = permanent)">
       <input id="bg-hours" class="input" type="number" min="1" placeholder="Valid hours (optional)">
+      <input id="bg-expat" class="input" type="datetime-local" title="…or expires on this exact date (overrides the days/hours above)">
       <input id="bg-note" class="input" placeholder="Note (optional)">
       <button class="btn btn-primary" id="bg-go">Grant Bonus</button>
     </div>
@@ -1102,7 +1120,7 @@ async function adminPromos(body) {
     ${data.ft_bonus.length ? `<div class="card">
       <div class="card-label">FIRST-INTERACTION BONUS RULES</div>
       ${data.ft_bonus.map((g) => `<div class="list-row">
-        <span>${fmtChips(g.amount)}${g.expiry_hours ? ` · ${g.expiry_hours}h` : ""}${g.note ? ` · ${esc(g.note)}` : ""}</span>
+        <span>${fmtChips(g.amount)}${g.expires_at ? ` · exp ${fmtDt(g.expires_at)}` : g.expiry_hours ? ` · ${g.expiry_hours}h` : ""}${g.note ? ` · ${esc(g.note)}` : ""}</span>
         <button class="btn btn-sm btn-danger" data-act="ft-del" data-id="${g.id}">Remove</button>
       </div>`).join("")}
     </div>` : ""}
@@ -1151,6 +1169,7 @@ async function adminPromos(body) {
       <input id="bgr-target" class="input" placeholder="Discord user ID (blank for first-interaction)">
       <input id="bgr-days" class="input" type="number" min="1" placeholder="Valid days (blank = no expiry)">
       <input id="bgr-hours" class="input" type="number" min="1" placeholder="Valid hours (optional)">
+      <input id="bgr-expat" class="input" type="datetime-local" title="…or expires on this exact date (overrides the days/hours above)">
       <button class="btn btn-primary" id="bgr-go">Grant Boost</button>
     </div>
 
@@ -1169,6 +1188,7 @@ async function adminPromos(body) {
       <input id="dm-pct" class="input" type="number" min="1" value="100" placeholder="Match %">
       <input id="dm-cap" class="input" type="number" min="1" value="5000" placeholder="Max match per member (Bonus Chips)">
       <input id="dm-bexp" class="input" type="number" min="1" placeholder="Matched Bonus Chips expire after N days (blank = permanent)">
+      <input id="dm-bexpat" class="input" type="datetime-local" title="…or matched Bonus Chips expire on this exact date (overrides the days above)">
       <input id="dm-start" class="input" type="datetime-local" placeholder="Starts (blank = now)">
       <input id="dm-end" class="input" type="datetime-local" placeholder="Ends">
       <input id="dm-role" class="input" placeholder="Restrict to role ID (optional)">
@@ -1178,7 +1198,7 @@ async function adminPromos(body) {
     <div class="card">
       <div class="card-label">DEPOSIT MATCH PROMOS</div>
       ${data.deposit_promos.length ? data.deposit_promos.map((p) => `<div class="list-row">
-        <span>${esc(p.name)} ${p.live ? "<span class='odds-pos'>● live</span>" : ""} — ${p.match_pct}% up to ${fmtChips(p.max_match_per_user)} in Bonus Chips · <span class="dim">${p.match_bonus_expiry_days ? `${p.match_bonus_expiry_days}d expiry · ` : ""}${fmtDt(p.starts_at)} → ${fmtDt(p.ends_at)}${p.role_id ? ` · role ${p.role_id}` : ""} · ${p.claims.members} claim(s), ${fmtChips(p.claims.matched)} matched</span></span>
+        <span>${esc(p.name)} ${p.live ? "<span class='odds-pos'>● live</span>" : ""} — ${p.match_pct}% up to ${fmtChips(p.max_match_per_user)} in Bonus Chips · <span class="dim">${p.match_bonus_expires_at ? `exp ${fmtDt(p.match_bonus_expires_at)} · ` : p.match_bonus_expiry_days ? `${p.match_bonus_expiry_days}d expiry · ` : ""}${fmtDt(p.starts_at)} → ${fmtDt(p.ends_at)}${p.role_id ? ` · role ${p.role_id}` : ""} · ${p.claims.members} claim(s), ${fmtChips(p.claims.matched)} matched</span></span>
         <span>
           ${p.live ? `<button class="btn btn-sm" data-act="dm-end" data-id="${p.id}">End now</button>` : ""}
           <button class="btn btn-sm btn-danger" data-act="dm-del" data-id="${p.id}">Delete</button>
@@ -1216,6 +1236,7 @@ async function adminPromos(body) {
       </select>
       <input id="si-price" class="input" type="number" min="1" placeholder="Price (Bonus Chips)">
       <input id="si-exp" class="input" type="number" min="1" placeholder="Token expires after N days (blank = permanent)">
+      <input id="si-expat" class="input" type="datetime-local" title="…or token expires on this exact date (overrides the days above)">
       <input id="si-limit" class="input" type="number" min="1" placeholder="Per-member purchase limit (blank = unlimited)">
       <button class="btn btn-primary" id="si-go">Add Item</button>
     </div>
@@ -1223,7 +1244,7 @@ async function adminPromos(body) {
     <div class="card">
       <div class="card-label">SHOP ITEMS</div>
       ${data.shop_items.length ? data.shop_items.map((it) => `<div class="list-row" style="flex-wrap:wrap">
-        <span>${esc(it.name)} — <span class="odds-pos">+${it.boost_pct != null ? it.boost_pct : "?"}%</span> ${it.scope_label || ""} · <span class="dim">${it.expiry_days ? `${it.expiry_days}d token · ` : ""}${it.per_user_limit ? `limit ${it.per_user_limit} · ` : ""}${it.active ? "active" : "disabled"}</span></span>
+        <span>${esc(it.name)} — <span class="odds-pos">+${it.boost_pct != null ? it.boost_pct : "?"}%</span> ${it.scope_label || ""} · <span class="dim">${it.expiry_at ? `exp ${fmtDt(it.expiry_at)} token · ` : it.expiry_days ? `${it.expiry_days}d token · ` : ""}${it.per_user_limit ? `limit ${it.per_user_limit} · ` : ""}${it.active ? "active" : "disabled"}</span></span>
         <span style="display:flex;gap:.35rem;align-items:center">
           <input class="input" style="width:6rem" type="number" min="1" value="${it.price_bonus_bets}" data-si-price="${it.id}">
           <button class="btn btn-sm" data-act="si-setprice" data-id="${it.id}">Set</button>
@@ -1288,9 +1309,10 @@ async function adminPromos(body) {
     const msg = $("#cd-msg", body).value.trim();
     const roleName = cdRoleName();
     let contains = cdRewardLabel();
-    const rexp = num("cd-rexp"), maxc = num("cd-max");
+    const rexp = num("cd-rexp"), rexpat = val("cd-rexpat"), maxc = num("cd-max");
     const extras = [];
-    if (rexp) extras.push(`expires ${rexp}d after you claim`);
+    if (rexpat) extras.push(`expires ${fmtDt(isoUtc("cd-rexpat"))}`);
+    else if (rexp) extras.push(`expires ${rexp}d after you claim`);
     if (maxc) extras.push(`first ${fmtChips(maxc)} claimers only`);
     if (extras.length) contains += `<br><span class="dim">${esc(extras.join(" · "))}</span>`;
     p.innerHTML = `
@@ -1310,7 +1332,7 @@ async function adminPromos(body) {
     $("#cd-tpl", body).style.display = boost ? "" : "none";
     renderCdPreview();
   };
-  ["cd-kind", "cd-role", "cd-amount", "cd-tpl", "cd-msg", "cd-max", "cd-rexp"].forEach((id) => {
+  ["cd-kind", "cd-role", "cd-amount", "cd-tpl", "cd-msg", "cd-max", "cd-rexp", "cd-rexpat"].forEach((id) => {
     const el = $("#" + id, body);
     el.addEventListener("input", renderCdPreview);
     el.addEventListener("change", renderCdPreview);
@@ -1329,13 +1351,15 @@ async function adminPromos(body) {
         boost_template_id: Number($("#cd-tpl", body).value) || 0,
         message: msg, max_claims: num("cd-max"),
         duration_hours: num("cd-dur"), reward_expiry_days: num("cd-rexp"),
+        reward_expiry_date: isoUtc("cd-rexpat"),
       },
     });
   });
   $("#bg-go", body).addEventListener("click", () => call("/admin/promos/bonus/grant", {
     method: "POST",
     body: { scope: val("bg-scope"), target_id: val("bg-target"), amount: num("bg-amount"),
-      expiry_days: num("bg-days"), expiry_hours: num("bg-hours"), note: val("bg-note") },
+      expiry_days: num("bg-days"), expiry_hours: num("bg-hours"),
+      expiry_date: isoUtc("bg-expat"), note: val("bg-note") },
   }));
   $("#bd-go", body).addEventListener("click", (ev) => armConfirm(ev.currentTarget, () =>
     call("/admin/promos/bonus/deduct", { method: "POST",
@@ -1348,12 +1372,13 @@ async function adminPromos(body) {
   $("#bgr-go", body).addEventListener("click", () => call("/admin/promos/boost/grant", {
     method: "POST",
     body: { template_id: Number($("#bgr-tpl", body).value), scope: val("bgr-scope"),
-      target_id: val("bgr-target"), expiry_days: num("bgr-days"), expiry_hours: num("bgr-hours") },
+      target_id: val("bgr-target"), expiry_days: num("bgr-days"), expiry_hours: num("bgr-hours"),
+      expiry_date: isoUtc("bgr-expat") },
   }));
   $("#dm-go", body).addEventListener("click", () => call("/admin/promos/deposit-match", {
     method: "POST",
     body: { name: val("dm-name"), match_pct: num("dm-pct"), max_match_per_user: num("dm-cap"),
-      match_bonus_expiry_days: num("dm-bexp"),
+      match_bonus_expiry_days: num("dm-bexp"), match_bonus_expiry_date: isoUtc("dm-bexpat"),
       starts_at: isoUtc("dm-start"), ends_at: isoUtc("dm-end"), role_id: val("dm-role") },
   }));
 
@@ -1391,7 +1416,8 @@ async function adminPromos(body) {
       body: {
         boost_template_id: Number($("#si-tpl", body).value) || 0,
         price_bonus_bets: num("si-price"),
-        expiry_days: num("si-exp"), per_user_limit: num("si-limit"),
+        expiry_days: num("si-exp"), expiry_date: isoUtc("si-expat"),
+        per_user_limit: num("si-limit"),
       },
     });
   });
@@ -2007,6 +2033,63 @@ function modal(innerHtml) {
   return overlay;
 }
 
+async function openLegalModal(doc) {
+  const overlay = modal(`
+    <div class="modal-legal-header">
+      <h3 id="legal-modal-title">Loading…</h3>
+      <button type="button" class="btn btn-sm btn-outline" id="legal-close-btn">&times;</button>
+    </div>
+    <div class="modal-legal-body" id="legal-modal-body">
+      <div class="loading-inline">Loading document…</div>
+    </div>
+    <div class="row-buttons" style="margin-top:0.5rem">
+      <button type="button" class="btn btn-outline" style="flex:1" id="legal-done-btn">Close</button>
+    </div>
+  `);
+  const mBox = overlay.querySelector(".modal");
+  if (mBox) mBox.classList.add("modal-legal");
+  overlay.querySelector("#legal-close-btn")?.addEventListener("click", () => overlay.remove());
+  overlay.querySelector("#legal-done-btn")?.addEventListener("click", () => overlay.remove());
+
+  try {
+    const data = await api(`/legal/${doc}`);
+    const titleEl = overlay.querySelector("#legal-modal-title");
+    const bodyEl = overlay.querySelector("#legal-modal-body");
+    if (titleEl) titleEl.textContent = data.title;
+    if (bodyEl) bodyEl.innerHTML = data.html;
+  } catch (err) {
+    const bodyEl = overlay.querySelector("#legal-modal-body");
+    if (bodyEl) bodyEl.innerHTML = `<div class="empty">Failed to load document: ${esc(err.message)}</div>`;
+  }
+}
+
+async function viewLegalDoc(view, doc) {
+  view.innerHTML = `
+    <div class="legal-view-bar" style="margin-bottom:0.75rem;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem">
+      <div style="display:flex;gap:0.4rem">
+        <a href="${location.pathname}${location.search}#privacy" class="btn btn-sm ${doc === "privacy" ? "btn-primary" : "btn-outline"}">Privacy Policy</a>
+        <a href="${location.pathname}${location.search}#terms" class="btn btn-sm ${doc === "terms" ? "btn-primary" : "btn-outline"}">Terms of Service</a>
+      </div>
+      <a href="${location.pathname}${location.search}#markets" class="btn btn-sm btn-outline">&larr; Back to Markets</a>
+    </div>
+    <div class="card legal-card" id="legal-doc-content" style="padding:1.25rem;">
+      <div class="loading-inline">Loading document…</div>
+    </div>
+  `;
+  try {
+    const data = await api(`/legal/${doc}`);
+    const card = view.querySelector("#legal-doc-content");
+    if (card) {
+      card.innerHTML = `<div class="legal-content">${data.html}</div>`;
+    }
+  } catch (err) {
+    const card = view.querySelector("#legal-doc-content");
+    if (card) {
+      card.innerHTML = `<div class="empty">Failed to load document: ${esc(err.message)}</div>`;
+    }
+  }
+}
+
 async function openBetModal(marketId) {
   const data = await api(`/markets?status=open`);
   const m = data.markets.find((x) => x.id === marketId);
@@ -2217,7 +2300,7 @@ function openKillModal(tributeId, name) {
     document.getElementById("app").innerHTML = `
       <div class="fatal">
         <div class="loading-crest">⚔</div>
-        <p>${esc(e.message)}</p>
+        <p>${esc(e.message).replace(/https:\/\/discord\.gg\/\w+/g, (u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`)}</p>
         <button class="btn btn-outline" onclick="location.reload()">Try Again</button>
       </div>`;
   }

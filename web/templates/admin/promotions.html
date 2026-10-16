@@ -20,7 +20,7 @@
 
 <div class="card">
   <div class="card-label">GRANT BONUS CHIPS</div>
-  <form method="post" action="/admin/promotions/bonus/grant">
+  <form method="post" action="/admin/promotions/bonus/grant" id="bg-grant-form">
     <div class="form-group">
       <label class="form-label">Target</label>
       <select name="scope" class="form-control">
@@ -44,12 +44,27 @@
       </div>
     </div>
     <div class="form-group">
+      <label class="form-label">…or expires on this date <span class="text-dim">(overrides the days/hours above; your local time)</span></label>
+      <input type="datetime-local" id="bg-expiry-date-local" class="form-control">
+      <input type="hidden" name="expiry_date">
+    </div>
+    <div class="form-group">
       <label class="form-label">Note <span class="text-dim">(optional)</span></label>
       <input type="text" name="note" class="form-control" maxlength="200">
     </div>
     <button type="submit" class="btn btn-primary">Grant</button>
   </form>
 </div>
+<script>
+  (function () {
+    var f = document.getElementById("bg-grant-form");
+    if (!f) return;
+    f.addEventListener("submit", function () {
+      var v = document.getElementById("bg-expiry-date-local").value;
+      f.elements["expiry_date"].value = v ? new Date(v).toISOString() : "";
+    });
+  })();
+</script>
 
 <div class="card mt-3">
   <div class="card-label">DEDUCT BONUS CHIPS</div>
@@ -76,12 +91,12 @@
 <div class="card mt-3">
   <div class="card-label">FIRST-INTERACTION BONUS RULES</div>
   <table class="table">
-    <thead><tr><th>Amount</th><th>Expiry (h)</th><th>Note</th><th></th></tr></thead>
+    <thead><tr><th>Amount</th><th>Expiry</th><th>Note</th><th></th></tr></thead>
     <tbody>
       {% for g in ft_bonus %}
       <tr>
         <td class="text-gold font-bold">{{ "{:,}".format(g.amount) }}</td>
-        <td>{{ g.expiry_hours or "—" }}</td>
+        <td>{{ g.expires_at.strftime("%Y-%m-%d %H:%M") if g.expires_at else (g.expiry_hours ~ "h" if g.expiry_hours else "—") }}</td>
         <td class="text-dim">{{ g.note or "" }}</td>
         <td>
           <form method="post" action="/admin/promotions/bonus/first-touch/{{ g.id }}/delete">
@@ -182,7 +197,7 @@
 
 <div class="card mt-3">
   <div class="card-label">GRANT A BOOST</div>
-  <form method="post" action="/admin/promotions/boost/grant">
+  <form method="post" action="/admin/promotions/boost/grant" id="bgr-grant-form">
     <div class="form-group">
       <label class="form-label">Template</label>
       <select name="template_id" class="form-control" required>
@@ -207,9 +222,24 @@
         <input type="number" name="expiry_hours" class="form-control" min="0" value="0" placeholder="hours">
       </div>
     </div>
+    <div class="form-group">
+      <label class="form-label">…or expires on this date <span class="text-dim">(overrides the days/hours above; your local time)</span></label>
+      <input type="datetime-local" id="bgr-expiry-date-local" class="form-control">
+      <input type="hidden" name="expiry_date">
+    </div>
     <button type="submit" class="btn btn-primary">Grant</button>
   </form>
 </div>
+<script>
+  (function () {
+    var f = document.getElementById("bgr-grant-form");
+    if (!f) return;
+    f.addEventListener("submit", function () {
+      var v = document.getElementById("bgr-expiry-date-local").value;
+      f.elements["expiry_date"].value = v ? new Date(v).toISOString() : "";
+    });
+  })();
+</script>
 
 <div class="section-header mt-3"><h2>Outstanding Boost Tokens</h2></div>
 <div class="card">
@@ -302,10 +332,11 @@
     <div class="form-group"><label class="form-label">Match %</label><input type="number" name="match_pct" class="form-control" step="1" min="1" value="100" required></div>
     <div class="form-group"><label class="form-label">Max match per member (Bonus Chips)</label><input type="number" name="max_match_per_user" class="form-control" min="1" value="5000" required></div>
     <div class="form-group"><label class="form-label">Matched Bonus Chips expire after <span class="text-dim">(days — blank/0 = permanent)</span></label><input type="number" name="match_bonus_expiry_days" class="form-control" min="0" value="0"></div>
+    <div class="form-group"><label class="form-label">…or matched Bonus Chips expire on this date <span class="text-dim">(overrides the days above; your local time)</span></label><input type="datetime-local" id="dm-bexpiry" class="form-control"></div>
     <div class="form-group"><label class="form-label">Starts <span class="text-dim">(blank = now, your local time)</span></label><input type="datetime-local" id="dm-starts" class="form-control"></div>
     <div class="form-group"><label class="form-label">Ends <span class="text-dim">(your local time)</span></label><input type="datetime-local" id="dm-ends" class="form-control" required></div>
     <div class="form-group"><label class="form-label">Restrict to role ID <span class="text-dim">(optional — blank = everyone)</span></label><input type="text" name="role_id" class="form-control"></div>
-    <input type="hidden" name="starts_at"><input type="hidden" name="ends_at">
+    <input type="hidden" name="starts_at"><input type="hidden" name="ends_at"><input type="hidden" name="match_bonus_expiry_date">
     <button type="submit" class="btn btn-primary">Create</button>
   </form>
 </div>
@@ -316,8 +347,10 @@
     f.addEventListener("submit", function () {
       var s = document.getElementById("dm-starts").value;
       var e = document.getElementById("dm-ends").value;
+      var b = document.getElementById("dm-bexpiry").value;
       f.elements["starts_at"].value = s ? new Date(s).toISOString() : "";
       f.elements["ends_at"].value = e ? new Date(e).toISOString() : "";
+      f.elements["match_bonus_expiry_date"].value = b ? new Date(b).toISOString() : "";
     });
   })();
 </script>
@@ -331,7 +364,7 @@
         <td>{{ p.name }}{% if p.starts_at <= now and p.ends_at > now and p.active %} <span class="text-gold">● live</span>{% endif %}</td>
         <td class="text-gold font-bold">{{ p.match_pct }}%</td>
         <td>{{ "{:,}".format(p.max_match_per_user) }}</td>
-        <td class="text-dim">{{ (p.match_bonus_expiry_days ~ "d") if p.match_bonus_expiry_days else "permanent" }}</td>
+        <td class="text-dim">{{ p.match_bonus_expires_at.strftime("%Y-%m-%d %H:%M") if p.match_bonus_expires_at else ((p.match_bonus_expiry_days ~ "d") if p.match_bonus_expiry_days else "permanent") }}</td>
         <td class="text-dim" style="font-size:0.8rem">{{ p.starts_at.strftime("%m-%d %H:%M") }} → {{ p.ends_at.strftime("%m-%d %H:%M") }}</td>
         <td class="text-dim">{{ p.role_id or "all" }}</td>
         <td class="text-dim">

@@ -598,3 +598,30 @@ async def select_server_post(
     resp = RedirectResponse("/", status_code=303)
     set_session(resp, user)
     return resp
+
+
+@router.get("/privacy")
+async def privacy_policy(request: Request, user: SessionUser | None = Depends(optional_user)):
+    from web.markdown import get_legal_doc
+    title, content_html = get_legal_doc("privacy")
+    return request.app.state.templates.TemplateResponse("legal.html", {
+        "request": request,
+        "user": user,
+        "title": title,
+        "content": content_html,
+        "is_privacy": True,
+    })
+
+
+@router.get("/terms")
+async def terms_of_service(request: Request, user: SessionUser | None = Depends(optional_user)):
+    from web.markdown import get_legal_doc
+    title, content_html = get_legal_doc("terms")
+    return request.app.state.templates.TemplateResponse("legal.html", {
+        "request": request,
+        "user": user,
+        "title": title,
+        "content": content_html,
+        "is_privacy": False,
+    })
+

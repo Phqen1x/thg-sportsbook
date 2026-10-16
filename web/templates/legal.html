@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Panem Sportsbook{% endblock %}
+
+{% block content %}
+<div class="legal-page">
+  <div class="legal-nav-bar">
+    <div class="legal-tabs">
+      <a href="/privacy" class="btn btn-sm {% if is_privacy %}btn-primary{% else %}btn-outline{% endif %}">Privacy Policy</a>
+      <a href="/terms" class="btn btn-sm {% if not is_privacy %}btn-primary{% else %}btn-outline{% endif %}">Terms of Service</a>
+    </div>
+    <a href="/markets" class="btn btn-sm btn-ghost">&larr; Back to Markets</a>
+  </div>
+
+  <div class="card legal-card">
+    <div class="legal-content">
+      {{ content | safe }}
+    </div>
+  </div>
+
+  <div class="legal-bottom-nav">
+    <div class="legal-tabs">
+      <a href="/privacy" class="btn btn-sm {% if is_privacy %}btn-primary{% else %}btn-outline{% endif %}">Privacy Policy</a>
+      <a href="/terms" class="btn btn-sm {% if not is_privacy %}btn-primary{% else %}btn-outline{% endif %}">Terms of Service</a>
+    </div>
+    <a href="#top" class="btn btn-sm btn-ghost">&uarr; Back to Top</a>
+  </div>
+</div>
+{% endblock %}

@@ -19,6 +19,18 @@ logging.basicConfig(
 log = logging.getLogger("capitol")
 
 
+async def _reject_if_wrong_guild(interaction: discord.Interaction) -> bool:
+    """True (and responds) if the interaction didn't come from the main server.
+    The app can be installed anywhere but only works in config.MAIN_GUILD_ID."""
+    if interaction.guild_id == config.MAIN_GUILD_ID:
+        return False
+    try:
+        await interaction.response.send_message(config.WRONG_SERVER_MESSAGE, ephemeral=True)
+    except (discord.InteractionResponded, discord.HTTPException):
+        pass
+    return True
+
+
 async def _reject_if_tribute_locked(interaction: discord.Interaction) -> bool:
     """True (and responds) if this interaction's user is locked out as a
     Tribute — call sites must stop processing the interaction when this
@@ -55,18 +67,24 @@ def _install_component_guild_context() -> None:
     _orig_dynamic_item_call = discord.ui.view.ViewStore.schedule_dynamic_item_call
 
     async def _view_task(self, item, interaction):
+        if await _reject_if_wrong_guild(interaction):
+            return
         set_guild_context(interaction.guild_id or 0)
         if await _reject_if_tribute_locked(interaction):
             return
         return await _orig_view_task(self, item, interaction)
 
     async def _modal_task(self, interaction, *args, **kwargs):
+        if await _reject_if_wrong_guild(interaction):
+            return
         set_guild_context(interaction.guild_id or 0)
         if await _reject_if_tribute_locked(interaction):
             return
         return await _orig_modal_task(self, interaction, *args, **kwargs)
 
     async def _dynamic_item_call(self, component_type, factory, interaction, custom_id, match):
+        if await _reject_if_wrong_guild(interaction):
+            return
         set_guild_context(interaction.guild_id or 0)
         if await _reject_if_tribute_locked(interaction):
             return
@@ -84,6 +102,8 @@ class SportsBookCommandTree(app_commands.CommandTree):
         # one hook that fires for *all* app commands — including read-only ones
         # that aren't wrapped by the audit decorator. Stamp the per-guild DB
         # context here so they don't fall through to sportsbook_0.db.
+        if await _reject_if_wrong_guild(interaction):
+            return
         set_guild_context(interaction.guild_id or 0)
         if await _reject_if_tribute_locked(interaction):
             return
@@ -151,6 +171,9 @@ class SportsBookBot(commands.Bot):
         await post_audit_log(self, interaction)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
+        if guild.id != config.MAIN_GUILD_ID:
+            log.info(f"Joined non-main guild {guild.id} ({guild.name}); not initialising.")
+            return
         log.info(f"Joined guild {guild.id} ({guild.name}), initialising database…")
         await init_db(guild.id)
 
@@ -158,11 +181,13 @@ class SportsBookBot(commands.Bot):
         assert self.user is not None
         log.info(f"Logged in as {self.user} (ID: {self.user.id})")
         for guild in self.guilds:
+            if guild.id != config.MAIN_GUILD_ID:
+                continue
             await init_db(guild.id)
             log.info(f"Serving guild {guild.id} ({guild.name}) → sportsbook_{guild.id}.db")
 
-        if self.guilds:
-            set_guild_context(self.guilds[0].id)
+        if any(g.id == config.MAIN_GUILD_ID for g in self.guilds):
+            set_guild_context(config.MAIN_GUILD_ID)
             saved_theme = await get_setting("image_theme")
             if saved_theme:
                 theme = get_theme_by_name(saved_theme)

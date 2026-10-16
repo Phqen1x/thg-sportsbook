@@ -710,9 +710,38 @@ async def _migrate_schema() -> None:
 
         # Promo claim drops can now ping a role above their announcement embed.
         rows = await conn.execute(text("PRAGMA table_info(promo_claim_drops)"))
-        if "ping_role_id" not in {row[1] for row in rows.fetchall()}:
+        promo_drop_cols = {row[1] for row in rows.fetchall()}
+        if "ping_role_id" not in promo_drop_cols:
             await conn.execute(text(
                 "ALTER TABLE promo_claim_drops ADD COLUMN ping_role_id BIGINT"
+            ))
+
+        # Bonus Chip / profit-boost grants, deposit-match rewards, claim-drop
+        # rewards and shop tokens can now expire on an admin-picked absolute
+        # date instead of only "N days/hours after grant".
+        rows = await conn.execute(text("PRAGMA table_info(bonus_grants)"))
+        if "expires_at" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE bonus_grants ADD COLUMN expires_at DATETIME"
+            ))
+        rows = await conn.execute(text("PRAGMA table_info(profit_boost_grants)"))
+        if "expires_at" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE profit_boost_grants ADD COLUMN expires_at DATETIME"
+            ))
+        if "reward_expires_at" not in promo_drop_cols:
+            await conn.execute(text(
+                "ALTER TABLE promo_claim_drops ADD COLUMN reward_expires_at DATETIME"
+            ))
+        rows = await conn.execute(text("PRAGMA table_info(deposit_match_promos)"))
+        if "match_bonus_expires_at" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE deposit_match_promos ADD COLUMN match_bonus_expires_at DATETIME"
+            ))
+        rows = await conn.execute(text("PRAGMA table_info(boost_shop_items)"))
+        if "expiry_at" not in {row[1] for row in rows.fetchall()}:
+            await conn.execute(text(
+                "ALTER TABLE boost_shop_items ADD COLUMN expiry_at DATETIME"
             ))
 
 

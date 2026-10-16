@@ -523,6 +523,11 @@ class BonusGrant(Base):
     target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     amount: Mapped[int] = mapped_column(Integer, nullable=False)
     expiry_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Absolute expiry, as an alternative to expiry_hours — when set, every lot
+    # this grant creates (immediately, or later for FIRST_TOUCH) expires on this
+    # exact timestamp instead of N hours after it was granted. Takes precedence
+    # over expiry_hours when both are set.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     note: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     recipients_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -584,6 +589,8 @@ class ProfitBoostGrant(Base):
     scope: Mapped[str] = mapped_column(String(12), nullable=False)  # USER|FIRST_TOUCH
     target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     expiry_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Absolute expiry, as an alternative to expiry_hours — see BonusGrant.expires_at.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     recipients_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -603,6 +610,10 @@ class DepositMatchPromo(Base):
     max_match_per_user: Mapped[int] = mapped_column(Integer, nullable=False)
     # Expiry applied to the granted Bonus Chip lot (days). Null = permanent.
     match_bonus_expiry_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Absolute expiry, as an alternative to match_bonus_expiry_days — every
+    # matched lot expires on this exact timestamp instead of N days after the
+    # match. Takes precedence over match_bonus_expiry_days when both are set.
+    match_bonus_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     starts_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     role_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # null = everyone
@@ -645,6 +656,12 @@ class PromoClaimDrop(Base):
     boost_template_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Expiry applied to the granted lot/token (hours). Null = permanent.
     reward_expiry_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Absolute expiry, as an alternative to reward_expiry_hours — the granted
+    # lot/token expires on this exact timestamp instead of N hours after the
+    # claim. Takes precedence over reward_expiry_hours when both are set.
+    # (Distinct from `expires_at` below, which is the Claim button's own
+    # lifetime, not the reward's.)
+    reward_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Role mentioned above the announcement embed when posted. Null = no ping.
     ping_role_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # The announcement body is rendered inside an embed above the Claim button.
@@ -686,6 +703,10 @@ class BoostShopItem(Base):
     price_bonus_bets: Mapped[int] = mapped_column(Integer, nullable=False)
     # Expiry applied to the purchased token (days). Null = permanent.
     expiry_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Absolute expiry, as an alternative to expiry_days — every purchased token
+    # expires on this exact timestamp instead of N days after purchase. Takes
+    # precedence over expiry_days when both are set.
+    expiry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Per-member purchase cap for this listing. Null = unlimited.
     per_user_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

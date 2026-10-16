@@ -21,6 +21,15 @@ WITHDRAW_CHANNEL_ID: int | None = (
     if os.environ.get("WITHDRAW_CHANNEL_ID")
     else None
 )
+# The only server where Panem Sportsbook works. The app can be added anywhere,
+# but commands, components and the Activity refuse to run outside this guild.
+MAIN_GUILD_ID: int = int(os.environ.get("MAIN_GUILD_ID", "706281858253717554"))
+MAIN_SERVER_INVITE: str = "https://discord.gg/sunriseonthereaping"
+WRONG_SERVER_MESSAGE: str = (
+    f"You cannot do this here, join the main server to use Panem Sportsbook. "
+    f"{MAIN_SERVER_INVITE}"
+)
+
 DEV_GUILD_ID: int | None = (
     int(os.environ["DEV_GUILD_ID"]) if os.environ.get("DEV_GUILD_ID") else None
 )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import quote_plus
 import json
 from datetime import datetime, timezone
 from typing import Annotated
@@ -337,41 +338,28 @@ async def tribute_kill(
     killed_by_id: Annotated[str, Form()] = "",
     placement: Annotated[int, Form()] = 0,
 ):
-    async with get_db() as db:
-        t = await db.get(Tribute, tribute_id)
-        if not t or t.status != "ALIVE":
-            return _redirect("/admin/tributes", error="Tribute+not+found+or+already+dead.")
-        t.status = "DEAD"
-        t.death_cause = death_cause
-        t.placement = placement if placement > 0 else None
-        if killed_by_id.strip():
-            killer_id = int(killed_by_id)
-            t.killed_by_id = killer_id
-            killer = await db.get(Tribute, killer_id)
-            if killer:
-                killer.kills = (killer.kills or 0) + 1
-        await db.commit()
-    asyncio.create_task(post_admin_action(user, "Tribute eliminated", {"tribute": t.name, "cause": death_cause, "placement": str(placement) if placement > 0 else "auto"}))
-    return _redirect("/admin/tributes", msg=f"{t.name}+has+been+eliminated.")
+    from bot.cogs.admin import perform_tribute_kill
+    if death_cause == "Another Tribute" and not killed_by_id.strip():
+        return _redirect("/admin/tributes", error="Cause+Another+Tribute+requires+a+killer.")
+    err, info, notifs = await perform_tribute_kill(tribute_id, death_cause, killed_by_id.strip() or None)
+    if err:
+        return _redirect("/admin/tributes", error=quote_plus(err))
+    from web.notify import send_resolution_dms
+    await send_resolution_dms(notifs)
+    name = info["name"]
+    asyncio.create_task(post_admin_action(user, "Tribute eliminated", {"tribute": name, "cause": death_cause}))
+    return _redirect("/admin/tributes", msg=f"{quote_plus(name)}+has+been+eliminated.")
 
 
 @router.post("/tributes/{tribute_id}/unkill")
 async def tribute_unkill(tribute_id: int, user: SessionUser = Depends(require_admin)):
-    async with get_db() as db:
-        t = await db.get(Tribute, tribute_id)
-        if not t or t.status == "ALIVE":
-            return _redirect("/admin/tributes", error="Tribute+not+found+or+already+alive.")
-        if t.killed_by_id:
-            killer = await db.get(Tribute, t.killed_by_id)
-            if killer:
-                killer.kills = max(0, (killer.kills or 1) - 1)
-        t.status = "ALIVE"
-        t.death_cause = None
-        t.placement = None
-        t.killed_by_id = None
-        await db.commit()
-    asyncio.create_task(post_admin_action(user, "Tribute revived", {"tribute": t.name}))
-    return _redirect("/admin/tributes", msg=f"{t.name}+revived.")
+    from bot.cogs.admin import perform_tribute_unkill
+    err, info = await perform_tribute_unkill(tribute_id)
+    if err:
+        return _redirect("/admin/tributes", error=quote_plus(err))
+    name = info["name"]
+    asyncio.create_task(post_admin_action(user, "Tribute revived", {"tribute": name}))
+    return _redirect("/admin/tributes", msg=f"{quote_plus(name)}+revived.")
 
 
 @router.post("/tributes/{tribute_id}/victor")
@@ -606,61 +594,22 @@ async def market_resolve(
     # result: "true" | "false" | "void"
     bool_result: bool | None = None if result == "void" else (result == "true")
 
-    async with get_db() as db:
-        m = await db.get(Market, market_id)
-        if not m:
-            return _redirect(_markets_redirect_url(status), error="Market+not+found.")
+    from bot.cogs.admin import _collect_notifications, _resolve_market
+    from bot.database.engine import get_session
+    from web.notify import send_resolution_dms
 
-        m.status = "RESOLVED"
-        m.result = bool_result
-
-        bets = (await db.execute(
-            select(Bet).where(Bet.market_id == market_id, Bet.status == "PENDING")
-        )).scalars().all()
-
-        hc_config = await load_house_cut_config()
-        single_cap = await get_payout_cap("SINGLE")
-        cut_taken = 0
-        for bet in bets:
-            if bool_result is None:
-                bet.status = "VOIDED"
-                db_user = (await db.execute(select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id))).scalar_one_or_none()
-                refund = promos.void_chip_refund(bet.wager, bet.bonus_bet_amount)
-                if db_user:
-                    db_user.chips += refund
-                if bet.bonus_bet_amount and bet.parlay_id is None:
-                    await promos.refund_bonus(db, bet.guild_id, bet.user_id, bet.bonus_bet_amount)
-                if bet.profit_boost_token_id and bet.parlay_id is None:
-                    await promos.restore_boost_for_bet(db, bet.guild_id, bet.id)
-            elif bool_result and bet.parlay_id is None:
-                bet.status = "WON"
-                paid, cut = net_payout(
-                    hc_config, wager=bet.wager, payout_if_win=bet.payout_if_win,
-                    market_type=m.type, odds=bet.odds_at_placement,
-                    payout_rate=bet.payout_rate_at_placement, cap=single_cap,
-                )
-                bet.house_cut = cut
-                cut_taken += cut
-                db_user = (await db.execute(select(User).where(User.guild_id == bet.guild_id, User.discord_id == bet.user_id))).scalar_one_or_none()
-                credited, real_won, bonus_won = promos.split_won_credit(
-                    bet.wager, bet.bonus_bet_amount, paid
-                )
-                if db_user:
-                    db_user.chips += credited
-                    db_user.total_won += real_won
-                    db_user.bonus_won += bonus_won
-            elif not bool_result and bet.parlay_id is None:
-                bet.status = "LOST"
-            elif bet.parlay_id is not None:
-                bet.status = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
-                await _settle_parlay(db, bet.parlay_id)
-
-        await record_house_cut_taken(cut_taken)
-        await db.commit()
+    async with _collect_notifications() as notifs:
+        async with get_session() as session:
+            m = await session.get(Market, market_id)
+            if not m:
+                return _redirect(_markets_redirect_url(status), error="Market+not+found.")
+            stats = await _resolve_market(session, m, bool_result)
+            label_text = m.label
+    await send_resolution_dms(notifs)
 
     label = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
-    asyncio.create_task(post_admin_action(user, "Market resolved", {"market": m.label, "result": label, "bets settled": str(len(bets))}))
-    return _redirect(_markets_redirect_url(status), msg=f"Market+resolved+as+{label}.+{len(bets)}+bets+settled.")
+    asyncio.create_task(post_admin_action(user, "Market resolved", {"market": label_text, "result": label, "bets settled": str(stats["resolved"])}))
+    return _redirect(_markets_redirect_url(status), msg=f"Market+resolved+as+{label}.+{stats['resolved']}+bets+settled.")
 
 
 async def _settle_parlay(db, parlay_id: int) -> None:
@@ -1358,18 +1307,24 @@ async def promotions_bonus_grant(
     amount: Annotated[int, Form()] = 0,
     expiry_days: Annotated[int, Form()] = 0,
     expiry_hours: Annotated[int, Form()] = 0,
+    expiry_date: Annotated[str, Form()] = "",
     note: Annotated[str, Form()] = "",
 ):
     scope = scope.upper()
     if amount <= 0:
         return _redirect("/admin/promotions", error="Amount+must+be+positive.")
     hours = _parse_expiry_hours(expiry_days, expiry_hours)
+    try:
+        exp_at = _iso_to_naive_utc(expiry_date) if expiry_date.strip() else None
+    except ValueError:
+        return _redirect("/admin/promotions", error="Invalid+expiry+date.")
     async with get_db() as db:
         gid = _GUILD_ID()
         grant = BonusGrant(
             guild_id=gid, scope=scope,
             target_id=int(target_id) if scope == "USER" and str(target_id).strip().isdigit() else None,
-            amount=amount, expiry_hours=hours, note=note.strip()[:200] or None,
+            amount=amount, expiry_hours=hours, expires_at=exp_at,
+            note=note.strip()[:200] or None,
             created_by=user.discord_id,
         )
         db.add(grant)
@@ -1381,7 +1336,9 @@ async def promotions_bonus_grant(
         ids, err = await _resolve_target_ids(scope, target_id)
         if err:
             return _redirect("/admin/promotions", error=err.replace(" ", "+"))
-        n = await promos.grant_bonus_to_users(db, gid, ids, amount, hours, "GRANT_USER", grant_id=grant.id)
+        n = await promos.grant_bonus_to_users(
+            db, gid, ids, amount, hours, "GRANT_USER", grant_id=grant.id, expires_at=exp_at,
+        )
         grant.recipients_count = n
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Bonus Chips granted", {"scope": scope, "amount": f"{amount:,}", "recipients": str(n)}))
@@ -1481,9 +1438,14 @@ async def promotions_boost_grant(
     target_id: Annotated[str, Form()] = "",
     expiry_days: Annotated[int, Form()] = 0,
     expiry_hours: Annotated[int, Form()] = 0,
+    expiry_date: Annotated[str, Form()] = "",
 ):
     scope = scope.upper()
     hours = _parse_expiry_hours(expiry_days, expiry_hours)
+    try:
+        exp_at = _iso_to_naive_utc(expiry_date) if expiry_date.strip() else None
+    except ValueError:
+        return _redirect("/admin/promotions", error="Invalid+expiry+date.")
     async with get_db() as db:
         gid = _GUILD_ID()
         tpl = await db.get(ProfitBoostTemplate, template_id)
@@ -1492,7 +1454,7 @@ async def promotions_boost_grant(
         grant = ProfitBoostGrant(
             guild_id=gid, template_id=tpl.id, scope=scope,
             target_id=int(target_id) if scope == "USER" and str(target_id).strip().isdigit() else None,
-            expiry_hours=hours, created_by=user.discord_id,
+            expiry_hours=hours, expires_at=exp_at, created_by=user.discord_id,
         )
         db.add(grant)
         await db.flush()
@@ -1502,7 +1464,9 @@ async def promotions_boost_grant(
         ids, err = await _resolve_target_ids(scope, target_id)
         if err:
             return _redirect("/admin/promotions", error=err.replace(" ", "+"))
-        n = await promos.grant_boost_to_users(db, gid, tpl, ids, hours, user.discord_id, grant_id=grant.id)
+        n = await promos.grant_boost_to_users(
+            db, gid, tpl, ids, hours, user.discord_id, grant_id=grant.id, expires_at=exp_at,
+        )
         grant.recipients_count = n
         await db.commit()
     asyncio.create_task(post_admin_action(user, "Profit boosts granted", {"template": tpl.name, "recipients": str(n)}))
@@ -1526,6 +1490,7 @@ async def promotions_deposit_match_new(
     match_pct: Annotated[float, Form()] = 100.0,
     max_match_per_user: Annotated[int, Form()] = 0,
     match_bonus_expiry_days: Annotated[int, Form()] = 0,
+    match_bonus_expiry_date: Annotated[str, Form()] = "",
     starts_at: Annotated[str, Form()] = "",
     ends_at: Annotated[str, Form()] = "",
     role_id: Annotated[str, Form()] = "",
@@ -1535,8 +1500,9 @@ async def promotions_deposit_match_new(
     try:
         sa = _iso_to_naive_utc(starts_at) if starts_at else datetime.utcnow()
         ea = _iso_to_naive_utc(ends_at)
+        bexp_at = _iso_to_naive_utc(match_bonus_expiry_date) if match_bonus_expiry_date.strip() else None
     except ValueError:
-        return _redirect("/admin/promotions", error="Invalid+start/end+time.")
+        return _redirect("/admin/promotions", error="Invalid+date/time.")
     if ea <= sa:
         return _redirect("/admin/promotions", error="End+must+be+after+start.")
     async with get_db() as db:
@@ -1544,6 +1510,7 @@ async def promotions_deposit_match_new(
             guild_id=_GUILD_ID(), name=name.strip()[:100], match_pct=match_pct,
             max_match_per_user=max_match_per_user, starts_at=sa, ends_at=ea,
             match_bonus_expiry_days=int(match_bonus_expiry_days) or None,
+            match_bonus_expires_at=bexp_at,
             role_id=int(role_id) if str(role_id).strip().isdigit() else None,
             created_by=user.discord_id,
         ))

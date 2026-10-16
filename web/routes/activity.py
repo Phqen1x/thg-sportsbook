@@ -50,6 +50,7 @@ from bot.utils.restrictions import (
 from web import config, discord_api
 from web.activity_auth import bearer_admin, bearer_user, mint_token
 from web.audit import post_admin_action, post_bet_log
+from bot import config as _bot_config
 from web.database import get_db, get_request_guild, set_request_guild
 from web.deps import live_role_ids
 from web.routes.public import _parlay_flavor
@@ -289,16 +290,10 @@ async def token(
     if not config.DISCORD_CLIENT_ID or not config.DISCORD_CLIENT_SECRET:
         raise HTTPException(status_code=500, detail="Discord OAuth is not configured.")
 
-    # Lock the Activity to a single server when GUILD_ID is configured. Without
-    # this check the client-reported guild_id (whichever server the Activity was
-    # actually launched from) was trusted as-is, so the Activity would happily
-    # authenticate — and spin up a fresh per-guild database for — any server the
-    # bot is in, regardless of GUILD_ID in .env.
-    if config.GUILD_ID and gid != config.GUILD_ID:
-        raise HTTPException(
-            status_code=403,
-            detail="This Activity is only available in the official server.",
-        )
+    # The Activity only works in the main server, regardless of which other
+    # servers the app has been added to.
+    if gid != config.MAIN_GUILD_ID:
+        raise HTTPException(status_code=403, detail=_bot_config.WRONG_SERVER_MESSAGE)
     try:
         tokens = await discord_api.exchange_code_activity(code)
         access_token = tokens["access_token"]
@@ -1830,71 +1825,22 @@ async def admin_market_resolve(
     # result: "true" | "false" | "void"
     bool_result: bool | None = None if result == "void" else (result == "true")
 
-    async with get_db() as db:
-        m = await db.get(Market, market_id)
-        if not m:
-            raise HTTPException(status_code=404, detail="Market not found.")
+    from bot.cogs.admin import _collect_notifications, _resolve_market
+    from bot.database.engine import get_session
+    from web.notify import send_resolution_dms
 
-        m.status = "RESOLVED"
-        m.result = bool_result
-
-        bets = (await db.execute(
-            select(Bet).where(Bet.market_id == market_id, Bet.status == "PENDING")
-        )).scalars().all()
-
-        hc_config = await load_house_cut_config()
-        single_cap = await get_payout_cap("SINGLE")
-        cut_taken = 0
-        for bet in bets:
-            if bool_result is None:
-                bet.status = "VOIDED"
-                db_user = await _fetch_user(db, bet.user_id)
-                refund = promos.void_chip_refund(bet.wager, bet.bonus_bet_amount)
-                if db_user:
-                    db_user.chips += refund
-                if bet.bonus_bet_amount and bet.parlay_id is None:
-                    await promos.refund_bonus(db, bet.guild_id, bet.user_id, bet.bonus_bet_amount)
-                if bet.profit_boost_token_id and bet.parlay_id is None:
-                    await promos.restore_boost_for_bet(db, bet.guild_id, bet.id)
-            elif bool_result and bet.parlay_id is None:
-                bet.status = "WON"
-                paid, cut = net_payout(
-                    hc_config, wager=bet.wager, payout_if_win=bet.payout_if_win,
-                    market_type=m.type, odds=bet.odds_at_placement,
-                    payout_rate=bet.payout_rate_at_placement, cap=single_cap,
-                )
-                bet.house_cut = cut
-                cut_taken += cut
-                db_user = await _fetch_user(db, bet.user_id)
-                credited, real_won, bonus_won = promos.split_won_credit(
-                    bet.wager, bet.bonus_bet_amount, paid
-                )
-                if db_user:
-                    db_user.chips += credited
-                    db_user.total_won += real_won
-                    db_user.bonus_won += bonus_won
-                await promos.award_settle_rebate(
-                    db, bet.guild_id, bet.user_id,
-                    wager_placed=max(0, bet.wager - bet.bonus_bet_amount),
-                    won=True, bet_id=bet.id,
-                )
-            elif not bool_result and bet.parlay_id is None:
-                bet.status = "LOST"
-                await promos.award_settle_rebate(
-                    db, bet.guild_id, bet.user_id,
-                    wager_placed=max(0, bet.wager - bet.bonus_bet_amount),
-                    won=False, bet_id=bet.id,
-                )
-            elif bet.parlay_id is not None:
-                bet.status = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
-                await _settle_parlay(db, bet.parlay_id)
-
-        await record_house_cut_taken(cut_taken)
-        await db.commit()
-        settled = len(bets)
+    async with _collect_notifications() as notifs:
+        async with get_session() as session:
+            m = await session.get(Market, market_id)
+            if not m:
+                raise HTTPException(status_code=404, detail="Market not found.")
+            stats = await _resolve_market(session, m, bool_result)
+            market_label = m.label
+    await send_resolution_dms(notifs)
+    settled = stats["resolved"]
 
     label = "WON" if bool_result else ("VOIDED" if bool_result is None else "LOST")
-    asyncio.create_task(post_admin_action(admin, "Market resolved", {"market": m.label, "result": label, "bets settled": str(settled)}, source="Discord Activity"))
+    asyncio.create_task(post_admin_action(admin, "Market resolved", {"market": market_label, "result": label, "bets settled": str(settled)}, source="Discord Activity"))
     return {"ok": True, "message": f"Market resolved as {label}. {settled} bets settled."}
 
 
@@ -1952,23 +1898,15 @@ async def admin_tribute_kill(
     killed_by_id: Annotated[str, Body()] = "",
     placement: Annotated[int, Body()] = 0,
 ):
-    async with get_db() as db:
-        t = await db.get(Tribute, tribute_id)
-        if not t or t.status != "ALIVE":
-            raise HTTPException(status_code=400, detail="Tribute not found or already dead.")
-        in_bloodbath = await _phase_name(db) == "Bloodbath"
-        t.status = "DEAD"
-        t.death_cause = death_cause
-        t.placement = placement if placement > 0 else None
-        if killed_by_id.strip():
-            killer = await db.get(Tribute, int(killed_by_id))
-            t.killed_by_id = int(killed_by_id)
-            if killer:
-                killer.kills = (killer.kills or 0) + 1
-                if in_bloodbath:
-                    killer.bloodbath_kills = (killer.bloodbath_kills or 0) + 1
-        await db.commit()
-        name = t.name
+    from bot.cogs.admin import perform_tribute_kill
+    if death_cause == "Another Tribute" and not killed_by_id.strip():
+        raise HTTPException(status_code=400, detail="Cause Another Tribute requires a killer.")
+    err, info, notifs = await perform_tribute_kill(tribute_id, death_cause, killed_by_id.strip() or None)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    from web.notify import send_resolution_dms
+    await send_resolution_dms(notifs)
+    name = info["name"]
     asyncio.create_task(post_admin_action(admin, "Tribute eliminated", {"tribute": name, "cause": death_cause}, source="Discord Activity"))
     return {"ok": True, "message": f"{name} has been eliminated."}
 
@@ -1989,23 +1927,11 @@ async def admin_tribute_victor(tribute_id: int, admin: SessionUser = Depends(bea
 
 @router.post("/admin/tribute/{tribute_id}/unkill")
 async def admin_tribute_unkill(tribute_id: int, admin: SessionUser = Depends(bearer_admin)):
-    async with get_db() as db:
-        t = await db.get(Tribute, tribute_id)
-        if not t or t.status == "ALIVE":
-            raise HTTPException(status_code=400, detail="Tribute not found or already alive.")
-        in_bloodbath = await _phase_name(db) == "Bloodbath"
-        if t.killed_by_id:
-            killer = await db.get(Tribute, t.killed_by_id)
-            if killer:
-                killer.kills = max(0, (killer.kills or 1) - 1)
-                if in_bloodbath and (killer.bloodbath_kills or 0) > 0:
-                    killer.bloodbath_kills -= 1
-        t.status = "ALIVE"
-        t.death_cause = None
-        t.placement = None
-        t.killed_by_id = None
-        await db.commit()
-        name = t.name
+    from bot.cogs.admin import perform_tribute_unkill
+    err, info = await perform_tribute_unkill(tribute_id)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    name = info["name"]
     asyncio.create_task(post_admin_action(admin, "Tribute revived", {"tribute": name}, source="Discord Activity"))
     return {"ok": True, "message": f"{name} revived."}
 
@@ -2276,7 +2202,11 @@ async def admin_promos(admin: SessionUser = Depends(bearer_admin)):
         "channels": channels,
         "roles": roles,
         "bonus_users": sorted(agg.values(), key=lambda x: -x["total"]),
-        "ft_bonus": [{"id": g.id, "amount": g.amount, "expiry_hours": g.expiry_hours, "note": g.note} for g in ft_bonus],
+        "ft_bonus": [
+            {"id": g.id, "amount": g.amount, "expiry_hours": g.expiry_hours,
+             "expires_at": g.expires_at.isoformat() if g.expires_at else None, "note": g.note}
+            for g in ft_bonus
+        ],
         "templates": [
             {"id": t.id, "name": t.name, "boost_pct": t.boost_pct, "scope_type": t.scope_type,
              "scope_id": t.scope_id, "max_wager": t.max_wager,
@@ -2295,6 +2225,7 @@ async def admin_promos(admin: SessionUser = Depends(bearer_admin)):
             {"id": p.id, "name": p.name, "match_pct": p.match_pct,
              "max_match_per_user": p.max_match_per_user,
              "match_bonus_expiry_days": p.match_bonus_expiry_days,
+             "match_bonus_expires_at": p.match_bonus_expires_at.isoformat() if p.match_bonus_expires_at else None,
              "starts_at": p.starts_at.isoformat(), "ends_at": p.ends_at.isoformat(),
              "role_id": str(p.role_id) if p.role_id else None,
              "live": (p.active and p.starts_at <= now < p.ends_at),
@@ -2318,6 +2249,7 @@ async def admin_promos_claim_drop(
     max_claims: Annotated[int, Body()] = 0,
     duration_hours: Annotated[int, Body()] = 0,
     reward_expiry_days: Annotated[int, Body()] = 0,
+    reward_expiry_date: Annotated[str, Body()] = "",
 ):
     """Post a channel message with a persistent Claim button. The bot registers
     the button handler on startup, so it services clicks regardless of the fact
@@ -2334,6 +2266,10 @@ async def admin_promos_claim_drop(
         chan_id = int(str(channel_id).strip())
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Pick a channel.")
+    try:
+        reward_exp_at = _iso_to_naive_utc(reward_expiry_date) if reward_expiry_date.strip() else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid reward expiry date.")
 
     role_id = int(str(ping_role_id).strip()) if str(ping_role_id).strip().isdigit() else None
     reward_expiry_hours = int(reward_expiry_days) * 24 if reward_expiry_days else None
@@ -2363,7 +2299,7 @@ async def admin_promos_claim_drop(
             guild_id=gid, channel_id=chan_id, reward_kind=kind,
             bonus_amount=int(bonus_amount) if kind == "BONUS" else None,
             boost_template_id=tpl_id,
-            reward_expiry_hours=reward_expiry_hours,
+            reward_expiry_hours=reward_expiry_hours, reward_expires_at=reward_exp_at,
             ping_role_id=role_id,
             message_text=message[:2000],
             max_claims=max_claims_val,
@@ -2383,7 +2319,7 @@ async def admin_promos_claim_drop(
     }]
     embed = promos.build_claim_drop_embed(
         message, reward_label, reward_expiry_hours=reward_expiry_hours,
-        max_claims=max_claims_val,
+        reward_expires_at=reward_exp_at, max_claims=max_claims_val,
     )
     sent = await discord_api.post_channel_message(
         chan_id, f"<@&{role_id}>" if role_id else "", components=components,
@@ -2430,18 +2366,24 @@ async def admin_promos_bonus_grant(
     amount: Annotated[int, Body()] = 0,
     expiry_days: Annotated[int, Body()] = 0,
     expiry_hours: Annotated[int, Body()] = 0,
+    expiry_date: Annotated[str, Body()] = "",
     note: Annotated[str, Body()] = "",
 ):
     scope = scope.upper()
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive.")
     hours = _promo_expiry_hours(expiry_days, expiry_hours)
+    try:
+        exp_at = _iso_to_naive_utc(expiry_date) if expiry_date.strip() else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid expiry date.")
     async with get_db() as db:
         gid = _GUILD_ID()
         grant = BonusGrant(
             guild_id=gid, scope=scope,
             target_id=int(target_id) if scope == "USER" and str(target_id).strip().isdigit() else None,
-            amount=amount, expiry_hours=hours, note=(note or "").strip()[:200] or None,
+            amount=amount, expiry_hours=hours, expires_at=exp_at,
+            note=(note or "").strip()[:200] or None,
             created_by=admin.discord_id,
         )
         db.add(grant)
@@ -2452,7 +2394,9 @@ async def admin_promos_bonus_grant(
         ids, err = await _promo_resolve_target_ids(scope, target_id)
         if err:
             raise HTTPException(status_code=400, detail=err)
-        n = await promos.grant_bonus_to_users(db, gid, ids, amount, hours, "GRANT_USER", grant_id=grant.id)
+        n = await promos.grant_bonus_to_users(
+            db, gid, ids, amount, hours, "GRANT_USER", grant_id=grant.id, expires_at=exp_at,
+        )
         grant.recipients_count = n
         await db.commit()
     asyncio.create_task(post_admin_action(admin, "Bonus Chips granted", {"scope": scope, "amount": f"{amount:,}", "recipients": str(n)}, source="Discord Activity"))
@@ -2549,9 +2493,14 @@ async def admin_promos_boost_grant(
     target_id: Annotated[str, Body()] = "",
     expiry_days: Annotated[int, Body()] = 0,
     expiry_hours: Annotated[int, Body()] = 0,
+    expiry_date: Annotated[str, Body()] = "",
 ):
     scope = scope.upper()
     hours = _promo_expiry_hours(expiry_days, expiry_hours)
+    try:
+        exp_at = _iso_to_naive_utc(expiry_date) if expiry_date.strip() else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid expiry date.")
     async with get_db() as db:
         gid = _GUILD_ID()
         tpl = await db.get(ProfitBoostTemplate, template_id)
@@ -2560,7 +2509,7 @@ async def admin_promos_boost_grant(
         grant = ProfitBoostGrant(
             guild_id=gid, template_id=tpl.id, scope=scope,
             target_id=int(target_id) if scope == "USER" and str(target_id).strip().isdigit() else None,
-            expiry_hours=hours, created_by=admin.discord_id,
+            expiry_hours=hours, expires_at=exp_at, created_by=admin.discord_id,
         )
         db.add(grant)
         await db.flush()
@@ -2570,7 +2519,9 @@ async def admin_promos_boost_grant(
         ids, err = await _promo_resolve_target_ids(scope, target_id)
         if err:
             raise HTTPException(status_code=400, detail=err)
-        n = await promos.grant_boost_to_users(db, gid, tpl, ids, hours, admin.discord_id, grant_id=grant.id)
+        n = await promos.grant_boost_to_users(
+            db, gid, tpl, ids, hours, admin.discord_id, grant_id=grant.id, expires_at=exp_at,
+        )
         grant.recipients_count = n
         await db.commit()
     asyncio.create_task(post_admin_action(admin, "Profit boosts granted", {"template": tpl.name, "recipients": str(n)}, source="Discord Activity"))
@@ -2594,6 +2545,7 @@ async def admin_promos_deposit_match_new(
     match_pct: Annotated[float, Body()] = 100.0,
     max_match_per_user: Annotated[int, Body()] = 0,
     match_bonus_expiry_days: Annotated[int, Body()] = 0,
+    match_bonus_expiry_date: Annotated[str, Body()] = "",
     starts_at: Annotated[str, Body()] = "",
     ends_at: Annotated[str, Body()] = "",
     role_id: Annotated[str, Body()] = "",
@@ -2603,8 +2555,9 @@ async def admin_promos_deposit_match_new(
     try:
         sa = _iso_to_naive_utc(starts_at) if starts_at else datetime.utcnow()
         ea = _iso_to_naive_utc(ends_at)
+        bexp_at = _iso_to_naive_utc(match_bonus_expiry_date) if match_bonus_expiry_date.strip() else None
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid start/end time.")
+        raise HTTPException(status_code=400, detail="Invalid date/time.")
     if ea <= sa:
         raise HTTPException(status_code=400, detail="End must be after start.")
     async with get_db() as db:
@@ -2612,6 +2565,7 @@ async def admin_promos_deposit_match_new(
             guild_id=_GUILD_ID(), name=name.strip()[:100], match_pct=match_pct,
             max_match_per_user=max_match_per_user, starts_at=sa, ends_at=ea,
             match_bonus_expiry_days=int(match_bonus_expiry_days) or None,
+            match_bonus_expires_at=bexp_at,
             role_id=int(role_id) if str(role_id).strip().isdigit() else None,
             created_by=admin.discord_id,
         ))
@@ -2698,7 +2652,9 @@ def _shop_item_json(item: BoostShopItem, tpl: ProfitBoostTemplate | None) -> dic
     return {
         "id": item.id, "template_id": item.boost_template_id,
         "price_bonus_bets": item.price_bonus_bets,
-        "expiry_days": item.expiry_days, "per_user_limit": item.per_user_limit,
+        "expiry_days": item.expiry_days,
+        "expiry_at": item.expiry_at.isoformat() if item.expiry_at else None,
+        "per_user_limit": item.per_user_limit,
         "sort_order": item.sort_order, "active": item.active,
         "boost_pct": tpl.boost_pct if tpl else None,
         "scope_type": tpl.scope_type if tpl else None,
@@ -2768,10 +2724,15 @@ async def admin_shop_item_new(
     boost_template_id: Annotated[int, Body()] = 0,
     price_bonus_bets: Annotated[int, Body()] = 0,
     expiry_days: Annotated[int, Body()] = 0,
+    expiry_date: Annotated[str, Body()] = "",
     per_user_limit: Annotated[int, Body()] = 0,
 ):
     if price_bonus_bets <= 0:
         raise HTTPException(status_code=400, detail="Set a positive Bonus Chip price.")
+    try:
+        exp_at = _iso_to_naive_utc(expiry_date) if expiry_date.strip() else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid expiry date.")
     async with get_db() as db:
         gid = _GUILD_ID()
         tpl = await db.get(ProfitBoostTemplate, int(boost_template_id or 0))
@@ -2785,7 +2746,7 @@ async def admin_shop_item_new(
         db.add(BoostShopItem(
             guild_id=gid, boost_template_id=tpl.id,
             price_bonus_bets=int(price_bonus_bets),
-            expiry_days=int(expiry_days) or None,
+            expiry_days=int(expiry_days) or None, expiry_at=exp_at,
             per_user_limit=int(per_user_limit) or None,
             sort_order=nxt, created_by=admin.discord_id,
         ))
@@ -2829,3 +2790,13 @@ async def admin_shop_item_delete(item_id: int, admin: SessionUser = Depends(bear
             await db.delete(it)
             await db.commit()
     return {"ok": True, "message": "Shop item removed."}
+
+
+@router.get("/legal/{doc}")
+async def activity_legal_doc(doc: str):
+    if doc not in ("privacy", "terms"):
+        raise HTTPException(status_code=404, detail="Document not found.")
+    from web.markdown import get_legal_doc
+    title, content_html = get_legal_doc(doc)
+    return {"doc": doc, "title": title, "html": content_html}
+
