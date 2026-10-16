@@ -30,4 +30,4 @@ thg-sportsbook-web = "web.main:main"
 include = ["bot*", "web*"]
 
 [tool.setuptools.package-data]
-"web" = ["templates/**/*", "static/**/*", "activity/**/*", "activity/static/**/*"]
+"web" = ["templates/**/*", "static/**/*", "activity/**/*", "activity/static/**/*", "legal/*.md"]

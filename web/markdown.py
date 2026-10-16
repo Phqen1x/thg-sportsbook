@@ -4,7 +4,7 @@ import html
 import re
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+LEGAL_DIR = Path(__file__).resolve().parent / "legal"
 
 
 def md_to_html(md: str) -> str:
@@ -131,7 +131,7 @@ def get_legal_doc(doc_type: str) -> tuple[str, str]:
     is_privacy = doc_type.lower().startswith("priv")
     filename = "PRIVACY_POLICY.md" if is_privacy else "TERMS_OF_SERVICE.md"
     title = "Privacy Policy" if is_privacy else "Terms of Service"
-    path = BASE_DIR / filename
+    path = LEGAL_DIR / filename
     if not path.is_file():
         return (title, f"<p class=\"doc-p\">The {title} document is currently unavailable.</p>")
     content = path.read_text(encoding="utf-8")
