@@ -6594,11 +6594,11 @@ class AdminCog(commands.Cog):
     @app_commands.describe(
         tribute_id="Tribute who died",
         cause="Cause of death",
-        killed_by_id="Tribute who killed them (optional)",
+        killed_by_id="Tribute who killed them (optional) — can be a dead tribute (e.g. a trap)",
     )
     @app_commands.autocomplete(
         tribute_id=alive_tribute_autocomplete,
-        killed_by_id=alive_tribute_autocomplete,
+        killed_by_id=tribute_autocomplete,
         cause=death_cause_autocomplete,
     )
     @is_admin()
